@@ -29,8 +29,8 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <stdlib.h>
-#include <string.h>
+#include <cstdlib>
+#include <cstring>
 
 #include "XrdSsi/XrdSsiRequest.hh"
 
@@ -121,7 +121,7 @@ protected:
 //! (e.g. data response buffer or a stream). This method is invoked when
 //! XrdSsiRequest::Finished() is called by the client.
 //!
-//! @param  rqstP  reference to the object describing the request.
+//! @param  rqstR  reference to the object describing the request.
 //! @param  rInfo  reference to the object describing the response.
 //! @param  cancel False -> the request/response interaction completed.
 //!                True  -> the request/response interaction aborted because

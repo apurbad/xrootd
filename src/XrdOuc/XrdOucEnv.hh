@@ -30,7 +30,7 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <stdlib.h>
+#include <cstdlib>
 #ifndef WIN32
 #include <strings.h>
 #endif
@@ -46,6 +46,11 @@ public:
 //       constructor.
 //
 inline char *Env(int &envlen) {envlen = global_len; return global_env;}
+
+// EnvTidy() returns the environment string and length with authorization
+//           information (ie. authz), if any, removed.
+//
+       char *EnvTidy(int &envlen);
 
 // Export() sets an external environmental variable to the desired value
 //          using dynamically allocated fixed storage.
@@ -110,6 +115,7 @@ inline const XrdSecEntity *secEnv() const {return secEntity;}
       ~XrdOucEnv() {if (global_env) free((void *)global_env);}
 
 private:
+void EnvBuildTidy();
 
 XrdOucHash<char> env_Hash;
 const XrdSecEntity *secEntity;

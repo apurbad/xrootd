@@ -29,7 +29,7 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <string.h>
+#include <cstring>
 #include <sys/types.h>
 
 #include "XrdSfs/XrdSfsInterface.hh"
@@ -81,7 +81,7 @@ public:
                                   XrdSfsFileOffset   offset,
                                   XrdSfsXferSize     size);
 
-        void             setXio(XrdSfsXio *xP) {xioP = xP;}
+        void             setXio(XrdSfsXio *xP);
                         
         int              stat(struct stat *buf);
                         
@@ -99,16 +99,16 @@ public:
                         
 // Constructor and destructor
 //                      
-                         XrdSsiFile(const char *user, int MonID);
+                         XrdSsiFile(const char *user, int MonID)
+                                   : XrdSfsFile(myEInfo), fsFile(0), fSessP(0),
+                                     myEInfo(user, MonID) {}
                         
 virtual                 ~XrdSsiFile();
                         
 private:                
-void                     CopyECB(bool forOpen=false);
-int                      CopyErr(const char *op, int rc);
 
 XrdSfsFile              *fsFile;
 XrdSsiFileSess          *fSessP;
-XrdSfsXio               *xioP;
+XrdOucErrInfo            myEInfo;
 };
 #endif

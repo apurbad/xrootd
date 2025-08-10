@@ -1,6 +1,7 @@
 
 #include "XrdSfs/XrdSfsAio.hh"
 #include "XrdSec/XrdSecEntity.hh"
+#include "XrdSec/XrdSecEntityAttr.hh"
 
 #include "XrdThrottle.hh"
 
@@ -11,7 +12,7 @@ using namespace XrdThrottle;
    unsigned port; \
    std::string host; \
    m_throttle.PerformLoadShed(m_loadshed, host, port); \
-   m_eroute.Emsg("File", "Performing load-shed for client", m_user.c_str()); \
+   m_eroute.Emsg("File", "Performing load-shed for client", m_connection_id.c_str()); \
    error.setErrInfo(port, host.c_str()); \
    return SFS_REDIRECT; \
 }
@@ -21,58 +22,28 @@ DO_LOADSHED \
 m_throttle.Apply(amount, 1, m_uid); \
 XrdThrottleTimer xtimer = m_throttle.StartIOTimer();
 
-class ErrorSentry
-{
-public:
-    ErrorSentry(XrdOucErrInfo &dst_err, XrdOucErrInfo &src_err, bool forOpen=false)
-        : m_dst_err(dst_err), m_src_err(src_err)
-    {
-        unsigned long long cbArg;
-        XrdOucEICB *cbVal = dst_err.getErrCB(cbArg);
-
-        if (forOpen)
-        {
-            src_err.setUCap(dst_err.getUCap());
-        }
-        src_err.setErrCB(cbVal, cbArg);
-    }
-
-    ~ErrorSentry()
-    {
-        if (m_src_err.getErrInfo())
-        {
-            m_dst_err = m_src_err;
-        }
-        else
-        {
-            m_dst_err.Reset();
-        }
-    }
-
-private:
-    XrdOucErrInfo &m_dst_err;
-    XrdOucErrInfo &m_src_err;
-};
-
 File::File(const char                     *user,
-                 int                       monid,
                  unique_sfs_ptr            sfs,
                  XrdThrottleManager       &throttle,
                  XrdSysError              &eroute)
-   : XrdSfsFile(user, monid),
+   : XrdSfsFile(sfs->error), // Use underlying error object as ours
 #if __cplusplus >= 201103L
      m_sfs(std::move(sfs)), // Guaranteed to be non-null by FileSystem::newFile
 #else
      m_sfs(sfs),
 #endif
      m_uid(0),
-     m_user(user),
+     m_connection_id(user ? user : ""),
      m_throttle(throttle),
      m_eroute(eroute)
 {}
 
 File::~File()
-{}
+{
+   if (m_is_open) {
+      m_throttle.CloseFile(m_user);
+   }
+}
 
 int
 File::open(const char                *fileName,
@@ -81,43 +52,59 @@ File::open(const char                *fileName,
            const XrdSecEntity        *client,
            const char                *opaque)
 {
-   m_uid = XrdThrottleManager::GetUid(client->name);
+   // Try various potential "names" associated with the request, from the most
+   // specific to most generic.
+   if (client->eaAPI && client->eaAPI->Get("token.subject", m_user)) {
+       if (client->vorg) m_user = std::string(client->vorg) + ":" + m_user;
+   } else if (client->eaAPI) {
+       std::string user;
+       if (client->eaAPI->Get("request.name", user) && !user.empty()) m_user = user;
+   }
+   if (m_user.empty()) {m_user = client->name ? client->name : "nobody";}
+   m_uid = XrdThrottleManager::GetUid(m_user.c_str());
    m_throttle.PrepLoadShed(opaque, m_loadshed);
-   ErrorSentry sentry(error, m_sfs->error, true);
-   return m_sfs->open(fileName, openMode, createMode, client, opaque);
+   std::string open_error_message;
+   if (!m_throttle.OpenFile(m_user, open_error_message)) {
+       error.setErrInfo(EMFILE, open_error_message.c_str());
+       return SFS_ERROR;
+   }
+   auto retval = m_sfs->open(fileName, openMode, createMode, client, opaque);
+   if (retval != SFS_ERROR) {
+      m_is_open = true;
+   } else {
+      m_throttle.CloseFile(m_user);
+   }
+   return retval;
 }
 
 int
 File::close()
 {
-   ErrorSentry sentry(error, m_sfs->error);
+   m_is_open = false;
+   m_throttle.CloseFile(m_user);
    return m_sfs->close();
 }
+
+int File::checkpoint(cpAct act, struct iov *range, int n)
+{  return m_sfs->checkpoint(act, range, n);}
 
 int
 File::fctl(const int               cmd,
            const char             *args,
                  XrdOucErrInfo    &out_error)
 {
-   ErrorSentry sentry(error, m_sfs->error);
    // Disable sendfile
    if (cmd == SFS_FCTL_GETFD)
    {
       error.setErrInfo(ENOTSUP, "Sendfile not supported by throttle plugin.");
       return SFS_ERROR;
    }
-   // If out_error is aliased to this->error, then the ErrorSentry destructor will clobber
-   // the out_error with the contents of m_sfs->error, resulting in an incorrect state.
-   // Instead, we pass m_sfs->error as the argument to fctl.  This way, the underlying
-   // m_sfs also sees the aliased behavior, more closely mimicking the case where the
-   // chained SFS doesn't exist.
-   else return m_sfs->fctl(cmd, args, &error == &out_error ? m_sfs->error : out_error);
+   else return m_sfs->fctl(cmd, args, out_error);
 }
 
 const char *
 File::FName()
 {
-   ErrorSentry sentry(error, m_sfs->error);
    return m_sfs->FName();
 }
 
@@ -128,12 +115,55 @@ File::getMmap(void **Addr, off_t &Size)
    return SFS_ERROR;
 }
 
+XrdSfsXferSize
+File::pgRead(XrdSfsFileOffset   offset,
+             char              *buffer,
+             XrdSfsXferSize     rdlen,
+             uint32_t          *csvec,
+             uint64_t           opts)
+{
+   DO_THROTTLE(rdlen)
+   return m_sfs->pgRead(offset, buffer, rdlen, csvec, opts);
+}
+
+XrdSfsXferSize
+File::pgRead(XrdSfsAio *aioparm, uint64_t opts)
+{  // We disable all AIO-based reads.
+   aioparm->Result = this->pgRead((XrdSfsFileOffset)aioparm->sfsAio.aio_offset,
+                                            (char *)aioparm->sfsAio.aio_buf,
+                                    (XrdSfsXferSize)aioparm->sfsAio.aio_nbytes,
+                                                    aioparm->cksVec, opts);
+   aioparm->doneRead();
+   return SFS_OK;
+}
+
+XrdSfsXferSize
+File::pgWrite(XrdSfsFileOffset   offset,
+              char              *buffer,
+              XrdSfsXferSize     rdlen,
+              uint32_t          *csvec,
+              uint64_t           opts)
+{
+   DO_THROTTLE(rdlen)
+   return m_sfs->pgWrite(offset, buffer, rdlen, csvec, opts);
+}
+
+XrdSfsXferSize
+File::pgWrite(XrdSfsAio *aioparm, uint64_t opts)
+{  // We disable all AIO-based writes.
+   aioparm->Result = this->pgWrite((XrdSfsFileOffset)aioparm->sfsAio.aio_offset,
+                                             (char *)aioparm->sfsAio.aio_buf,
+                                     (XrdSfsXferSize)aioparm->sfsAio.aio_nbytes,
+                                                     aioparm->cksVec, opts);
+   aioparm->doneWrite();
+   return SFS_OK;
+}
+
 int
 File::read(XrdSfsFileOffset   fileOffset,
            XrdSfsXferSize     amount)
 {
    DO_THROTTLE(amount)
-   ErrorSentry sentry(error, m_sfs->error);
    return m_sfs->read(fileOffset, amount);
 }
 
@@ -143,7 +173,6 @@ File::read(XrdSfsFileOffset   fileOffset,
            XrdSfsXferSize     buffer_size)
 {
    DO_THROTTLE(buffer_size);
-   ErrorSentry sentry(error, m_sfs->error);
    return m_sfs->read(fileOffset, buffer, buffer_size);
 }
 
@@ -154,7 +183,6 @@ File::read(XrdSfsAio *aioparm)
                                           (char *)aioparm->sfsAio.aio_buf,
                                   (XrdSfsXferSize)aioparm->sfsAio.aio_nbytes);
    aioparm->doneRead();
-   ErrorSentry sentry(error, m_sfs->error);
    return SFS_OK;
 }
 
@@ -164,7 +192,6 @@ File::write(      XrdSfsFileOffset   fileOffset,
                   XrdSfsXferSize     buffer_size)
 {
    DO_THROTTLE(buffer_size);
-   ErrorSentry sentry(error, m_sfs->error);
    return m_sfs->write(fileOffset, buffer, buffer_size);
 }
 
@@ -174,45 +201,37 @@ File::write(XrdSfsAio *aioparm)
    aioparm->Result = this->write((XrdSfsFileOffset)aioparm->sfsAio.aio_offset,
                                            (char *)aioparm->sfsAio.aio_buf,
                                    (XrdSfsXferSize)aioparm->sfsAio.aio_nbytes);
-   aioparm->doneRead();
-   ErrorSentry sentry(error, m_sfs->error);
+   aioparm->doneWrite();
    return SFS_OK;
 }
 
 int
 File::sync()
 {
-   ErrorSentry sentry(error, m_sfs->error);
    return m_sfs->sync();
 }
 
 int
 File::sync(XrdSfsAio *aiop)
 {
-   aiop->Result = this->sync();
-   aiop->doneWrite();
-   ErrorSentry sentry(error, m_sfs->error);
    return m_sfs->sync(aiop);
 }
 
 int
 File::stat(struct stat *buf)
 {
-   ErrorSentry sentry(error, m_sfs->error);
    return m_sfs->stat(buf);
 }
 
 int
 File::truncate(XrdSfsFileOffset   fileOffset)
 {
-   ErrorSentry sentry(error, m_sfs->error);
    return m_sfs->truncate(fileOffset);
 }
 
 int
 File::getCXinfo(char cxtype[4], int &cxrsz)
 {
-   ErrorSentry sentry(error, m_sfs->error);
    return m_sfs->getCXinfo(cxtype, cxrsz);
 }
 
@@ -221,7 +240,6 @@ File::SendData(XrdSfsDio         *sfDio,
                XrdSfsFileOffset   offset,
                XrdSfsXferSize     size)
 {
-   ErrorSentry sentry(error, m_sfs->error);
    DO_THROTTLE(size);
    return m_sfs->SendData(sfDio, offset, size);
 }

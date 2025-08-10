@@ -38,7 +38,6 @@
 namespace XrdCl
 {
   class PostMaster;
-  class Message;
   class FileSystemPlugIn;
   struct MessageSendParams;
 
@@ -75,36 +74,38 @@ namespace XrdCl
     //--------------------------------------------------------------------------
     enum Flags
     {
-      None     = 0,              //!< Nothing
-      Compress = kXR_compress,   //!< Read compressed data for open (ignored),
-                                 //!< for kXR_locate return unique hosts
-      Delete   = kXR_delete,     //!< Open a new file, deleting any existing
-                                 //!< file
-      Force    = kXR_force,      //!< Ignore file usage rules, for kXR_locate
-                                 //!< it means ignoreing network dependencies
-      MakePath = kXR_mkpath,     //!< Create directory path if it does not
-                                 //!< already exist
-      New      = kXR_new,        //!< Open the file only if it does not already
-                                 //!< exist
-      NoWait   = kXR_nowait,     //!< Open the file only if it does not cause
-                                 //!< a wait. For locate: provide a location as
-                                 //!< soon as one becomes known. This means
-                                 //!< that not all locations are necessarily
-                                 //!< returned. If the file does not exist a
-                                 //!< wait is still imposed.
-      Append   = kXR_open_apnd,  //!< Open only for appending
-      Read     = kXR_open_read,  //!< Open only for reading
-      Update   = kXR_open_updt,  //!< Open for reading and writing
-      Write    = kXR_open_wrto,  //!< Open only for writing
-      POSC     = kXR_posc,       //!< Enable Persist On Successful Close
-                                 //!< processing
-      Refresh  = kXR_refresh,    //!< Refresh the cached information on file's
-                                 //!< location. Voids NoWait.
-      Replica  = kXR_replica,    //!< The file is being opened for replica
-                                 //!< creation
-      SeqIO    = kXR_seqio,      //!< File will be read or written sequentially
-      PrefName = kXR_prefname    //!< Hostname response is prefered, applies
-                                 //!< only to FileSystem::Locate
+      None     = 0,                 //!< Nothing
+      Compress = kXR_compress,      //!< Read compressed data for open (ignored),
+                                    //!< for kXR_locate return unique hosts
+      Delete   = kXR_delete,        //!< Open a new file, deleting any existing
+                                    //!< file
+      Force    = kXR_force,         //!< Ignore file usage rules, for kXR_locate
+                                    //!< it means ignoreing network dependencies
+      MakePath = kXR_mkpath,        //!< Create directory path if it does not
+                                    //!< already exist
+      New      = kXR_new,           //!< Open the file only if it does not already
+                                    //!< exist
+      NoWait   = kXR_nowait,        //!< Open the file only if it does not cause
+                                    //!< a wait. For locate: provide a location as
+                                    //!< soon as one becomes known. This means
+                                    //!< that not all locations are necessarily
+                                    //!< returned. If the file does not exist a
+                                    //!< wait is still imposed.
+//      Append   = kXR_open_apnd,   //!< Open only for appending
+      Read     = kXR_open_read,     //!< Open only for reading
+      Update   = kXR_open_updt,     //!< Open for reading and writing
+      Write    = kXR_open_wrto,     //!< Open only for writing
+      POSC     = kXR_posc,          //!< Enable Persist On Successful Close
+                                    //!< processing
+      Refresh  = kXR_refresh,       //!< Refresh the cached information on file's
+                                    //!< location. Voids NoWait.
+      Replica  = kXR_replica,       //!< The file is being opened for replica
+                                    //!< creation
+      SeqIO    = kXR_seqio,         //!< File will be read or written sequentially
+      PrefName = kXR_prefname,      //!< Hostname response is prefered, applies
+                                    //!< only to FileSystem::Locate
+      IntentDirList = kXR_4dirlist  //!< Make sure the server knows we are doing
+                                    //!< locate in context of a dir list operation
     };
   };
   XRDOUC_ENUM_OPERATORS( OpenFlags::Flags )
@@ -160,7 +161,8 @@ namespace XrdCl
       Recursive = 4,  //!< Do a recursive listing
       Merge     = 8,  //!< Merge duplicates
       Chunked   = 16, //!< Serve chunked results for better performance
-      Zip       = 32  //!< List content of ZIP files
+      Zip       = 32, //!< List content of ZIP files
+      Cksm      = 64  //!< Get checksum for every entry
     };
   };
   XRDOUC_ENUM_OPERATORS( DirListFlags::Flags )
@@ -172,18 +174,27 @@ namespace XrdCl
   {
     enum Flags
     {
-      None        = 0,            //!< no flags
-      Colocate    = kXR_coloc,    //!< co-locate staged files, if possible
-      Fresh       = kXR_fresh,    //!< refresh file access time even if
-                                  //!< the location is known
-      Stage       = kXR_stage,    //!< stage the file to disk if it is not
-                                  //!< online
-      WriteMode   = kXR_wmode,    //!< the file will be accessed for
-                                  //!< modification
-      Cancel      = kXR_cancel
+      None        = 0,              //!< no flags
+      Colocate    = kXR_coloc,      //!< co-locate staged files, if possible
+      Fresh       = kXR_fresh,      //!< refresh file access time even if
+                                    //!< the location is known
+      Stage       = kXR_stage,      //!< stage the file to disk if it is not
+                                    //!< online
+      WriteMode   = kXR_wmode,      //!< the file will be accessed for
+                                    //!< modification
+      Cancel      = kXR_cancel,     //!< cancel staging request
+      Evict       = kXR_evict << 8  //!< evict the file from disk cache
+                                    //!< we have to shift kXR_evict as its value
+                                    //!< is the same as cancel's because this
+                                    //!< flag goes to options extension
     };
   };
   XRDOUC_ENUM_OPERATORS( PrepareFlags::Flags )
+
+  //----------------------------------------------------------------------------
+  //! Forward declaration of the implementation class holding the data members
+  //----------------------------------------------------------------------------
+  struct FileSystemImpl;
 
   //----------------------------------------------------------------------------
   //! Send file/filesystem queries to an XRootD cluster
@@ -630,6 +641,36 @@ namespace XrdCl
                             XRD_WARN_UNUSED_RESULT;
 
       //------------------------------------------------------------------------
+      //! Send cache into the server - async
+      //!
+      //! @param info      the info string to be sent
+      //! @param handler   handler to be notified when the response arrives,
+      //!                  the response parameter will hold a Buffer object
+      //!                  if the procedure is successful
+      //! @param timeout   timeout value, if 0 the environment default will
+      //!                  be used
+      //! @return          status of the operation
+      //------------------------------------------------------------------------
+      XRootDStatus SendCache( const std::string &info,
+                              ResponseHandler   *handler,
+                              uint16_t           timeout = 0 )
+                              XRD_WARN_UNUSED_RESULT;
+
+      //------------------------------------------------------------------------
+      //! Send cache into the server - sync
+      //!
+      //! @param info      the info string to be sent
+      //! @param response  the response (to be deleted by the user)
+      //! @param timeout   timeout value, if 0 the environment default will
+      //!                  be used
+      //! @return          status of the operation
+      //------------------------------------------------------------------------
+      XRootDStatus SendCache( const std::string  &info,
+                              Buffer            *&response,
+                              uint16_t            timeout = 0 )
+                              XRD_WARN_UNUSED_RESULT;
+
+      //------------------------------------------------------------------------
       //! Send info to the server (up to 1024 characters)- async
       //!
       //! @param info      the info string to be sent
@@ -698,6 +739,130 @@ namespace XrdCl
                             XRD_WARN_UNUSED_RESULT;
 
       //------------------------------------------------------------------------
+      //! Set extended attributes - async
+      //!
+      //! @param attrs   : list of extended attributes to set
+      //! @param handler : handler to be notified when the response arrives,
+      //!                  the response parameter will hold a std::vector of
+      //!                  XAttrStatus objects
+      //! @param timeout : timeout value, if 0 the environment default will
+      //!                  be used
+      //!
+      //! @return        : status of the operation
+      //------------------------------------------------------------------------
+      XRootDStatus SetXAttr( const std::string           &path,
+                             const std::vector<xattr_t>  &attrs,
+                             ResponseHandler             *handler,
+                             uint16_t                     timeout = 0 );
+
+      //------------------------------------------------------------------------
+      //! Set extended attributes - sync
+      //!
+      //! @param attrs   : list of extended attributes to set
+      //! @param result  : result of the operation
+      //! @param timeout : timeout value, if 0 the environment default will
+      //!                  be used
+      //!
+      //! @return        : status of the operation
+      //------------------------------------------------------------------------
+      XRootDStatus SetXAttr( const std::string           &path,
+                             const std::vector<xattr_t>  &attrs,
+                             std::vector<XAttrStatus>    &result,
+                             uint16_t                     timeout = 0 );
+
+      //------------------------------------------------------------------------
+      //! Get extended attributes - async
+      //!
+      //! @param attrs   : list of extended attributes to get
+      //! @param handler : handler to be notified when the response arrives,
+      //!                  the response parameter will hold a std::vector of
+      //!                  XAttr objects
+      //! @param timeout : timeout value, if 0 the environment default will
+      //!                  be used
+      //!
+      //! @return        : status of the operation
+      //------------------------------------------------------------------------
+      XRootDStatus GetXAttr( const std::string               &path,
+                             const std::vector<std::string>  &attrs,
+                             ResponseHandler                 *handler,
+                             uint16_t                         timeout = 0 );
+
+      //------------------------------------------------------------------------
+      //! Get extended attributes - sync
+      //!
+      //! @param attrs   : list of extended attributes to get
+      //! @param result  : result of the operation
+      //! @param timeout : timeout value, if 0 the environment default will
+      //!                  be used
+      //!
+      //! @return        : status of the operation
+      //------------------------------------------------------------------------
+      XRootDStatus GetXAttr( const std::string               &path,
+                             const std::vector<std::string>  &attrs,
+                             std::vector<XAttr>              &result,
+                             uint16_t                         timeout = 0 );
+
+      //------------------------------------------------------------------------
+      //! Delete extended attributes - async
+      //!
+      //! @param attrs   : list of extended attributes to set
+      //! @param handler : handler to be notified when the response arrives,
+      //!                  the response parameter will hold a std::vector of
+      //!                  XAttrStatus objects
+      //! @param timeout : timeout value, if 0 the environment default will
+      //!                  be used
+      //!
+      //! @return        : status of the operation
+      //------------------------------------------------------------------------
+      XRootDStatus DelXAttr( const std::string               &path,
+                             const std::vector<std::string>  &attrs,
+                             ResponseHandler                 *handler,
+                             uint16_t                         timeout = 0 );
+
+      //------------------------------------------------------------------------
+      //! Delete extended attributes - sync
+      //!
+      //! @param attrs   : list of extended attributes to set
+      //! @param result  : result of the operation
+      //! @param timeout : timeout value, if 0 the environment default will
+      //!                  be used
+      //!
+      //! @return        : status of the operation
+      //------------------------------------------------------------------------
+      XRootDStatus DelXAttr( const std::string               &path,
+                             const std::vector<std::string>  &attrs,
+                             std::vector<XAttrStatus>        &result,
+                             uint16_t                         timeout = 0 );
+
+      //------------------------------------------------------------------------
+      //! List extended attributes - async
+      //!
+      //! @param handler : handler to be notified when the response arrives,
+      //!                  the response parameter will hold a std::vector of
+      //!                  XAttr objects
+      //! @param timeout : timeout value, if 0 the environment default will
+      //!                  be used
+      //!
+      //! @return        : status of the operation
+      //------------------------------------------------------------------------
+      XRootDStatus ListXAttr( const std::string         &path,
+                              ResponseHandler           *handler,
+                              uint16_t                   timeout = 0 );
+
+      //------------------------------------------------------------------------
+      //! List extended attributes - sync
+      //!
+      //! @param result  : result of the operation
+      //! @param timeout : timeout value, if 0 the environment default will
+      //!                  be used
+      //!
+      //! @return        : status of the operation
+      //------------------------------------------------------------------------
+      XRootDStatus ListXAttr( const std::string    &path,
+                              std::vector<XAttr>   &result,
+                              uint16_t              timeout = 0 );
+
+      //------------------------------------------------------------------------
       //! Set filesystem property
       //!
       //! Filesystem properties:
@@ -717,38 +882,48 @@ namespace XrdCl
       FileSystem &operator = (const FileSystem &other);
 
       //------------------------------------------------------------------------
-      // Send a message in a locked environment
-      //------------------------------------------------------------------------
-      Status Send( Message                 *msg,
-                   ResponseHandler         *handler,
-                   MessageSendParams       &params );
-
-      //------------------------------------------------------------------------
-      // Assign a load balancer if it has not already been assigned
-      //------------------------------------------------------------------------
-      void AssignLoadBalancer( const URL &url );
-
-      //------------------------------------------------------------------------
       // Lock the internal lock
       //------------------------------------------------------------------------
-      void Lock()
-      {
-        pMutex.Lock();
-      }
+      void Lock();
 
       //------------------------------------------------------------------------
       // Unlock the internal lock
       //------------------------------------------------------------------------
-      void UnLock()
-      {
-        pMutex.UnLock();
-      }
+      void UnLock();
 
-      XrdSysMutex       pMutex;
-      bool              pLoadBalancerLookupDone;
-      bool              pFollowRedirects;
-      URL              *pUrl;
-      FileSystemPlugIn *pPlugIn;
+      //------------------------------------------------------------------------
+      //! Generic implementation of SendCache and SendInfo
+      //!
+      //! @param info    : the info string to be sent
+      //! @param handler : handler to be notified when the response arrives.
+      //! @param timeout : timeout value or 0 for default.
+      //! @return          status of the operation
+      //------------------------------------------------------------------------
+      XRootDStatus SendSet( const char        *prefix,
+                            const std::string &info,
+                            ResponseHandler   *handler,
+                            uint16_t           timeout = 0 )
+                            XRD_WARN_UNUSED_RESULT;
+
+      //------------------------------------------------------------------------
+      //! Generic implementation of xattr operation
+      //!
+      //! @param subcode : xattr operation code
+      //! @param path    : path to the file
+      //! @param attrs   : operation argument
+      //! @param handler : operation handler
+      //! @param timeout : operation timeout
+      //------------------------------------------------------------------------
+      template<typename T>
+      Status XAttrOperationImpl( kXR_char              subcode,
+                                 kXR_char              options,
+                                 const std::string    &path,
+                                 const std::vector<T> &attrs,
+                                 ResponseHandler      *handler,
+                                 uint16_t              timeout = 0 );
+
+      FileSystemImpl   *pImpl;   //< pointer to implementation (TODO: once we can break ABI we can use a shared pointer here, and then we can drop the FileSystemData in source file)
+      FileSystemPlugIn *pPlugIn; //< file system plug-in
   };
 }
 

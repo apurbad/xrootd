@@ -47,6 +47,14 @@ namespace XrdCl
       URL( const std::string &url );
 
       //------------------------------------------------------------------------
+      //! Constructor
+      //!
+      //! @param url  an url in format:
+      //!             protocol://user:password\@host:port/path?param1=x&param2=y
+      //------------------------------------------------------------------------
+      URL( const char *url );
+
+      //------------------------------------------------------------------------
       //! Is the url valid
       //------------------------------------------------------------------------
       bool IsValid() const;
@@ -63,6 +71,16 @@ namespace XrdCl
       bool IsLocalFile() const;
 
       //------------------------------------------------------------------------
+      //! Does the protocol indicate encryption
+      //------------------------------------------------------------------------
+      bool IsSecure() const;
+
+      //------------------------------------------------------------------------
+      //! Is the URL used in TPC context
+      //------------------------------------------------------------------------
+      bool IsTPC() const;
+
+      //------------------------------------------------------------------------
       //! Get the URL
       //------------------------------------------------------------------------
       std::string GetURL() const
@@ -71,12 +89,23 @@ namespace XrdCl
       }
 
       //------------------------------------------------------------------------
+      //! Get the URL with authz information obfuscated
+      //------------------------------------------------------------------------
+      std::string GetObfuscatedURL() const;
+
+      //------------------------------------------------------------------------
       //! Get the host part of the URL (user:password\@host:port)
       //------------------------------------------------------------------------
       std::string GetHostId() const
       {
         return pHostId;
       }
+
+      //------------------------------------------------------------------------
+      //! Get the host part of the URL (user:password\@host:port) plus channel
+      //! specific CGI (xrdcl.identity & xrd.gsiusrpxy)
+      //------------------------------------------------------------------------
+      std::string GetChannelId() const;
 
       //------------------------------------------------------------------------
       //! Get location (protocol://host:port/path)
@@ -221,6 +250,11 @@ namespace XrdCl
       //! Get the URL params as string
       //------------------------------------------------------------------------
       std::string GetParamsAsString() const;
+
+      //------------------------------------------------------------------------
+      //! Get the login token if present in the opaque info
+      //------------------------------------------------------------------------
+      std::string GetLoginToken() const;
 
       //------------------------------------------------------------------------
       //! Get the URL params as string

@@ -28,19 +28,18 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <ctype.h>
-#include <string.h>
-#include <errno.h>
+#include <cctype>
+#include <cstring>
 #include <dirent.h>
 #include <unistd.h>
 
 #include "XrdOuc/XrdOucNSWalk.hh"
 #include "XrdOuc/XrdOucTList.hh"
+#include "XrdSys/XrdSysE2T.hh"
 #include "XrdSys/XrdSysError.hh"
 #include "XrdSys/XrdSysHeaders.hh"
 #include "XrdSys/XrdSysPlatform.hh"
 
-using namespace std;
 
 /******************************************************************************/
 /*                           C o n s t r u c t o r                            */
@@ -246,11 +245,10 @@ int XrdOucNSWalk::Emsg(const char *pfx, int rc, const char *txt1,
 {
    if (eDest) eDest->Emsg(pfx, rc, txt1, txt2);
       else if (mPfx)
-              {char letter, *etxt = strerror(rc);
-               letter = tolower(*etxt);
-               cerr <<mPfx <<": Unable to " <<txt1;
-               if (txt2) cerr <<' ' <<txt2;
-               cerr <<"; " <<letter <<(etxt+1) <<endl;
+              {const char *etxt = XrdSysE2T(rc);
+               std::cerr <<mPfx <<": Unable to " <<txt1;
+               if (txt2) std::cerr <<' ' <<txt2;
+               std::cerr <<"; " <<(etxt) <<"\n" << std::flush;
               }
    return rc;
 }

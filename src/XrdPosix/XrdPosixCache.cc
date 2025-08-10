@@ -28,7 +28,7 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include "XrdOuc/XrdOucCache2.hh"
+#include "XrdOuc/XrdOucCache.hh"
 #include "XrdOuc/XrdOucCacheStats.hh"
 #include "XrdPosix/XrdPosixCache.hh"
 
@@ -38,7 +38,7 @@
   
 namespace XrdPosixGlobals
 {
-extern XrdOucCache2              *theCache;
+extern XrdOucCache *theCache;
 }
 
 using namespace XrdPosixGlobals;
@@ -49,7 +49,7 @@ using namespace XrdPosixGlobals;
 
 int XrdPosixCache::CachePath(const char *url, char *buff, int blen)
 {
-   return theCache->LocalFilePath(url, buff, blen, XrdOucCache2::ForPath);
+   return theCache->LocalFilePath(url, buff, blen, XrdOucCache::ForPath);
 }
 
 /******************************************************************************/
@@ -60,8 +60,8 @@ int XrdPosixCache::CacheQuery(const char *url, bool hold)
 {
 
    int rc = theCache->LocalFilePath(url, 0, 0,
-                                    (hold ? XrdOucCache2::ForAccess
-                                          : XrdOucCache2::ForInfo)
+                                    (hold ? XrdOucCache::ForAccess
+                                          : XrdOucCache::ForInfo)
                                    );
    if (!rc) return 1;
    if (rc == -EREMOTE) return 0;
@@ -94,7 +94,7 @@ int XrdPosixCache::Stat(const char *path, struct stat &sbuff)
 /******************************************************************************/
 
 void XrdPosixCache::Statistics(XrdOucCacheStats &Stats)
-                        {return theCache->Stats.Get(Stats);}
+                        {return theCache->Statistics.Get(Stats);}
 
 /******************************************************************************/
 /*                              T r u n c a t e                               */

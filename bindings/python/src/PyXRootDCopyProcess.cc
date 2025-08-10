@@ -32,10 +32,12 @@
 #include <XrdCl/XrdClDefaultEnv.hh>
 #include <XrdCl/XrdClConstants.hh>
 
+#include <memory>
+
 namespace PyXRootD
 {
   //----------------------------------------------------------------------------
-  // Set the unmber of parallel jobs
+  // Set the number of parallel jobs
   //----------------------------------------------------------------------------
   PyObject* CopyProcess::Parallel( CopyProcess *self, PyObject *args, PyObject *kwds )
   {
@@ -63,10 +65,11 @@ namespace PyXRootD
     XrdCl::Env *env = XrdCl::DefaultEnv::GetEnv();
 
     static const char *kwlist[]
-      = { "source", "target", "sourcelimit", "force", "posc", "coerce",
-          "mkdir", "thirdparty", "checksummode", "checksumtype",
+      = { "source", "target", "sourcelimit", "force", "posc",
+          "coerce", "mkdir", "thirdparty", "checksummode", "checksumtype",
           "checksumpreset", "dynamicsource", "chunksize", "parallelchunks", "inittimeout",
-          "tpctimeout", NULL };
+          "tpctimeout", "rmBadCksum", "cptimeout", "xratethreshold", "xrate",
+          "retry", "cont", "rtrplc", NULL };
 
     const char  *source;
     const char  *target;
@@ -80,6 +83,12 @@ namespace PyXRootD
     const char  *checkSumType      = "";
     const char  *checkSumPreset    = "";
     bool         dynamicSource     = false;
+    bool         rmBadCksum        = false;
+    long long    xRateThreshold    = 0;
+    long long    xRate             = 0;
+    long long    retry             = 0;
+    bool         cont              = false;
+    const char  *rtrplc            = "force";
 
 
     int val = XrdCl::DefaultCPChunkSize;
@@ -98,32 +107,45 @@ namespace PyXRootD
     env->GetInt( "CPTPCTimeout", val );
     uint16_t tpcTimeout = val;
 
+    val = XrdCl::DefaultCPTimeout;
+    env->GetInt( "CPTimeout", val );
+    uint16_t cpTimeout = val;
 
-    if ( !PyArg_ParseTupleAndKeywords( args, kwds, "ss|HbbbbssssbIHHH:add_job",
-         (char**) kwlist, &source, &target, &sourceLimit, &force, &posc,
+    if ( !PyArg_ParseTupleAndKeywords( args, kwds, "ss|HbbbbssssbIHHHbHLLLbs:add_job",
+         (char**) kwlist,
+         &source, &target, &sourceLimit, &force, &posc,
          &coerce, &mkdir, &thirdParty, &checkSumMode, &checkSumType,
-         &checkSumPreset, &dynamicSource, &chunkSize, &parallelChunks,
-         &initTimeout, &tpcTimeout) )
+         &checkSumPreset, &dynamicSource, &chunkSize, &parallelChunks, &initTimeout,
+         &tpcTimeout, &rmBadCksum, &cpTimeout, &xRateThreshold, &xRate,
+         &retry, &cont, &rtrplc ) )
       return NULL;
 
     XrdCl::PropertyList properties;
     self->results->push_back(XrdCl::PropertyList());
 
-    properties.Set( "source",         source         );
-    properties.Set( "target",         target         );
-    properties.Set( "force",          force          );
-    properties.Set( "posc",           posc           );
-    properties.Set( "coerce",         coerce         );
-    properties.Set( "makeDir",        mkdir          );
-    properties.Set( "dynamicSource",  dynamicSource  );
-    properties.Set( "thirdParty",     thirdParty     );
-    properties.Set( "checkSumMode",   checkSumMode   );
-    properties.Set( "checkSumType",   checkSumType   );
-    properties.Set( "checkSumPreset", checkSumPreset );
-    properties.Set( "chunkSize",      chunkSize      );
-    properties.Set( "parallelChunks", parallelChunks );
-    properties.Set( "initTimeout",    initTimeout    );
-    properties.Set( "tpcTimeout",     tpcTimeout     );
+    properties.Set( "source",          source          );
+    properties.Set( "target",          target          );
+    properties.Set( "force",           force           );
+    properties.Set( "posc",            posc            );
+    properties.Set( "coerce",          coerce          );
+    properties.Set( "makeDir",         mkdir           );
+    properties.Set( "dynamicSource",   dynamicSource   );
+    properties.Set( "thirdParty",      thirdParty      );
+    properties.Set( "checkSumMode",    checkSumMode    );
+    properties.Set( "checkSumType",    checkSumType    );
+    properties.Set( "checkSumPreset",  checkSumPreset  );
+    properties.Set( "chunkSize",       chunkSize       );
+    properties.Set( "parallelChunks",  parallelChunks  );
+    properties.Set( "initTimeout",     initTimeout     );
+    properties.Set( "tpcTimeout",      tpcTimeout      );
+    properties.Set( "rmOnBadCksum",    rmBadCksum      );
+    properties.Set( "cpTimeout",       cpTimeout       );
+    properties.Set( "xrateThreshold",  xRateThreshold  );
+    properties.Set( "xrate",           xRate           );
+    properties.Set( "continue",        cont );
+
+    env->PutInt( "CpRetry", retry );
+    env->PutString( "CpRetryPolicy", rtrplc );
 
     if( sourceLimit > 1 )
     {
@@ -165,19 +187,19 @@ namespace PyXRootD
     (void) CopyProcessType;   // Suppress unused variable warning
     static const char          *kwlist[]   = { "handler", NULL };
     PyObject                   *pyhandler  = 0;
-    XrdCl::CopyProgressHandler *handler    = 0;
+    std::unique_ptr<XrdCl::CopyProgressHandler> handler;
 
     if( !PyArg_ParseTupleAndKeywords( args, kwds, "|O", (char**) kwlist,
         &pyhandler ) ) return NULL;
 
-    handler = new CopyProgressHandler( pyhandler );
+    handler = std::make_unique<CopyProgressHandler>( pyhandler );
     XrdCl::XRootDStatus status;
 
     //--------------------------------------------------------------------------
     //! Allow other threads to acquire the GIL while the copy jobs are running
     //--------------------------------------------------------------------------
     Py_BEGIN_ALLOW_THREADS
-    status = self->process->Run( handler );
+    status = self->process->Run( handler.get() );
     Py_END_ALLOW_THREADS
 
     PyObject *tuple = PyTuple_New(2);

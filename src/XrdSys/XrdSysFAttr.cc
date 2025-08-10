@@ -28,9 +28,9 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <errno.h>
-#include <stdio.h>
-#include <stdlib.h>
+#include <cerrno>
+#include <cstdio>
+#include <cstdlib>
 
 #include "XrdSys/XrdSysError.hh"
 #include "XrdSys/XrdSysFAttr.hh"
@@ -68,28 +68,23 @@ XrdSysXAttr *XrdSysFAttr::Xat = &dfltXAttr;
   
 #if    defined(__FreeBSD__)
 #include "XrdSys/XrdSysFAttrBsd.icc"
-#elif defined(__linux__)
+#elif defined(__linux__) || defined(__GNU__) || (defined(__FreeBSD_kernel__) && defined(__GLIBC__))
 #include "XrdSys/XrdSysFAttrLnx.icc"
 #elif defined(__APPLE__)
 #include "XrdSys/XrdSysFAttrMac.icc"
 #elif defined(__solaris__)
 #include "XrdSys/XrdSysFAttrSun.icc"
 #else
-int XrdSysFAttr::Del(const char *Aname, const char *Path)
+int XrdSysFAttr::Del(const char *Aname, const char *Path, int fd)
                 {return -ENOTSUP;}
-int XrdSysFAttr::Del(const char *Aname, int fd)
+int XrdSysFAttr::List(AList **aPL, const char *Path, int fd, int getSz)
                 {return -ENOTSUP;}
-int XrdSysFAttr::Get(const char *Aname, void *Aval, int Avsz, const char *Path)
-                {return -ENOTSUP;}
-int XrdSysFAttr::Get(const char *Aname, void *Aval, int Avsz, int fd)
-                {return -ENOTSUP;}
-int XrdSysFAttr::Set(const char *Aname, const void *Aval, int Avsz,
-                     const char *Path,  int isNew)
+int XrdSysFAttr::Get(const char *Aname, void *Aval, int Avsz,
+                     const char *Path, int fd)
                 {return -ENOTSUP;}
 int XrdSysFAttr::Set(const char *Aname, const void *Aval, int Avsz,
-                     int         fd,    int isNew)
+                     const char *Path, int fd, int isNew)
                 {return -ENOTSUP;}
-int XrdSysFAttr::Set(XrdSysError *erp) {return 0;}
 #endif
 
 /******************************************************************************/
@@ -103,7 +98,7 @@ int XrdSysFAttr::Diagnose(const char *Op, const char *Var,
 
 // Screen out common case
 //
-   if (ec == ENOATTR || ec == ENOENT) return -ENOENT;
+   if (ec == ENOATTR || ec == ENOENT) return -ec;
 
 // Format message insert and print if we can actually say anything
 //
@@ -125,7 +120,7 @@ void XrdSysFAttr::Free(XrdSysFAttr::AList *aLP)
 {
    AList *aNP;
 
-// Free all teh structs using free as they were allocated using malloc()
+// Free all the structs using free as they were allocated using malloc()
 //
    while(aLP) {aNP = aLP->Next; free(aLP); aLP = aNP;}
 }
@@ -143,7 +138,7 @@ XrdSysFAttr::AList *XrdSysFAttr::getEnt(const char *Path,  int fd,
 
 // Get the data size of this attribute if so wanted
 //
-   if (!n || (msP && !(sz = Get(Aname, 0, 0, Path, fd)))) return 0;
+   if (!n || (msP && (sz = Get(Aname, 0, 0, Path, fd)) < 0)) return 0;
 
 // Allocate a new dynamic struct
 //
@@ -166,8 +161,8 @@ XrdSysFAttr::AList *XrdSysFAttr::getEnt(const char *Path,  int fd,
 /*                             S e t P l u g i n                              */
 /******************************************************************************/
   
-void XrdSysFAttr::SetPlugin(XrdSysXAttr *xaP)
+void XrdSysFAttr::SetPlugin(XrdSysXAttr *xaP, bool push)
 {
-   if (Xat && Xat != &dfltXAttr) delete Xat;
+   if (!push && Xat && Xat != &dfltXAttr) delete Xat;
    XrdSysXAttrActive = Xat = xaP;
 }

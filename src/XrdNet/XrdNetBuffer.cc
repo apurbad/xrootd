@@ -32,10 +32,7 @@
 #include <unistd.h>
 #endif
 #include <sys/types.h>
-#include <stdlib.h>
-#if !defined(__APPLE__) && !defined(__FreeBSD__)
-#include <malloc.h>
-#endif
+#include <cstdlib>
 
 #include "XrdNet/XrdNetBuffer.hh"
 #include "XrdSys/XrdSysPlatform.hh"
@@ -83,7 +80,7 @@ XrdNetBuffer *XrdNetBufferQ::Alloc()
 //
    if ((bp = BuffStack.Pop())) numbuff--;
       else if ((bp = new XrdNetBuffer(this))
-           &&  !(bp->data = (char *)memalign(alignit, size)))
+           &&  posix_memalign((void **)&(bp->data), alignit, size))
               {delete bp; bp = 0;}
 
 // Unlock the data area

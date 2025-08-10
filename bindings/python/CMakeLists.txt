@@ -1,30 +1,33 @@
+cmake_minimum_required(VERSION 3.16...3.31 FATAL_ERROR)
 
-set(SETUP_PY_IN    "${CMAKE_CURRENT_SOURCE_DIR}/setup.py.in")
-set(SETUP_PY       "${CMAKE_CURRENT_BINARY_DIR}/setup.py")
-set(DEPS           "${CMAKE_CURRENT_SOURCE_DIR}/libs/__init__.py")
-set(OUTPUT         "${CMAKE_CURRENT_BINARY_DIR}/python_bindings")
-set(XRD_SRCINCDIR  "${CMAKE_SOURCE_DIR}/src")
-set(XRD_BININCDIR  "${CMAKE_BINARY_DIR}/src")
-set(XRDCL_LIBDIR   "${CMAKE_BINARY_DIR}/src/XrdCl")
-set(XRD_LIBDIR     "${CMAKE_BINARY_DIR}/src")
+project(PyXRootD LANGUAGES CXX)
 
-if( "${CMAKE_CXX_COMPILER_ID}" STREQUAL "Clang" )
-  if( CMAKE_CXX_COMPILER_VERSION VERSION_LESS 3.7 )
-    message( "clang 3.5" )
-    set( CLANG_PROHIBITED ", '-Wp,-D_FORTIFY_SOURCE=2', '-fstack-protector-strong'" )
-  endif()
+if( CMAKE_VERSION VERSION_LESS 3.18 )
+  set(PYTHON_COMPONENTS Interpreter Development)
+else()
+  set(PYTHON_COMPONENTS Interpreter Development.Module)
 endif()
 
-configure_file(${SETUP_PY_IN} ${SETUP_PY})
+find_package(Python REQUIRED COMPONENTS ${PYTHON_COMPONENTS})
 
-add_custom_command(OUTPUT ${OUTPUT}
-                   COMMAND ${PYTHON_EXECUTABLE} ${SETUP_PY} build
-                   DEPENDS ${DEPS})
+if(CMAKE_SOURCE_DIR STREQUAL PROJECT_SOURCE_DIR OR PYPI_BUILD)
+  add_subdirectory(src)
+else()
+  configure_file(setup.py setup.py)
+  file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/VERSION "${XRootD_VERSION_STRING}")
 
-add_custom_target(python_target ALL DEPENDS ${OUTPUT} XrdCl)
+  option(INSTALL_PYTHON_BINDINGS "Install Python bindings" TRUE)
 
-install(
-  CODE
-  "EXECUTE_PROCESS(
-    COMMAND ${PYTHON_EXECUTABLE} ${SETUP_PY} install --prefix \$ENV{DESTDIR}/${CMAKE_INSTALL_PREFIX} --record PYTHON_INSTALLED)")
+  if(INSTALL_PYTHON_BINDINGS)
+    set(PIP_OPTIONS "" CACHE STRING "Install options for pip")
 
+    install(CODE "
+      execute_process(COMMAND ${Python_EXECUTABLE} -m pip install ${PIP_OPTIONS}
+        --prefix \$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX} ${CMAKE_CURRENT_BINARY_DIR}
+        RESULT_VARIABLE INSTALL_STATUS COMMAND_ECHO STDOUT)
+      if(NOT INSTALL_STATUS EQUAL 0)
+        message(FATAL_ERROR \"Failed to install Python bindings\")
+      endif()
+    ")
+  endif()
+endif()

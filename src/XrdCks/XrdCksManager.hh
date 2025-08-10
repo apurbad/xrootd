@@ -68,6 +68,12 @@ virtual int         Size( const char  *Name=0);
 
 virtual int         Set(  const char *Pfn, XrdCksData &Cks, int myTime=0);
 
+// Valid options and the values, The high order bit must be zero
+//
+        enum {Cks_nomtchk = 0x00000001};
+
+        void        SetOpts(int opt);
+
 virtual int         Ver(  const char *Pfn, XrdCksData &Cks);
 
                     XrdCksManager(XrdSysError *erP, int iosz,
@@ -89,6 +95,8 @@ virtual int         Calc(const char *Pfn, time_t &MTime, XrdCksCalc *CksObj);
 virtual int         ModTime(const char *Pfn, time_t &MTime);
 
 private:
+
+using XrdCks::Calc;
 
 struct csInfo
       {char          Name[XrdCksData::NameSize];

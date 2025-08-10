@@ -27,14 +27,14 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <stdlib.h>
+#include <cstdlib>
 #include <unistd.h>
-#include <string.h>
+#include <cstring>
 #include <sys/types.h>
 #include <sys/stat.h>
-#include <time.h>
+#include <ctime>
 #include <fcntl.h>
-#include <errno.h>
+#include <cerrno>
 
 #include "XrdOuc/XrdOucString.hh"
 #include "XrdSut/XrdSutRndm.hh"
@@ -217,7 +217,7 @@ char *XrdSutRndm::GetBuffer(int len, int opt)
          if (filter) {
             j = i / 32;
             l = i - j * 32;
-            keep = (XrdSutCharMsk[opt][j] & (1 << l));
+            keep = (XrdSutCharMsk[opt][j%4] & (1 << l));
          }
          if (keep) {
             buf[k] = i;

@@ -1,28 +1,9 @@
-
-include(XRootDCommon)
-
-add_library(
-  XrdClTestsHelper SHARED
-  Server.cc Server.hh
-  Utils.cc Utils.hh
+add_library(XrdTestUtils SHARED
+  Server.cc  Server.hh
   TestEnv.cc TestEnv.hh
-  CppUnitXrdHelpers.hh)
+  Utils.cc   Utils.hh)
 
-target_link_libraries(
- XrdClTestsHelper
-  pthread
-  ${CPPUNIT_LIBRARIES}
-  ${ZLIB_LIBRARY}
-  XrdCl
-  XrdUtils)
+target_link_libraries(XrdTestUtils ZLIB::ZLIB XrdCl XrdUtils)
 
-add_executable(text-runner TextRunner.cc PathProcessor.hh)
-target_link_libraries(text-runner ${CMAKE_DL_LIBS} ${CPPUNIT_LIBRARIES} pthread)
-
-#-------------------------------------------------------------------------------
-# Install
-#-------------------------------------------------------------------------------
-install(
- TARGETS XrdClTestsHelper text-runner
- RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
- LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
+target_include_directories(XrdTestUtils
+  PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>)

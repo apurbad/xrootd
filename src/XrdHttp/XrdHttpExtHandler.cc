@@ -21,7 +21,7 @@
 //------------------------------------------------------------------------------
 
 
-
+#include "Xrd/XrdLink.hh"
 #include "XrdHttpExtHandler.hh"
 #include "XrdHttpReq.hh"
 #include "XrdHttpProtocol.hh"
@@ -52,7 +52,7 @@ int XrdHttpExtReq::StartChunkedResp(int code, const char *desc, const char *head
 {
   if (!prot) return -1;
 
-  return prot->StartChunkedResp(code, desc, header_to_add, true);
+  return prot->StartChunkedResp(code, desc, header_to_add, -1, true);
 }
 
 int XrdHttpExtReq::ChunkResp(const char *body, long long bodylen)
@@ -70,6 +70,12 @@ int XrdHttpExtReq::BuffgetData(int blen, char **data, bool wait) {
   return nb;
 }
 
+void XrdHttpExtReq::GetClientID(std::string &clid)
+{
+   char buff[512];
+   prot->Link->Client(buff, sizeof(buff));
+   clid = buff;
+}
 
 const XrdSecEntity &XrdHttpExtReq::GetSecEntity() const
 {
@@ -83,8 +89,12 @@ verb(req->requestverb), headers(req->allheaders) {
   resource = req->resource.c_str();
   int envlen = 0;
   
-  headers["xrd-http-query"] = req->opaque?req->opaque->Env(envlen):"";
-  headers["xrd-http-fullresource"] = req->resourceplusopaque.c_str();
+  const char *p = nullptr;
+  if (req->opaque)
+    p = req->opaque->Env(envlen);
+  headers["xrd-http-query"] = p ? p:"";
+  p = req->resourceplusopaque.c_str();
+  headers["xrd-http-fullresource"] = p ? p:"";
   headers["xrd-http-prot"] = prot->isHTTPS()?"https":"http";
   
   // These fields usually identify the client that connected
@@ -102,6 +112,12 @@ verb(req->requestverb), headers(req->allheaders) {
     clientgroups = prot->SecEntity.vorg;
     trim(clientgroups);
   }
-  
+
+  // Get the packet marking handle and the client scitag from the XrdHttp layer
+  pmark = prot->pmarkHandle;
+  mSciTag = req->mScitag;
+
+  tpcForwardCreds = prot->tpcForwardCreds;
+
   length = req->length;
 }

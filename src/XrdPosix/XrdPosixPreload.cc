@@ -28,10 +28,18 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
+#if defined(__clang__) && defined(_FORTIFY_SOURCE)
+#undef _FORTIFY_SOURCE
+#endif
+
+#if defined(__APPLE__)
+#define _DARWIN_USE_64_BIT_INODE 1
+#endif
+
 #include <sys/types.h>
-#include <stdarg.h>
+#include <cstdarg>
 #include <unistd.h>
-#include <stdlib.h>
+#include <cstdlib>
 
 #include "XrdPosix/XrdPosixLinkage.hh"
 #include "XrdPosix/XrdPosixOsDep.hh"
@@ -41,6 +49,22 @@
 /******************************************************************************/
 
 #include "XrdPosix/XrdPosixExtern.hh"
+
+#ifdef MUSL
+#undef creat64
+#undef fseeko64
+#undef ftello64
+#undef ftruncate64
+#undef lseek64
+#undef open64
+#undef pread64
+#undef pwrite64
+#undef readdir64
+#undef readdir64_r
+#undef statfs64
+#undef statvfs64
+#undef truncate64
+#endif
  
 /******************************************************************************/
 /*                   G l o b a l   D e c l a r a t i o n s                    */
@@ -261,7 +285,7 @@ int fseeko64(FILE *stream, off64_t offset, int whence)
 
 extern "C"
 {
-#if defined __linux__ && __GNUC__ && __GNUC__ >= 2
+#if defined(__linux__) and defined(_STAT_VER) and __GNUC__ and __GNUC__ >= 2
 int  __fxstat64(int ver, int fildes, struct stat64 *buf)
 #else
 int     fstat64(         int fildes, struct stat64 *buf)
@@ -269,7 +293,7 @@ int     fstat64(         int fildes, struct stat64 *buf)
 {
    static int Init = Xunix.Init(&Init);
 
-#ifdef __linux__
+#if defined(__linux__) and defined(_STAT_VER)
    return XrdPosix_FstatV(ver, fildes, (struct stat *)buf);
 #else
    return XrdPosix_Fstat (     fildes, (struct stat *)buf);
@@ -351,7 +375,7 @@ size_t fwrite(const void *ptr, size_t size, size_t nitems, FILE *stream)
 /*                             f g e t x a t t r                              */
 /******************************************************************************/
   
-#ifdef __linux__
+#if defined(__linux__) || defined(__GNU__) || (defined(__FreeBSD_kernel__) && defined(__GLIBC__))
 extern "C"
 {
 ssize_t fgetxattr (int fd, const char *name, void *value, size_t size)
@@ -367,7 +391,7 @@ ssize_t fgetxattr (int fd, const char *name, void *value, size_t size)
 /*                              g e t x a t t r                               */
 /******************************************************************************/
   
-#ifdef __linux__
+#if defined(__linux__) || defined(__GNU__) || (defined(__FreeBSD_kernel__) && defined(__GLIBC__))
 extern "C"
 {
 ssize_t getxattr (const char *path, const char *name, void *value, size_t size)
@@ -383,7 +407,7 @@ ssize_t getxattr (const char *path, const char *name, void *value, size_t size)
 /*                             l g e t x a t t r                              */
 /******************************************************************************/
   
-#ifdef __linux__
+#if defined(__linux__) || defined(__GNU__) || (defined(__FreeBSD_kernel__) && defined(__GLIBC__))
 extern "C"
 {
 ssize_t lgetxattr (const char *path, const char *name, void *value, size_t size)

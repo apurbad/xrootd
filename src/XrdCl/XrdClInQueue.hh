@@ -21,8 +21,9 @@
 
 #include <XrdSys/XrdSysPthread.hh>
 #include <map>
+#include <memory>
 #include <utility>
-#include "XrdCl/XrdClStatus.hh"
+#include "XrdCl/XrdClXRootDResponses.hh"
 #include "XrdCl/XrdClPostMasterInterfaces.hh"
 
 namespace XrdCl
@@ -36,17 +37,26 @@ namespace XrdCl
   {
     public:
       //------------------------------------------------------------------------
-      //! Add a fully reconstructed message to the queue
-      //------------------------------------------------------------------------
-      bool AddMessage( Message *msg );
-
-      //------------------------------------------------------------------------
-      //! Add a listener that should be notified about incoming messages
+      //! Add a listener that should be notified about incoming messages.
+      //! Freshly added handlers have no expire time set and will not trigger
+      //! the timeout reporting. The expiry is added by AssignTimeout or
+      //! GetHandlerForMessage.
       //!
       //! @param handler message handler
-      //! @param expires time when the message handler expires
+      //! @param rmMsg   will be set to true if a left over message matching the
+      //!                request has been removed from the queue
       //------------------------------------------------------------------------
-      void AddMessageHandler( IncomingMsgHandler *handler, time_t expires );
+      void AddMessageHandler( MsgHandler *handler, bool &rmMsg );
+
+      //------------------------------------------------------------------------
+      //! If the specified handler is in the queue but has not yet had an
+      //! expiry time assigned, query the handler for the expiry and record
+      //! it. Expiry will also be assigned by GetHandlerForMessage if not
+      //! already assigned.
+      //!
+      //! @param handler handler to check
+      //------------------------------------------------------------------------
+      void AssignTimeout( MsgHandler *handler );
 
       //------------------------------------------------------------------------
       //! Get a message handler interested in receiving message whose header
@@ -58,26 +68,25 @@ namespace XrdCl
       //!
       //! @return handler or 0 if none is interested
       //------------------------------------------------------------------------
-      IncomingMsgHandler *GetHandlerForMessage( Message  *msg,
-                                                time_t   &expires,
-                                                uint16_t &action );
+      MsgHandler *GetHandlerForMessage( std::shared_ptr<Message> &msg,
+                                                time_t                   &expires,
+                                                uint16_t                 &action );
 
       //------------------------------------------------------------------------
       //! Re-insert the handler without scanning the cached messages
       //------------------------------------------------------------------------
-      void ReAddMessageHandler( IncomingMsgHandler *handler, time_t expires );
+      void ReAddMessageHandler( MsgHandler *handler, time_t expires );
 
       //------------------------------------------------------------------------
       //! Remove a listener
       //------------------------------------------------------------------------
-      void RemoveMessageHandler( IncomingMsgHandler *handler );
+      void RemoveMessageHandler( MsgHandler *handler );
 
       //------------------------------------------------------------------------
       //! Report an event to the handlers
       //------------------------------------------------------------------------
-      void ReportStreamEvent( IncomingMsgHandler::StreamEvent event,
-                              uint16_t                        streamNum,
-                              Status                          status );
+      void ReportStreamEvent( MsgHandler::StreamEvent event,
+                              XRootDStatus                    status );
 
       //------------------------------------------------------------------------
       //! Timeout handlers
@@ -96,12 +105,10 @@ namespace XrdCl
       //!
       //! @return true if message discarded, otherwise false
       //------------------------------------------------------------------------
-      bool DiscardMessage(Message* msg, uint16_t& sid) const;
+      bool DiscardMessage(Message& msg, uint16_t& sid) const;
 
-      typedef std::pair<IncomingMsgHandler *, time_t> HandlerAndExpire;
+      typedef std::pair<MsgHandler *, time_t> HandlerAndExpire;
       typedef std::map<uint16_t, HandlerAndExpire> HandlerMap;
-      typedef std::map<uint16_t, Message*> MessageMap;
-      MessageMap pMessages;
       HandlerMap pHandlers;
       XrdSysRecMutex pMutex;
   };

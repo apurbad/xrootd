@@ -25,10 +25,9 @@
 #include "ProxyPrefixPlugin.hh"
 #include "ProxyPrefixFile.hh"
 #include "XrdVersion.hh"
-#include "XrdSys/XrdSysDNS.hh"
 #include "XrdCl/XrdClDefaultEnv.hh"
 #include "XrdCl/XrdClLog.hh"
-#include <stdlib.h>
+#include <cstdlib>
 #include <cstdio>
 
 XrdVERSIONINFO(XrdClGetPlugIn, XrdClGetPlugIn)
@@ -100,7 +99,7 @@ XrdCl::FileSystemPlugIn*
 ProxyFactory::CreateFileSystem(const std::string& url)
 {
   XrdCl::Log* log = XrdCl::DefaultEnv::GetLog();
-  log->Error(1, "FileSystem plugin implementation not suppoted");
+  log->Error(1, "FileSystem plugin implementation not supported");
   return static_cast<XrdCl::FileSystemPlugIn*>(0);
 }
 } // namespace xrdcl_proxy

@@ -25,7 +25,7 @@ typedef std::auto_ptr<XrdSfsFile> unique_sfs_ptr;
 
 class FileSystem;
 
-class File : public XrdSfsFile {
+class File final : public XrdSfsFile {
 
 friend class FileSystem;
 
@@ -36,89 +36,114 @@ public:
               XrdSfsFileOpenMode   openMode,
               mode_t               createMode,
         const XrdSecEntity        *client,
-        const char                *opaque = 0);
+        const char                *opaque = 0) override;
 
    virtual int
-   close();
+   close() override;
+
+   virtual int
+   checkpoint(cpAct act, struct iov *range=0, int n=0) override;
 
    using XrdSfsFile::fctl;
    virtual int
    fctl(const int               cmd,
         const char             *args,
-              XrdOucErrInfo    &out_error);
+              XrdOucErrInfo    &out_error) override;
 
    virtual const char *
-   FName();
+   FName() override;
 
    virtual int
-   getMmap(void **Addr, off_t &Size);
+   getMmap(void **Addr, off_t &Size) override;
+
+   virtual XrdSfsXferSize
+   pgRead(XrdSfsFileOffset   offset,
+          char              *buffer,
+          XrdSfsXferSize     rdlen,
+          uint32_t          *csvec,
+          uint64_t           opts=0) override;
+
+   virtual XrdSfsXferSize
+   pgRead(XrdSfsAio *aioparm, uint64_t opts=0) override;
+
+   virtual XrdSfsXferSize
+   pgWrite(XrdSfsFileOffset   offset,
+           char              *buffer,
+           XrdSfsXferSize     rdlen,
+           uint32_t          *csvec,
+           uint64_t           opts=0) override;
+
+   virtual XrdSfsXferSize
+   pgWrite(XrdSfsAio *aioparm, uint64_t opts=0) override;
 
    virtual int
    read(XrdSfsFileOffset   fileOffset,   // Preread only
-        XrdSfsXferSize     amount);
+        XrdSfsXferSize     amount) override;
 
    virtual XrdSfsXferSize
    read(XrdSfsFileOffset   fileOffset,
         char              *buffer,
-        XrdSfsXferSize     buffer_size);
+        XrdSfsXferSize     buffer_size) override;
 
    virtual int
-   read(XrdSfsAio *aioparm);
+   read(XrdSfsAio *aioparm) override;
 
    virtual XrdSfsXferSize
    write(XrdSfsFileOffset   fileOffset,
          const char        *buffer,
-         XrdSfsXferSize     buffer_size);
+         XrdSfsXferSize     buffer_size) override;
 
    virtual int
-   write(XrdSfsAio *aioparm);
+   write(XrdSfsAio *aioparm) override;
 
    virtual int
-   sync();
+   sync() override;
 
    virtual int
-   sync(XrdSfsAio *aiop);
+   sync(XrdSfsAio *aiop) override;
 
    virtual int
-   stat(struct stat *buf);
+   stat(struct stat *buf) override;
 
    virtual int
-   truncate(XrdSfsFileOffset   fileOffset);
+   truncate(XrdSfsFileOffset   fileOffset) override;
 
    virtual int
-   getCXinfo(char cxtype[4], int &cxrsz);
+   getCXinfo(char cxtype[4], int &cxrsz) override;
 
    virtual int
    SendData(XrdSfsDio         *sfDio,
             XrdSfsFileOffset   offset,
-            XrdSfsXferSize     size);
+            XrdSfsXferSize     size) override;
 
 private:
-   File(const char *user, int monid, unique_sfs_ptr, XrdThrottleManager &throttle, XrdSysError &eroute);
+   File(const char *, unique_sfs_ptr, XrdThrottleManager &, XrdSysError &);
 
    virtual
    ~File();
 
+   bool m_is_open{false};
    unique_sfs_ptr m_sfs;
    int m_uid; // A unique identifier for this user; has no meaning except for the fairshare.
    std::string m_loadshed;
+   std::string m_connection_id; // Identity for the connection; may or may authenticated
    std::string m_user;
    XrdThrottleManager &m_throttle;
    XrdSysError &m_eroute;
 };
 
-class FileSystem : public XrdSfsFileSystem
+class FileSystem final : public XrdSfsFileSystem
 {
 
-friend XrdSfsFileSystem * XrdSfsGetFileSystem_Internal(XrdSfsFileSystem *, XrdSysLogger *, const char *);
+friend XrdSfsFileSystem * XrdSfsGetFileSystem_Internal(XrdSfsFileSystem *, XrdSysLogger *, const char *, XrdOucEnv *);
 
 public:
 
    virtual XrdSfsDirectory *
-   newDir(char *user=0, int monid=0);
+   newDir(char *user=0, int monid=0) override;
 
    virtual XrdSfsFile *
-   newFile(char *user=0, int monid=0);
+   newFile(char *user=0, int monid=0) override;
 
    virtual int
    chksum(      csFunc         Func,
@@ -126,63 +151,80 @@ public:
           const char          *path,
                 XrdOucErrInfo &eInfo,
           const XrdSecEntity  *client = 0,
-          const char          *opaque = 0);
+          const char          *opaque = 0) override;
 
    virtual int
    chmod(const char             *Name,
                XrdSfsMode        Mode,
                XrdOucErrInfo    &out_error,
          const XrdSecEntity     *client,
-         const char             *opaque = 0);
+         const char             *opaque = 0) override;
 
    virtual void
-   Disc(const XrdSecEntity   *client = 0);
+   Connect(const XrdSecEntity     *client = 0) override;
 
    virtual void
-   EnvInfo(XrdOucEnv *envP);
+   Disc(const XrdSecEntity   *client = 0) override;
+
+   virtual void
+   EnvInfo(XrdOucEnv *envP) override;
 
    virtual int
    exists(const char                *fileName,
                 XrdSfsFileExistence &exists_flag,
                 XrdOucErrInfo       &out_error,
           const XrdSecEntity        *client,
-          const char                *opaque = 0);
+          const char                *opaque = 0) override;
+
+   virtual int
+   FAttr(      XrdSfsFACtl      *faReq,
+               XrdOucErrInfo    &eInfo,
+         const XrdSecEntity     *client = 0) override;
 
    virtual int
    fsctl(const int               cmd,
          const char             *args,
                XrdOucErrInfo    &out_error,
-         const XrdSecEntity     *client);
+         const XrdSecEntity     *client) override;
 
    virtual int
-   getStats(char *buff, int blen);
+   getChkPSize() override;
+
+   virtual int
+   getStats(char *buff, int blen) override;
 
    virtual const char *
-   getVersion();
+   getVersion() override;
+
+   virtual int
+   gpFile(      gpfFunc          &gpAct,
+                XrdSfsGPFile     &gpReq,
+                XrdOucErrInfo    &eInfo,
+          const XrdSecEntity     *client = 0) override;
 
    virtual int
    mkdir(const char             *dirName,
                XrdSfsMode        Mode,
                XrdOucErrInfo    &out_error,
          const XrdSecEntity     *client,
-         const char             *opaque = 0);
+         const char             *opaque = 0) override;
 
    virtual int
    prepare(      XrdSfsPrep       &pargs,
                  XrdOucErrInfo    &out_error,
-           const XrdSecEntity     *client = 0);
+           const XrdSecEntity     *client = 0) override;
 
    virtual int
    rem(const char             *path,
              XrdOucErrInfo    &out_error,
        const XrdSecEntity     *client,
-       const char             *info = 0);
+       const char             *info = 0) override;
 
    virtual int
    remdir(const char             *dirName,
                 XrdOucErrInfo    &out_error,
           const XrdSecEntity     *client,
-          const char             *info = 0);
+          const char             *info = 0) override;
 
    virtual int
    rename(const char             *oldFileName,
@@ -190,38 +232,39 @@ public:
                 XrdOucErrInfo    &out_error,
           const XrdSecEntity     *client,
           const char             *infoO = 0,
-          const char             *infoN = 0);
+          const char             *infoN = 0) override;
 
    virtual int
    stat(const char             *Name,
               struct stat      *buf,
               XrdOucErrInfo    &out_error,
         const XrdSecEntity     *client,
-        const char             *opaque = 0);
+        const char             *opaque = 0) override;
 
    virtual int
    stat(const char             *Name,
               mode_t           &mode,
               XrdOucErrInfo    &out_error,
         const XrdSecEntity     *client,
-        const char             *opaque = 0);
+        const char             *opaque = 0) override;
 
    virtual int
    truncate(const char             *Name,
                   XrdSfsFileOffset fileOffset,
                   XrdOucErrInfo    &out_error,
             const XrdSecEntity     *client = 0,
-            const char             *opaque = 0);
-
-   virtual int
-   Configure(XrdSysError &, XrdSfsFileSystem *native_fs);
+            const char             *opaque = 0) override;
 
 private:
    static void
    Initialize(      FileSystem      *&fs,
                     XrdSfsFileSystem *native_fs,
                     XrdSysLogger     *lp,
-              const char             *config_file);
+              const char             *config_file,
+                    XrdOucEnv        *envP);
+
+   int
+   Configure(XrdSysError &, XrdSfsFileSystem *native_fs, XrdOucEnv *envP);
 
    FileSystem();
 
@@ -236,6 +279,12 @@ private:
 
    int
    xtrace(XrdOucStream &Config);
+
+   int
+   xmaxopen(XrdOucStream &Config);
+
+   int
+   xmaxconn(XrdOucStream &Config);
 
    static FileSystem  *m_instance;
    XrdSysError         m_eroute;

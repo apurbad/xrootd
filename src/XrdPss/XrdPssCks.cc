@@ -28,7 +28,7 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <stdio.h>
+#include <cstdio>
 
 #include "XrdPss/XrdPss.hh"
 #include "XrdPss/XrdPssCks.hh"
@@ -37,8 +37,13 @@
 #include "XrdVersion.hh"
 
 #include "XrdOuc/XrdOucTokenizer.hh"
+#include "XrdOuc/XrdOucPrivateUtils.hh"
 #include "XrdPosix/XrdPosixXrootd.hh"
 #include "XrdPss/XrdPssUrlInfo.hh"
+
+#ifndef ENODATA
+#define ENODATA ENOATTR
+#endif
 
 /******************************************************************************/
 /*                               G l o b a l s                                */
@@ -80,7 +85,8 @@ XrdPssCks::XrdPssCks(XrdSysError *erP) : XrdCks(erP)
    csTab[0].Len =  4; strcpy(csTab[0].Name, "adler32");
    csTab[1].Len =  4; strcpy(csTab[1].Name, "crc32");
    csTab[2].Len = 16; strcpy(csTab[2].Name, "md5");
-   csLast = 2;
+   csTab[3].Len =  4; strcpy(csTab[3].Name, "crc32c");
+   csLast = 3;
 }
 
 /******************************************************************************/
@@ -116,7 +122,7 @@ int XrdPssCks::Get(const char *Pfn, XrdCksData &Cks)
 
 // Construct the correct url info
 //
-   XrdPssUrlInfo uInfo(Cks.tident, Pfn, cgiBuff, false);
+   XrdPssUrlInfo uInfo(Cks.envP, Pfn, cgiBuff, true);
    uInfo.setID();
 
 // Direct the path to the origin
@@ -125,7 +131,11 @@ int XrdPssCks::Get(const char *Pfn, XrdCksData &Cks)
 
 // Do some debugging
 //
-    DEBUG(uInfo.Tident(),"url="<<pBuff);
+
+    if(DEBUGON) {
+      auto urlObf = obfuscateAuth(pBuff);
+      DEBUG(uInfo.Tident(),"url="<<urlObf);
+    }
 
 // First step is to getthe checksum value
 //
@@ -160,7 +170,7 @@ int XrdPssCks::Init(const char *ConfigFN, const char *DfltCalc)
 // See if we need to set the default calculation
 //
    if (DfltCalc)
-      {for (i = 0; i < csLast; i++) if (!strcmp(csTab[i].Name, DfltCalc)) break;
+      {for (i = 0; i <= csLast; i++) if (!strcmp(csTab[i].Name, DfltCalc)) break;
        if (i >= csMax)
           {eDest->Emsg("Config", DfltCalc, "cannot be made the default; "
                                            "not supported.");

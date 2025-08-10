@@ -27,6 +27,7 @@
 #include "XrdCl/XrdClLog.hh"
 #include "XrdCl/XrdClDefaultEnv.hh"
 #include "XrdCl/XrdClConstants.hh"
+#include "XrdCl/XrdClUtils.hh"
 
 #include <cmath>
 #include <cstdlib>
@@ -38,8 +39,8 @@ class ChunkHandler: public ResponseHandler
 {
   public:
 
-    ChunkHandler( XCpSrc *src, uint64_t offset, uint64_t size, char *buffer, File *handle ) :
-      pSrc( src->Self() ), pOffset( offset ), pSize( size ), pBuffer( buffer ), pHandle( handle )
+    ChunkHandler( XCpSrc *src, uint64_t offset, uint64_t size, char *buffer, File *handle, bool usepgrd ) :
+      pSrc( src->Self() ), pOffset( offset ), pSize( size ), pBuffer( buffer ), pHandle( handle ), pUsePgRead( usepgrd )
     {
 
     }
@@ -51,11 +52,10 @@ class ChunkHandler: public ResponseHandler
 
     virtual void HandleResponse( XRootDStatus *status, AnyObject *response )
     {
-      ChunkInfo *chunk = 0;
+      PageInfo *chunk = 0;
       if( response ) // get the response
       {
-        response->Get( chunk );
-        response->Set( ( int* )0 );
+        ToPgInfo( response, chunk );
         delete response;
       }
 
@@ -64,7 +64,7 @@ class ChunkHandler: public ResponseHandler
         *status = XRootDStatus( stError, errInternal );
       }
 
-      if( status->IsOK() && chunk->length != pSize ) // the file size on the server is different
+      if( status->IsOK() && chunk->GetLength() != pSize ) // the file size on the server is different
       {                                              // than the one specified in metalink file
         *status = XRootDStatus( stError, errDataError );
       }
@@ -83,20 +83,35 @@ class ChunkHandler: public ResponseHandler
 
   private:
 
+    void ToPgInfo( AnyObject *response, PageInfo *&chunk )
+    {
+      if( pUsePgRead )
+      {
+        response->Get( chunk );
+        response->Set( ( int* )0 );
+      }
+      else
+      {
+        ChunkInfo *rsp = nullptr;
+        response->Get( rsp );
+        chunk = new PageInfo( rsp->offset, rsp->length, rsp->buffer );
+      }
+    }
+
     XCpSrc           *pSrc;
     uint64_t           pOffset;
     uint64_t           pSize;
     char              *pBuffer;
     File              *pHandle;
+    bool               pUsePgRead;
 };
 
 
 XCpSrc::XCpSrc( uint32_t chunkSize, uint8_t parallel, int64_t fileSize, XCpCtx *ctx ) :
   pChunkSize( chunkSize ), pParallel( parallel ), pFileSize( fileSize ), pThread(),
   pCtx( ctx->Self() ), pFile( 0 ), pCurrentOffset( 0 ), pBlkEnd( 0 ), pDataTransfered( 0 ), pRefCount( 1 ),
-  pRunning( false ), pStartTime( 0 ), pTransferTime( 0 )
+  pRunning( false ), pStartTime( 0 ), pTransferTime( 0 ), pUsePgRead( false )
 {
-
 }
 
 XCpSrc::~XCpSrc()
@@ -132,7 +147,7 @@ void XCpSrc::StartDownloading()
   {
     pRunning = false;
     // notify those who wait for the file
-    // size, they wont get it from this
+    // size, they won't get it from this
     // source
     pCtx->NotifyInitExpectant();
     // put a null chunk so we are sure
@@ -238,6 +253,20 @@ XRootDStatus XCpSrc::Initialize()
       continue;
     }
 
+    URL url( pUrl );
+    if( ( !url.IsLocalFile() && !pFile->IsSecure() ) ||
+        ( url.IsLocalFile() && url.IsMetalink() ) )
+    {
+      std::string datasrv;
+      pFile->GetProperty( "DataServer", datasrv );
+      //--------------------------------------------------------------------
+      // Decide whether we can use PgRead
+      //--------------------------------------------------------------------
+      int val = XrdCl::DefaultCpUsePgWrtRd;
+      XrdCl::DefaultEnv::GetEnv()->GetInt( "CpUsePgWrtRd", val );
+      pUsePgRead = XrdCl::Utils::HasPgRW( datasrv ) && ( val == 1 );
+    }
+
     if( pFileSize < 0 )
     {
       StatInfo *statInfo = 0;
@@ -289,6 +318,20 @@ XRootDStatus XCpSrc::Recover()
       DeletePtr( pFile );
       log->Warning( UtilityMsg, "Failed to open %s for reading: %s", pUrl.c_str(), st.GetErrorMessage().c_str() );
     }
+
+    URL url( pUrl );
+    if( ( !url.IsLocalFile() && pFile->IsSecure() ) ||
+        ( url.IsLocalFile() && url.IsMetalink() ) )
+    {
+      std::string datasrv;
+      pFile->GetProperty( "DataServer", datasrv );
+      //--------------------------------------------------------------------
+      // Decide whether we can use PgRead
+      //--------------------------------------------------------------------
+      int val = XrdCl::DefaultCpUsePgWrtRd;
+      XrdCl::DefaultEnv::GetEnv()->GetInt( "CpUsePgWrtRd", val );
+      pUsePgRead = XrdCl::Utils::HasPgRW( datasrv ) && ( val == 1 );
+    }
   }
   while( !st.IsOK() );
 
@@ -317,8 +360,10 @@ XRootDStatus XCpSrc::ReadChunks()
     pRecovered.erase( itr );
 
     char *buffer = new char[p.second];
-    ChunkHandler *handler = new ChunkHandler( this, p.first, p.second, buffer, pFile );
-    XRootDStatus st = pFile->Read( p.first, p.second, buffer, handler );
+    ChunkHandler *handler = new ChunkHandler( this, p.first, p.second, buffer, pFile, pUsePgRead );
+    XRootDStatus st = pUsePgRead
+                    ? pFile->PgRead( p.first, p.second, buffer, handler )
+                    : pFile->Read( p.first, p.second, buffer, handler );
     if( !st.IsOK() )
     {
       delete[] buffer;
@@ -335,8 +380,10 @@ XRootDStatus XCpSrc::ReadChunks()
       chunkSize = pBlkEnd - pCurrentOffset;
     pOngoing[pCurrentOffset] = chunkSize;
     char *buffer = new char[chunkSize];
-    ChunkHandler *handler = new ChunkHandler( this, pCurrentOffset, chunkSize, buffer, pFile );
-    XRootDStatus st = pFile->Read( pCurrentOffset, chunkSize, buffer, handler );
+    ChunkHandler *handler = new ChunkHandler( this, pCurrentOffset, chunkSize, buffer, pFile, pUsePgRead );
+    XRootDStatus st = pUsePgRead
+                    ? pFile->PgRead( pCurrentOffset, chunkSize, buffer, handler )
+                    : pFile->Read( pCurrentOffset, chunkSize, buffer, handler );
     pCurrentOffset += chunkSize;
     if( !st.IsOK() )
     {
@@ -354,7 +401,7 @@ XRootDStatus XCpSrc::ReadChunks()
   return XRootDStatus( stOK, suContinue );
 }
 
-void XCpSrc::ReportResponse( XRootDStatus *status, ChunkInfo *chunk, File *handle )
+void XCpSrc::ReportResponse( XRootDStatus *status, PageInfo *chunk, File *handle )
 {
   XrdSysMutexHelper lck( pMtx );
   bool ignore = false;
@@ -366,7 +413,7 @@ void XCpSrc::ReportResponse( XRootDStatus *status, ChunkInfo *chunk, File *handl
     // was not on the list we ignore the
     // response (this could happen due to
     // source change or stealing)
-    ignore = !pOngoing.erase( chunk->offset );
+    ignore = !pOngoing.erase( chunk->GetOffset() );
   }
   else if( FilesEqual( pFile, handle ) )
   {
@@ -410,7 +457,7 @@ void XCpSrc::ReportResponse( XRootDStatus *status, ChunkInfo *chunk, File *handl
 
   if( chunk )
   {
-    pDataTransfered += chunk->length;
+    pDataTransfered += chunk->GetLength();
     pCtx->PutChunk( chunk );
   }
 }
@@ -443,7 +490,7 @@ void XCpSrc::Steal( XCpSrc *src )
     // need to notify
     pCtx->NotifyIdleSrc();
 
-    log->Debug( UtilityMsg, "s%: Stealing everything from %s", myHost.c_str(), srcHost.c_str() );
+    log->Debug( UtilityMsg, "%s: Stealing everything from %s", myHost.c_str(), srcHost.c_str() );
 
     return;
   }
@@ -468,7 +515,7 @@ void XCpSrc::Steal( XCpSrc *src )
     pBlkEnd        = src->pBlkEnd;
     src->pBlkEnd  -= steal;
 
-    log->Debug( UtilityMsg, "s%: Stealing fraction (%f) of block from %s", myHost.c_str(), fraction, srcHost.c_str() );
+    log->Debug( UtilityMsg, "%s: Stealing fraction (%f) of block from %s", myHost.c_str(), fraction, srcHost.c_str() );
 
     return;
   }
@@ -483,7 +530,7 @@ void XCpSrc::Steal( XCpSrc *src )
       src->pRecovered.erase( itr );
     }
 
-    log->Debug( UtilityMsg, "s%: Stealing fraction (%f) of recovered chunks from %s", myHost.c_str(), fraction, srcHost.c_str() );
+    log->Debug( UtilityMsg, "%s: Stealing fraction (%f) of recovered chunks from %s", myHost.c_str(), fraction, srcHost.c_str() );
 
     return;
   }
@@ -504,7 +551,7 @@ void XCpSrc::Steal( XCpSrc *src )
       src->pOngoing.erase( itr );
     }
 
-    log->Debug( UtilityMsg, "s%: Stealing fraction (%f) of ongoing chunks from %s", myHost.c_str(), fraction, srcHost.c_str() );
+    log->Debug( UtilityMsg, "%s: Stealing fraction (%f) of ongoing chunks from %s", myHost.c_str(), fraction, srcHost.c_str() );
   }
 }
 
@@ -520,7 +567,7 @@ XRootDStatus XCpSrc::GetWork()
 
     Log *log = DefaultEnv::GetLog();
     std::string myHost = URL( pUrl ).GetHostName();
-    log->Debug( UtilityMsg, "s% got next block", myHost.c_str() );
+    log->Debug( UtilityMsg, "%s got next block", myHost.c_str() );
 
     return XRootDStatus();
   }

@@ -28,15 +28,12 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <errno.h>
+#include <cerrno>
 #include <cstdio>
-#include <stdlib.h>
-#include <time.h>
+#include <cstdlib>
+#include <ctime>
 #include <unistd.h>
 #include <sys/types.h>
-#if !defined(__APPLE__) && !defined(__FreeBSD__)
-#include <malloc.h>
-#endif
 
 #include "XrdVersion.hh"
 
@@ -55,8 +52,6 @@
 /*                     S t a t i c   A l l o c a t i o n                      */
 /******************************************************************************/
 
-XrdScheduler      *XrdXrootdMonitor::Sched      = 0;
-XrdSysError       *XrdXrootdMonitor::eDest      = 0;
 char              *XrdXrootdMonitor::idRec      = 0;
 int                XrdXrootdMonitor::idLen      = 0;
 char              *XrdXrootdMonitor::Dest1      = 0;
@@ -67,7 +62,6 @@ int                XrdXrootdMonitor::monMode2   = 0;
 XrdNetMsg         *XrdXrootdMonitor::InetDest2  = 0;
 XrdXrootdMonitor  *XrdXrootdMonitor::altMon     = 0;
 XrdSysMutex        XrdXrootdMonitor::windowMutex;
-kXR_int32          XrdXrootdMonitor::startTime  = 0;
 int                XrdXrootdMonitor::monRlen    = 0;
 XrdXrootdMonitor::MonRdrBuff
                    XrdXrootdMonitor::rdrMon[XrdXrootdMonitor::rdrMax];
@@ -88,8 +82,6 @@ int                XrdXrootdMonitor::rdrTOD     = 0;
 int                XrdXrootdMonitor::rdrWin     = 0;
 int                XrdXrootdMonitor::rdrNum     = 3;
 kXR_int32          XrdXrootdMonitor::sizeWindow = 60;
-char               XrdXrootdMonitor::sidName[16]= {0};
-short              XrdXrootdMonitor::sidSize    = 0;
 char               XrdXrootdMonitor::monINFO    = 0;
 char               XrdXrootdMonitor::monIO      = 0;
 char               XrdXrootdMonitor::monFILE    = 0;
@@ -104,11 +96,29 @@ char               XrdXrootdMonitor::monCLOCK   = 0;
 /*                               G l o b a l s                                */
 /******************************************************************************/
   
-extern          XrdOucTrace       *XrdXrootdTrace;
+extern          XrdSysTrace        XrdXrootdTrace;
 
 namespace XrdXrootdMonInfo
 {
-long long mySID = 0;
+
+inline static int32_t  InitStartTime()
+{
+  return htonl( time( 0 ) );
+}
+
+XrdScheduler   *Sched     = 0;
+XrdSysError    *eDest     = 0;
+char           *monHost   = 0;
+char           *kySID     = 0;
+long long       mySID     = 0;
+int32_t         startTime = InitStartTime();
+int             kySIDSZ   = 0;
+XrdSysMutex     seqMutex;
+
+char           *SidCGI[4] = {0};
+int             LidCGI[4] = {0};
+char           *SidJSON[4]= {0}; // 0:sidsite 1:sidhostid 2:sidinst 3:sidfull
+int             LidJSON[4]= {0};
 }
 
 using namespace XrdXrootdMonInfo;
@@ -139,17 +149,22 @@ class XrdXrootdMonitor_Ident : public XrdJob
 public:
 
 void          DoIt() {
-                      XrdXrootdMonitor::Ident();
-                      Sched->Schedule((XrdJob *)this, time(0)+idInt);
+                      if (idInt >= 0)
+                         {if (doIdnt) XrdXrootdMonitor::Ident();
+                          if (doHail) doHail = XrdXrootdMonitor::Hello::Hail();
+                         }
+                      if ((doIdnt || doHail) && idInt > 0)
+                         Sched->Schedule((XrdJob *)this, time(0)+idInt);
                      }
 
-      XrdXrootdMonitor_Ident(XrdScheduler *sP, int idt)
-                            : XrdJob("monitor ident"), Sched(sP), idInt(idt) {}
+      XrdXrootdMonitor_Ident(int idt, bool ison) : XrdJob("monitor ident"),
+                             idInt(idt), doIdnt(ison), doHail(true) {}
      ~XrdXrootdMonitor_Ident() {}
 
 private:
-XrdScheduler  *Sched;     // System scheduler
-int            idInt;
+int           idInt;
+bool          doIdnt;
+bool          doHail;
 };
 
 /******************************************************************************/
@@ -208,6 +223,44 @@ static XrdSysMutex monLock;
 XrdSysMutex XrdXrootdMonitorLock::monLock;
 
 /******************************************************************************/
+/*               X r d X r o o t d M o n i t o r : : H e l l o                */
+/******************************************************************************/
+  
+XrdXrootdMonitor::Hello::Hello(const char *dest, char mode)
+                              : Next(0), theDest(0), theMode(0)
+{
+   if (dest)
+      {Hello *nP = First;
+       while(nP) {if (!strcmp(dest, nP->theDest) && mode == theMode) return;
+                  nP = nP->Next;
+                 }
+       Next    = First;
+       First   = this;
+       theDest = strdup(dest);
+       theMode = mode;
+      }
+}
+
+/******************************************************************************/
+/*         X r d X r o o t d M o n i t o r : : H e l l o : : H a i l          */
+/******************************************************************************/
+
+XrdXrootdMonitor::Hello *XrdXrootdMonitor::Hello::First = 0;
+  
+bool XrdXrootdMonitor::Hello::Hail()
+{
+   Hello *nP = First;
+
+// Call all the registered ident methods
+//
+   while(nP) {nP->Ident(); nP = nP->Next;}
+
+// Indicate whether or not anything would have been sent
+//
+   return First != 0;
+}
+  
+/******************************************************************************/
 /*       X r d X r o o t d M o n i t o r : : U s e r : : D i s a b l e        */
 /******************************************************************************/
 
@@ -233,29 +286,37 @@ void XrdXrootdMonitor::User::Enable()
 /******************************************************************************/
 /*      X r d X r o o t d M o n i t o r : : U s e r : : R e g i s t e r       */
 /******************************************************************************/
-  
+
 void XrdXrootdMonitor::User::Register(const char *Uname, 
                                       const char *Hname,
-                                      const char *Pname)
+                                      const char *Pname, unsigned int xSID)
 {
-   const char *colonP, *atP;
-   char  uBuff[1024], *uBP;
-   int n;
+#ifndef NODEBUG
+    const char *TraceID = "Monitor";
+#endif
+   char *dotP, *colonP, *atP;
+   char  uBuff[1024], tBuff[1024], sBuff[64];
 
-// The identification always starts with the protocol being used
+// Decode the user name as a.b:c@d and remap it for monitoring as
+// <protocol>/a.{b|xSID}:<kySID>@host
 //
-   n = sprintf(uBuff, "%s/", Pname);
-   uBP = uBuff + n;
+   snprintf(tBuff, sizeof(tBuff), "%s", Uname);
+   if ((dotP = index(tBuff, '.')) && (colonP = index(dotP+1, ':')) && 
+       (atP = index(colonP+1, '@')))
+      {*dotP = 0; *colonP = 0; *atP = 0;
+       if (xSID)  
+          {snprintf(sBuff, sizeof(sBuff), " %u", xSID);
+           dotP = sBuff;
+          }
 
-// Decode the user name as a.b:c@d
-//
-   if ((colonP = index(Uname, ':')) && (atP = index(colonP+1, '@')))
-      {n = colonP - Uname + 1;
-       strncpy(uBP, Uname, n);
-       strcpy(uBP+n, sidName);
-       n += sidSize; *(uBP+n) = '@'; n++;
-       strcpy(uBP+n, Hname);
-      } else strcpy(uBP, Uname);
+       int n = snprintf(uBuff, sizeof(uBuff), "%s/%s.%s:%s@%s", Pname, tBuff,
+                        dotP+1, kySID, atP+1);
+
+       if (n < 0 || n >= (int) sizeof(uBuff))
+         TRACE(LOGIN, "Login ID was truncated: " << uBuff);
+
+       if (xSID) {TRACE(LOGIN,"Register remap "<<Uname<<" -> "<<uBuff);}
+      } else snprintf(uBuff, sizeof(uBuff), "%s/%s", Pname, Uname);
 
 // Generate a monitor identity for this user. We do not assign a dictioary
 // identifier unless this entry is reported.
@@ -267,7 +328,37 @@ void XrdXrootdMonitor::User::Register(const char *Uname,
    Iops  = XrdXrootdMonitor::monIO;
    Fops  = XrdXrootdMonitor::monFILE;
 }
+
+/******************************************************************************/
+/*                                R e p o r t                                 */
+/******************************************************************************/
   
+void XrdXrootdMonitor::User::Report(int eCode, int aCode)
+{
+   char buff[1024];
+
+   snprintf(buff, sizeof(buff), "&Uc=%d&Ec=%d&Ac=%d", ntohl(Did), eCode, aCode);
+
+   XrdXrootdMonitor::Map(XROOTD_MON_MAPUEAC,*this,buff);
+}
+  
+/******************************************************************************/
+  
+bool XrdXrootdMonitor::User::Report(WhatInfo infoT, const char *info)
+{
+   char buff[4096];
+
+// Currently we support only the token external report
+//
+   if (infoT != TokenInfo) return false;
+
+   snprintf(buff, sizeof(buff), "&Uc=%d%s%s", ntohl(Did),
+                                (*info == '&' ? "" : "&"), info);
+
+   XrdXrootdMonitor::Map(XROOTD_MON_MAPTOKN,*this,buff);
+
+   return true;
+}
 /******************************************************************************/
 /*                           C o n s t r u c t o r                            */
 /******************************************************************************/
@@ -283,7 +374,7 @@ XrdXrootdMonitor::XrdXrootdMonitor()
 
 // Allocate a monitor buffer
 //
-   if (!(monBuff = (XrdXrootdMonBuff *)memalign(getpagesize(), monBlen)))
+   if (posix_memalign((void **)&monBuff, getpagesize(), monBlen))
       eDest->Emsg("Monitor", "Unable to allocate monitor buffer.");
       else {nextEnt = 1;
             setTMark(monBuff, 0, localWindow);
@@ -332,7 +423,8 @@ XrdXrootdMonitor *XrdXrootdMonitor::Alloc(int force)
 // If enabled, create a new object (if possible). If we are not monitoring
 // i/o then return the global object.
 //
-   if (!isEnabled || (isEnabled < 0 && !force)) mp = 0;
+// if (!isEnabled || (isEnabled < 0 && !force)) mp = 0;
+   if (!isEnabled) mp = 0;
       else if (!monIO) mp = altMon;
               else if ((mp = new XrdXrootdMonitor()))
                       if (!(mp->monBuff)) {delete mp; mp = 0;}
@@ -385,15 +477,13 @@ void XrdXrootdMonitor::Close(kXR_unt32 dictid, long long rTot, long long wTot)
 
 void XrdXrootdMonitor::Defaults(char *dest1, int mode1, char *dest2, int mode2)
 {
-   int mmode;
+   int  mmode;
 
-// Make sure if we have a dest1 we have mode
+// If there are no destination then only g-stream events may be enabled.
+// Otherwise, sort out the destinations relative to modes.
 //
-   if (!dest1)
-      {mode1 = (dest1 = dest2) ? mode2 : 0;
-       dest2 = 0; mode2 = 0;
-      } else if (!dest2) mode2 = 0;
-
+   if (!dest1 && !dest2) {isEnabled = 0; return;}
+   if (!dest1) {dest1 = dest2; dest2 = 0; mode1 |= mode2; mode2 = 0;}
 
 // Set the default destinations (caller supplied strdup'd strings)
 //
@@ -433,17 +523,13 @@ void XrdXrootdMonitor::Defaults(char *dest1, int mode1, char *dest2, int mode2)
 // should be sent (this also tips off other layers to handle such monitoring)
 //
    if (monREDR) XrdOucEnv::Export("XRDMONRDR", monIdent);
-
-// Do final check
-//
-   if (Dest1 == 0 && Dest2 == 0) isEnabled = 0;
 }
 
 /******************************************************************************/
 
 void XrdXrootdMonitor::Defaults(int msz,   int rsz,   int wsz,
                                 int flush, int flash, int idt, int rnm,
-                                int fsint, int fsopt, int fsion)
+                                int fbsz, int fsint, int fsopt, int fsion)
 {
 
 // Set default window size and flush time
@@ -451,14 +537,14 @@ void XrdXrootdMonitor::Defaults(int msz,   int rsz,   int wsz,
    sizeWindow = (wsz <= 0 ? 60 : wsz);
    autoFlush  = (flush <= 0 ? 600 : flush);
    autoFlash  = (flash <= 0 ?   0 : flash);
-   monIdent   = (idt   <  0 ?   0 : idt);
+   monIdent   =  idt;
    rdrNum     = (rnm   <= 0 || rnm > rdrMax ? 3 : rnm);
    rdrWin     = (sizeWindow > 16777215 ? 16777215 : sizeWindow);
    rdrWin     = htonl(rdrWin);
 
 // Set the fstat defaults
 //
-   XrdXrootdMonFile::Defaults(fsint, fsopt, fsion);
+   XrdXrootdMonFile::Defaults(fsint, fsopt, fsion, fbsz);
    monFSTAT = fsint != 0;
 
 // Set default monitor buffer size
@@ -544,44 +630,119 @@ XrdXrootdMonitor::MonRdrBuff *XrdXrootdMonitor::Fetch()
 /*                                  I n i t                                   */
 /******************************************************************************/
   
-int XrdXrootdMonitor::Init(XrdScheduler *sp,    XrdSysError *errp,
-                           const char   *iHost, const char  *iProg,
-                           const char   *iName, int Port)
+void XrdXrootdMonitor::Init(XrdScheduler *sp,    XrdSysError *errp,
+                            const char   *iHost, const char  *iProg,
+                            const char   *iName, int Port)
 {
-   static     XrdXrootdMonitor_Ident MonIdent(sp, monIdent);
+   const char *cgID0 = "&site=%s";
+   const char *cgID1 = "&host=%s";
+   const char *cgID2 = "&port=%d&inst=%s";
+   const char *cgID3 = "&pgm=%s&ver=%s";
+
+   const char *jsID0 = "\"src\":{\"site\":\"%s\"}";
+   const char *jsID1 = "%s\"host\":\"%s\"}";
+   const char *jsID2 = "%s\"port\":%d,\"inst\":\"%s\"}";
+   const char *jsID3 = "%s\"pgm\":\"%s\",\"ver\":\"%s\"}";
+
    XrdXrootdMonMap *mP;
-   char       iBuff[1024], iPuff[1024], *sName, *cP;
-   int        i, Now = time(0);
-   bool       aOK;
+   char       iBuff[1024], iMuff[2048], iPuff[1024];
+   int        n, i, j;
 
 // Set static variables
 //
    Sched = sp;
    eDest = errp;
-   startTime = htonl(Now);
 
-// Generate our server ID
+// Generate our server ID (the version is not part of he fingerprint)
 //
    strcpy(iBuff, "=/");
-   sprintf(iPuff, "%s&ver=%s", iProg, XrdVERSION);
-   sName = XrdOucUtils::Ident(mySID, iBuff+2, sizeof(iBuff)-2,
-                              iHost, iPuff, iName, Port);
-   cP = (char *)&mySID; *cP = 0; *(cP+1) = 0;
-   sidSize = strlen(sName);
-   if (sidSize >= (int)sizeof(sidName)) sName[sizeof(sidName)-1] = 0;
-   strcpy(sidName, sName);
-   free(sName);
+   kySID = XrdOucUtils::Ident(mySID, iBuff+2, sizeof(iBuff)-2,
+                              iHost, iProg, iName, Port);
+   n = strlen(iBuff);
+   snprintf(iBuff+n, sizeof(iBuff)-n, "&ver=%s", XrdVERSION);
 
-// There is nothing to do unless we have been enabled via Defaults()
+   kySIDSZ = strlen(kySID);
+   monHost = strdup(iHost);
+
+// Ignore array bounds warning from gcc 12 triggered because the allocated
+// memory for the XrdXrootdMonMap is smaller than sizeof(XrdXrootdMonMap)
+#if defined(__GNUC__) && __GNUC__ >= 12
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Warray-bounds"
+#endif
+// Create identification record
 //
-   if (!isEnabled) return 1;
+   idLen = strlen(iBuff) + sizeof(XrdXrootdMonHeader) + sizeof(kXR_int32);
+   idRec = (char *)malloc(idLen+1);
+   mP = (XrdXrootdMonMap *)idRec;
+   fillHeader(&(mP->hdr), XROOTD_MON_MAPIDNT, idLen);
+   mP->hdr.pseq = 0;
+   mP->dictid   = 0;
+   strcpy(mP->info, iBuff);
+#if defined(__GNUC__) && __GNUC__ >= 12
+#pragma GCC diagnostic pop
+#endif
+
+// Generate a CGI version of all the variations
+//
+   const char *Site (getenv("XRDSITE") ? getenv("XRDSITE") : "");
+   i = snprintf(iPuff, sizeof(iPuff), cgID0, Site);
+   SidCGI[0] = strdup(iPuff);
+   LidCGI[0] = strlen(iPuff);
+
+   n = sizeof(iPuff)-i; j = i;
+   i = snprintf(iPuff+j, n, cgID1, iHost);
+   SidCGI[1] = strdup(iPuff);
+   LidCGI[1] = strlen(iPuff);
+
+   n -= i; j += i;
+   i = snprintf(iPuff+j, n, cgID2, Port, iName);
+   SidCGI[2] = strdup(iPuff);
+   LidCGI[2] = strlen(iPuff);
+
+   n -= i; j += i;
+       snprintf(iPuff+j, n, cgID3, iProg, XrdVERSION);
+   SidCGI[3] = strdup(iPuff);
+   LidCGI[3] = strlen(iPuff);
+
+// Generate a JSON version of all the variations.
+//
+   n = snprintf(iPuff, sizeof(iPuff), jsID0, Site);
+   SidJSON[0] = strdup(iPuff);
+   LidJSON[0] = strlen(iPuff);
+
+   strcpy(iPuff+n-1, ",");
+   n = snprintf(iMuff, sizeof(iMuff), jsID1, iPuff, iHost);
+   SidJSON[1] = strdup(iMuff);
+   LidJSON[1] = strlen(iMuff);
+
+   strcpy(iMuff+n-1, ",");
+   n = snprintf(iPuff, sizeof(iPuff), jsID2, iMuff, Port, iName);
+   SidJSON[2] = strdup(iPuff);
+   LidJSON[2] = strlen(iPuff);
+
+   strcpy(iPuff+n-1, ",");
+   snprintf(iMuff, sizeof(iMuff), jsID3, iPuff, iProg, XrdVERSION);
+   SidJSON[3] = strdup(iMuff);
+   LidJSON[3] = strlen(iMuff);
+}
+
+/******************************************************************************/
+  
+int XrdXrootdMonitor::Init()
+{
+   static     XrdXrootdMonitor_Ident MonIdent(monIdent, isEnabled);
+   int        i, Now = time(0);
+   bool       aOK;
 
 // Setup the primary destination
 //
-   InetDest1 = new XrdNetMsg(eDest, Dest1, &aOK);
-   if (!aOK)
-      {eDest->Emsg("Monitor", "Unable to setup primary monitor collector.");
-       return 0;
+   if (Dest1)
+      {InetDest1 = new XrdNetMsg(eDest, Dest1, &aOK);
+       if (!aOK)
+          {eDest->Emsg("Monitor", "Unable to setup primary monitor collector.");
+           return 0;
+          }
       }
 
 // Setup the secondary destination
@@ -593,6 +754,14 @@ int XrdXrootdMonitor::Init(XrdScheduler *sp,    XrdSysError *errp,
            return 0;
           }
       }
+
+// Now schedule the first identification record
+//
+   if (Sched && monIdent >= 0) Sched->Schedule((XrdJob *)&MonIdent);
+
+// There is nothing more to do unless we have been enabled via Defaults()
+//
+   if (!isEnabled) return 1;
 
 // If there is a destination that is only collecting file events, then
 // allocate a global monitor object but don't start the timer just yet.
@@ -609,24 +778,10 @@ int XrdXrootdMonitor::Init(XrdScheduler *sp,    XrdSysError *errp,
 //
    if (monCLOCK) startClock();
 
-// Create identification record
-//
-   idLen = strlen(iBuff) + sizeof(XrdXrootdMonHeader) + sizeof(kXR_int32);
-   idRec = (char *)malloc(idLen+1);
-   mP = (XrdXrootdMonMap *)idRec;
-   fillHeader(&(mP->hdr), XROOTD_MON_MAPIDNT, idLen);
-   mP->hdr.pseq = 0;
-   mP->dictid   = 0;
-   strcpy(mP->info, iBuff);
-
-// Now schedule the first identification record
-//
-   if (Sched && monIdent) Sched->Schedule((XrdJob *)&MonIdent);
-
 // If we are monitoring file stats then start that up
 //
    if (!Sched || !monFSTAT) monFSTAT = 0;
-      else if (!XrdXrootdMonFile::Init(Sched, eDest)) return 0;
+      else if (!XrdXrootdMonFile::Init()) return 0;
 
 // If we are not monitoring redirections, we are done!
 //
@@ -635,8 +790,7 @@ int XrdXrootdMonitor::Init(XrdScheduler *sp,    XrdSysError *errp,
 // Allocate as many redirection monitors as requested
 //
    for (i = 0; i < rdrNum; i++)
-       {rdrMon[i].Buff = (XrdXrootdMonBurr *)memalign(getpagesize(),monRlen);
-        if (!rdrMon[i].Buff)
+       {if (posix_memalign((void **)&rdrMon[i].Buff, getpagesize(),monRlen))
            {eDest->Emsg("Monitor", "Unable to allocate monitor rdr buffer.");
             return 0;
            }
@@ -656,10 +810,10 @@ int XrdXrootdMonitor::Init(XrdScheduler *sp,    XrdSysError *errp,
 }
 
 /******************************************************************************/
-/* Private:                    G e t D i c t I D                              */
+/*                             G e t D i c t I D                              */
 /******************************************************************************/
   
-kXR_unt32 XrdXrootdMonitor::GetDictID()
+kXR_unt32 XrdXrootdMonitor::GetDictID(bool hbo)
 {
    static XrdSysMutex  seqMutex;
    static unsigned int monSeqID = 1;
@@ -673,6 +827,7 @@ kXR_unt32 XrdXrootdMonitor::GetDictID()
 
 // Return the ID
 //
+   if (hbo) return mySeqID;
    return htonl(mySeqID);
 }
 
@@ -705,7 +860,9 @@ kXR_unt32 XrdXrootdMonitor::Map(char  code, XrdXrootdMonitor::User &uInfo,
 // Route the packet to all destinations that need them
 //
         if (code == XROOTD_MON_MAPPATH) montype = XROOTD_MON_PATH;
-   else if (code == XROOTD_MON_MAPUSER) montype = XROOTD_MON_USER;
+   else if (code == XROOTD_MON_MAPUSER
+        ||  code == XROOTD_MON_MAPTOKN
+        ||  code == XROOTD_MON_MAPUEAC) montype = XROOTD_MON_USER;
    else                                 montype = XROOTD_MON_INFO;
    Send(montype, (void *)&map, size);
 
@@ -801,6 +958,7 @@ int XrdXrootdMonitor::Redirect(kXR_unt32 mID, const char *hName, int Port,
    mP->Mutex.UnLock();
    return 0;
 }
+
 
 /******************************************************************************/
 /*                                  T i c k                                   */
@@ -899,20 +1057,12 @@ unsigned char XrdXrootdMonitor::do_Shift(long long xTot, unsigned int &xVal)
   
 void XrdXrootdMonitor::fillHeader(XrdXrootdMonHeader *hdr,
                                   const char          id, int size)
-{  static XrdSysMutex seqMutex;
-   static int         seq = 0;
-          int         myseq;
-
-// Generate a new sequence number
-//
-   seqMutex.Lock();
-   myseq = 0x00ff & (seq++);
-   seqMutex.UnLock();
+{
 
 // Fill in the header
 //
    hdr->code = static_cast<kXR_char>(id);
-   hdr->pseq = static_cast<kXR_char>(myseq);
+// hdr->pseq = static_cast<kXR_char>(myseq);  // Filled in Send()
    hdr->plen = htons(static_cast<uint16_t>(size));
    hdr->stod = startTime;
 }
@@ -1045,22 +1195,31 @@ void XrdXrootdMonitor::Mark()
 /*                                  S e n d                                   */
 /******************************************************************************/
   
-int XrdXrootdMonitor::Send(int monMode, void *buff, int blen)
+int XrdXrootdMonitor::Send(int monMode, void *buff, int blen, bool setseq)
 {
 #ifndef NODEBUG
     const char *TraceID = "Monitor";
 #endif
     static XrdSysMutex sendMutex;
+    static int seq1=0, seq2=0;
+    XrdXrootdMonHeader *mHdr=0;
     int rc1, rc2;
+
+// If we are to set sequence numbers, recast the buffer. We are assured that
+// the buffer always starts with the standard monitor header.
+//
+   if (setseq) mHdr = static_cast<XrdXrootdMonHeader*>(buff);
 
     sendMutex.Lock();
     if (monMode & monMode1 && InetDest1)
-       {rc1  = InetDest1->Send((char *)buff, blen);
+       {if (mHdr) mHdr->pseq = (seq1++) & 0xff;
+        rc1  = InetDest1->Send((char *)buff, blen);
         TRACE(DEBUG,blen <<" bytes sent to " <<Dest1 <<" rc=" <<rc1);
        }
        else rc1 = 0;
     if (monMode & monMode2 && InetDest2)
-       {rc2  = InetDest2->Send((char *)buff, blen);
+       {if (mHdr) mHdr->pseq = (seq2++) & 0xff;
+        rc2  = InetDest2->Send((char *)buff, blen);
         TRACE(DEBUG,blen <<" bytes sent to " <<Dest2 <<" rc=" <<rc2);
        }
        else rc2 = 0;

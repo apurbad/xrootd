@@ -30,6 +30,9 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
+#include <cstdint>
+#include <vector>
+
 #include "Xrd/XrdJob.hh"
 #include "XrdCl/XrdClFile.hh"
 #include "XrdSys/XrdSysPthread.hh"
@@ -46,7 +49,8 @@ class XrdPosixFileRH : public XrdJob,
 {
 public:
 
-enum ioType {nonIO = 0, isRead = 1, isReadV = 2, isWrite = 3};
+enum ioType {nonIO = 0, isRead = 1, isReadV = 2, isWrite = 3,
+                                    isReadP = 4, isWriteP= 5};
 
 static XrdPosixFileRH  *Alloc(XrdOucCacheIOCB *cbp, XrdPosixFile *fp,
                               long long offs, int xResult, ioType typeIO);
@@ -58,12 +62,17 @@ static XrdPosixFileRH  *Alloc(XrdOucCacheIOCB *cbp, XrdPosixFile *fp,
 
         void            Recycle();
 
+inline  void            setCSVec(std::vector<uint32_t> *csv, int *csf,
+                                 bool fcs=false)
+                                {csVec = csv; csfix = csf; csFrc = fcs;}
+
 static  void            SetMax(int mval) {maxFree = mval;}
 
         void            Sched(int result);
 
 private:
-             XrdPosixFileRH() : theCB(0),theFile(0),result(0),typeIO(nonIO) {}
+             XrdPosixFileRH() : theCB(0), theFile(0), csVec(0), csfix(0),
+                                result(0),typeIO(nonIO), csFrc(false) {}
 virtual     ~XrdPosixFileRH() {}
 
 static  XrdSysMutex      myMutex;
@@ -75,8 +84,11 @@ union  {XrdOucCacheIOCB *theCB;
         XrdPosixFileRH  *next;
        };
 XrdPosixFile            *theFile;
+std::vector<uint32_t>   *csVec;
+int                     *csfix;
 long long                offset;
 int                      result;
 ioType                   typeIO;
+bool                     csFrc;
 };
 #endif

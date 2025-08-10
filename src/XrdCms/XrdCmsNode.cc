@@ -28,10 +28,9 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
   
-#include <errno.h>
 #include <limits.h>
-#include <stdio.h>
-#include <time.h>
+#include <cstdio>
+#include <ctime>
 #include <netinet/in.h>
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -59,6 +58,7 @@
 
 #include "XrdOss/XrdOss.hh"
 
+#include "XrdOuc/XrdOucCRC.hh"
 #include "XrdOuc/XrdOucName2Name.hh"
 #include "XrdOuc/XrdOucProg.hh"
 #include "XrdOuc/XrdOucPup.hh"
@@ -66,7 +66,9 @@
 
 #include "XrdNet/XrdNetUtils.hh"
 
+#include "XrdSys/XrdSysE2T.hh"
 #include "XrdSys/XrdSysPlatform.hh"
+#include "XrdSys/XrdSysTimer.hh"
 
 using namespace XrdCms;
 
@@ -94,7 +96,7 @@ int mtrylen = strlen(mtrymsg)+1;
 /******************************************************************************/
   
 XrdCmsNode::XrdCmsNode(XrdLink *lnkp, const char *theIF, const char *nid,
-                       int port, int lvl, int id) : nodeMutex(0, "nodeCV")
+                       int port, int lvl, int id)
 {
     static XrdSysMutex   iMutex;
     static const SMask_t smask_1(1);
@@ -103,54 +105,13 @@ XrdCmsNode::XrdCmsNode(XrdLink *lnkp, const char *theIF, const char *nid,
     Link     =  lnkp;
     NodeMask =  (id < 0 ? 0 : smask_1 << id);
     NodeID   = id;
-    cidP     =  0;
-    hasNet   =  0;
-    isBad    =  0;
     isOffline=  (lnkp == 0);
-    isNoStage=  0;
-    isBound  =  0;
-    isConn   =  0;
-    isGone   =  0;
-    isPerm   =  0;
-    isMan    =  0;
-    isKnown  =  0;
-    isPeer   =  0;
-    incUL    =  0;
-    myCost   =  0;
-    myLoad   =  0;
-    myMass   =  0;
-    DiskTotal=  0;
-    DiskFree =  0;
-    DiskMinF =  0;
-    DiskNums =  0;
-    DiskUtil =  0;
-    Next     =  0;
-    RefW     =  0;
-    RefTotW  =  0;
-    RefR     =  0;
-    RefTotR  =  0;
-    Share    =  0;
-    Shrem    =  0;
-    Shrin    =  0;
     logload  =  Config.LogPerf;
-    DropTime =  0;
-    DropJob  =  0;
-    myName   =  0;
-    myNlen   =  0;
-    Ident    =  0;
     myNID    = strdup(nid ? nid : "?");
     if ((myCID = index(myNID, ' '))) myCID++;
        else myCID = myNID;
     myLevel  = lvl;
-    ConfigID =  0;
-    TZValid  = 0;
-    TimeZone = 0;
-    subsPort = 0;
     myVersion= kYR_Version;
-
-    lkCount  = 0;
-    ulCount  = 0;
-    Manager  = 0;
 
 // setName() will set the node identification information
 //
@@ -168,7 +129,6 @@ XrdCmsNode::XrdCmsNode(XrdLink *lnkp, const char *theIF, const char *nid,
 XrdCmsNode::~XrdCmsNode()
 {
    isOffline = 1;  // STMutex not needed here
-   if (isLocked) UnLock();
 
 // Delete other appendages
 //
@@ -221,58 +181,52 @@ void XrdCmsNode::setName(XrdLink *lnkp, const char *theIF, int port)
 /*                                D e l e t e                                 */
 /******************************************************************************/
 
-void XrdCmsNode::Delete(XrdSysMutex &gMutex)
+void XrdCmsNode::Delete(XrdSysFusedMutex &gMutex)
 {
    EPNAME("Delete");
-   time_t tNow;
-   unsigned int theLKCnt;
-   int tmoWait = 60, totWait = 0;
+   static const int warnIntvl = 60;
+   int totWait = 0, tmoWarn = 60;
+   int tmoWait (Config.DELDelay < 3 ? Config.DELDelay : 3);
    bool doDel = true;
 
 // We need to make sure there are no references to this object. This is true
-// when the lkCount equals the ulCount. The lkCount is under control of the
-// global mutex passed to us. The ulCount is under control of the node lock.
-// we will wait until they are equal. As this node has been removed from all
-// tables at this point, the lkCount cannot increase but it may decrease when
-// Ref2G() is called which happens for none lock-free operations (e.g. Send).
-// However, we will refresh it if we timeout.
-//
-   gMutex.Lock();
-   theLKCnt = lkCount;
-   gMutex.UnLock();
-
-// Get the node lock and do some debugging. Set tghe isGone flag even though it
-// should be set. We need to do that under the node lock to make sure we get
-// signalled whenever the node gets unlocked by some thread (ulCount changed).
+// when the refCnt is zero but only when we hold a global write lock that has
+// been passed to us. As this node has been removed from all global tables
+// at this point, we just need to make sure than no threads are poised to
+// increase it. That can't happen if we obrtain a write lock. To start,
+// get the node lock and do some debugging. Set the isGone flag even though it
+// should be set. Note that we need to serialize with the refCnt as some
+// threads may still be holding a reference to the node.
 //
    nodeMutex.Lock();
    isGone = 1;
-   DEBUG(Ident <<" locks=" <<theLKCnt <<" unlocks=" <<ulCount);
+   nodeMutex.UnLock();
+   DEBUG(Ident <<" refs=" <<refCnt);
 
 // Now wait for things to simmer down. We wait for an appropriate time because
 // we don't want to occupy this thread forever.
 //
-   while(theLKCnt != ulCount)
+   gMutex.WriteLock();
+   while(refCnt)
         {if (totWait >= Config.DELDelay) {doDel = false; break;}
-         tNow = time(0);
-         if (!nodeMutex.Wait(tmoWait)) totWait += (time(0) - tNow);
-            else {DeleteWarn(gMutex, theLKCnt);
-                  totWait += tmoWait;
-                  tmoWait  = tmoWait << 1;
-                  if (totWait + tmoWait > Config.DELDelay)
-                     {tmoWait = Config.DELDelay - totWait;
-                      if (tmoWait < 30) tmoWait = 30;
-                     }
-                 }
+         gMutex.UnLock();
+         if (totWait >= tmoWarn)
+            {unsigned int theCnt = refCnt;
+             DeleteWarn(theCnt);
+             tmoWarn += warnIntvl;
+            }
+         XrdSysTimer::Snooze(tmoWait);
+         totWait += tmoWait;
+         gMutex.WriteLock();
         }
+    gMutex.UnLock();
 
 // We can now safely delete this node
 //
-   nodeMutex.UnLock();
    if (doDel) delete this;
       else {char eBuff[256];
             snprintf(eBuff, sizeof(eBuff),
-                     " (%p) delete timeout; node object lost!", this);
+                     " (%p) delete timeout; node object lost!", (void*)this);
             Say.Emsg("Delete", Ident, eBuff);
            }
 }
@@ -281,23 +235,16 @@ void XrdCmsNode::Delete(XrdSysMutex &gMutex)
 /* Private:                   D e l e t e W a r n                             */
 /******************************************************************************/
 
-void XrdCmsNode::DeleteWarn(XrdSysMutex &gMutex, unsigned int &lkVal)
+void XrdCmsNode::DeleteWarn(unsigned int lkVal)
 {
-   char eBuff[256];
 
 // Print warning
 //
-   snprintf(eBuff, sizeof(eBuff), "delete sync stall; lk %d != ul %d",
-            lkVal, ulCount);
-   Say.Emsg("Delete", Ident, eBuff);
-
-// Update the lock count
-//
-   nodeMutex.UnLock();
-   gMutex.Lock();
-   lkVal = lkCount;
-   gMutex.UnLock();
-   nodeMutex.Lock();
+   if (lkVal)
+      {char eBuff[256];
+       snprintf(eBuff, sizeof(eBuff), "delete sync stall; refs = %u", lkVal);
+       Say.Emsg("Delete", Ident, eBuff);
+      }
 }
   
 /******************************************************************************/
@@ -314,7 +261,7 @@ void XrdCmsNode::Disc(const char *reason, int needLock)
    isOffline = 1;         // STMutex is already held if needed
 
 // If we are still connected, initiate a teardown. This may be done async as
-// we are asking for a defered close which will be followed by a full close.
+// we are asking for a deferred close which will be followed by a full close.
 //
    if (isConn)
       {Link->setEtext(reason);
@@ -510,18 +457,22 @@ const char *XrdCmsNode::do_Have(XrdCmsRRData &Arg)
 const char *XrdCmsNode::do_Load(XrdCmsRRData &Arg)
 {
    EPNAME("do_Load")
-   int temp, pcpu, pnet, pxeq, pmem, ppag, pdsk;
+   uint32_t pcpu, pnet, pxeq, pmem, ppag, pdsk;
+   int temp;
 
 // Process: load <cpu> <io> <load> <mem> <pag> <util> <rsvd> <dskFree>
 //               0     1    2      3     4     5      6
-   pcpu = static_cast<int>(Arg.Opaque[CmsLoadRequest::cpuLoad]);
-   pnet = static_cast<int>(Arg.Opaque[CmsLoadRequest::netLoad]);
-   pxeq = static_cast<int>(Arg.Opaque[CmsLoadRequest::xeqLoad]);
-   pmem = static_cast<int>(Arg.Opaque[CmsLoadRequest::memLoad]);
-   ppag = static_cast<int>(Arg.Opaque[CmsLoadRequest::pagLoad]);
-   pdsk = static_cast<int>(Arg.Opaque[CmsLoadRequest::dskLoad]);
+   pcpu = static_cast<uint32_t>(Arg.Opaque[CmsLoadRequest::cpuLoad]);
+   pnet = static_cast<uint32_t>(Arg.Opaque[CmsLoadRequest::netLoad]);
+   pxeq = static_cast<uint32_t>(Arg.Opaque[CmsLoadRequest::xeqLoad]);
+   pmem = static_cast<uint32_t>(Arg.Opaque[CmsLoadRequest::memLoad]);
+   ppag = static_cast<uint32_t>(Arg.Opaque[CmsLoadRequest::pagLoad]);
+   pdsk = static_cast<uint32_t>(Arg.Opaque[CmsLoadRequest::dskLoad]);
 
-// Compute actual load value
+// Compute actual load value. Note that the update is not thread-kosher as we
+// do not obtain a write lock. However, the values below use the single writer
+// principal so other threads will eventually see a coherent picture. This is
+// good enough for what these values are used for.
 //
    myLoad = Meter.calcLoad(pcpu, pnet, pxeq, pmem, ppag);
    myMass = Meter.calcLoad(myLoad, pdsk);
@@ -560,9 +511,9 @@ const char *XrdCmsNode::do_Load(XrdCmsRRData &Arg)
           else nRefs = sRefs = 0;
        snprintf(buff, sizeof(buff)-1,
                "load=%d; cpu=%d net=%d inq=%d mem=%d pag=%d dsk=%d utl=%d "
-               "shr=[%d %lld %lld]",
+               "shr=[%d %lld %lld] ref=[%d %d]",
                myLoad, pcpu, pnet, pxeq, pmem, ppag, Arg.dskFree, pdsk,
-               myShr, nRefs, sRefs);
+               myShr, nRefs, sRefs, RefTotR+RefR, RefTotW+RefW);
        Say.Emsg("Node", Name(), buff);
        logload = Config.LogPerf;
       } else logload--;
@@ -627,7 +578,7 @@ const char *XrdCmsNode::do_Locate(XrdCmsRRData &Arg)
 // Encode if type into the options
 //
    Sel.Opts = static_cast<int>(ifType) & XrdCmsSelect::ifWant;
-   lsopts   = static_cast<XrdCmsCluster::CmsLSOpts>(lsopts | ifType);
+   lsopts   = lsopts | static_cast<XrdCmsCluster::CmsLSOpts>(ifType);
 
 // Grab various options
 //
@@ -651,7 +602,7 @@ const char *XrdCmsNode::do_Locate(XrdCmsRRData &Arg)
           {Arg.Request.rrCode = kYR_wait;
            bytes = sizeof(Resp.Val); Why = "delay ";
           } else {
-           if (rc == -2) return 0;
+           if (rc == XrdCmsCluster::Wait4CBk) return 0;
            Arg.Request.rrCode = kYR_error;
            rc = kYR_ENOENT; Why = "miss ";
            bytes = strlcpy(Resp.outbuff, "No servers have access to the file",
@@ -1071,7 +1022,7 @@ int XrdCmsNode::do_SelAvoid(XrdCmsRRData &Arg, XrdCmsSelect &Sel,
        Sel.Resp.DLen = msrclen;
        if (Arg.Opts & CmsSelectRequest::kYR_tryRSEL) Sel.Resp.Port = kYR_EPERM;
           else Sel.Resp.Port = kYR_ENOENT;
-       return XrdCmsCluster::RetryOut;
+       return XrdCmsCluster::EReplete;
       }
 
 // Check if we exceeded the retry count
@@ -1089,7 +1040,7 @@ int XrdCmsNode::do_SelAvoid(XrdCmsRRData &Arg, XrdCmsSelect &Sel,
        return -1;
       }
 
-// We suceeded, indicate selection can proceed.
+// We succeeded, indicate selection can proceed.
 //
    return 0;
 }
@@ -1139,9 +1090,12 @@ const char *XrdCmsNode::do_Select(XrdCmsRRData &Arg)
            {Sel.Opts |= XrdCmsSelect::Write;                       *toP++='w';
             if (Arg.Opts & CmsSelectRequest::kYR_mwfiles || !Config.DoMWChk)
                {Sel.Opts |= XrdCmsSelect::MWFiles;                *(toP-1)='W';}
-            }
+           }
          if (Arg.Opts & CmsSelectRequest::kYR_metaop)
-           {Sel.Opts |= XrdCmsSelect::Write|XrdCmsSelect::isMeta;  *toP++='m';}
+           {Sel.Opts |= XrdCmsSelect::isMeta;                      *toP++='m';
+            if (!(Arg.Opts & CmsSelectRequest::kYR_write))
+               {Sel.Opts |= XrdCmsSelect::isDir;                   *toP++='D';}
+           }
          if (Arg.Opts & CmsSelectRequest::kYR_create)  
            {Sel.Opts |= XrdCmsSelect::Write|XrdCmsSelect::NewFile; *toP++='c';
             if (Arg.Opts & CmsSelectRequest::kYR_replica)
@@ -1169,6 +1123,11 @@ const char *XrdCmsNode::do_Select(XrdCmsRRData &Arg)
           }
       }
 
+// Compute alternate hash.
+//
+   if (Sel.Opts & XrdCmsSelect::Pack && Config.sched_AffPC
+   &&  Sel.Path.Len > 3) setHash(Sel, Config.sched_AffPC);
+
 // Check if an avoid node present. If so, this is ineligible for fast redirect.
 //
    bool doRedir = false;
@@ -1186,12 +1145,15 @@ const char *XrdCmsNode::do_Select(XrdCmsRRData &Arg)
            DEBUGR("delay " <<rc <<' ' <<Arg.Path);
           } else {
            Arg.Request.rrCode = kYR_error;
-           if (rc != XrdCmsCluster::RetryOut)
-              {if (rc != XrdCmsCluster::RetryErr) Sel.Resp.Port = kYR_ENOENT;
-                  else {int rtRC = (Arg.Opts & CmsSelectRequest::kYR_tryMASK)
-                                 >> CmsSelectRequest::kYR_trySHFT;
-                        Sel.Resp.Port = rtEC[rtRC];
-                       }
+           if (rc != XrdCmsCluster::EReplete) // if error info has not been set
+              {if (rc == XrdCmsCluster::RetryErr)
+                  {int rtRC = (Arg.Opts & CmsSelectRequest::kYR_tryMASK)
+                                       >> CmsSelectRequest::kYR_trySHFT;
+                   Sel.Resp.Port = rtEC[rtRC];
+                  } else {
+                   Sel.Resp.Port = kYR_ENOENT; // This should never happen!
+                   Sel.Resp.DLen = sprintf(Sel.Resp.Data,"%s","Item not found.")+1;
+                  }
               }
            DEBUGR("failed; " <<Sel.Resp.Data << ' ' <<Arg.Path);
           }
@@ -1393,8 +1355,8 @@ void XrdCmsNode::do_StateDFS(XrdCmsBaseFR *rP, int rc)
 
 // Do some debugging and record the hash code.
 //
-   DEBUG((rP->Mod & CmsStateRequest::kYR_metaman ? "met " : "man ") <<std::hex
-         <<int(rP->Mod) <<std::dec <<" rc=" <<rc <<" path=" <<rP->Path);
+   DEBUG((rP->Mod & CmsStateRequest::kYR_metaman ? "met " : "man ") <<Xrd::hex1
+         <<int(rP->Mod) <<" rc=" <<rc <<" path=" <<rP->Path);
    Sel.Path.Hash = rP->Sid;
 
 // If the return code is negative then the file does not exist. If it is zero
@@ -1653,19 +1615,25 @@ const char *XrdCmsNode::do_Status(XrdCmsRRData &Arg)
           else      {add2Stage =  1; isNoStage = 0; stgMsg="staging resumed";}
        else         {add2Stage =  0;                stgMsg = 0;}
 
-// Process suspend/resume
+// Process suspend/resume. We mmerely need a read lock to alter isBad here.
 //
     if ((Resume && (isBad & isSuspend)) || (Suspend && !(isBad & isSuspend)))
-       if (Suspend) {add2Activ = -1; isBad |=  isSuspend;
+       if (Suspend) {add2Activ = -1;
+                     Cluster.SLock(true, false);
+                     isBad |=  isSuspend; // Keep coherency with black listing
+                     Cluster.SLock(false);
                      srvMsg="service suspended"; 
                      stgMsg = 0;
                     }
-          else      {add2Activ =  1; isBad &= ~isSuspend;
+          else      {add2Activ =  1;
+                     Cluster.SLock(true, false);
+                     isBad &= ~isSuspend; // Keep coherency with black listing
+                     Cluster.SLock(false);
                      srvMsg="service resumed";
                      stgMsg = (isNoStage ? "(no staging)" : "(staging)");
                      port = ntohl(Arg.Request.streamid);
                      if (port && port != netIF.Port())
-                        {Lock(false); netIF.Port(port); UnLock();
+                        {Lock(); netIF.Port(port); UnLock();
                          DEBUGR("set data port to " <<port);
                         }
                     }
@@ -1892,7 +1860,7 @@ const char *XrdCmsNode::fsFail(const char *Who,  const char *What,
       else {struct {const char *Ident;} Arg = {Who};
             DEBUGR("rc=" <<rc <<' ' <<What <<' ' <<Path);
            }
-   return rc ? strerror(rc) : 0;
+   return rc ? XrdSysE2T(rc) : 0;
 }
 
 /******************************************************************************/
@@ -1921,4 +1889,43 @@ int XrdCmsNode::getSize(const char *theSize, long long &Size)
 //
    if (!(Size = strtoll(theSize, &eP, 10)) || *eP) return 0;
    return 1;
+}
+
+/******************************************************************************/
+/*                               s e t H a s h                                */
+/******************************************************************************/
+  
+void XrdCmsNode::setHash(XrdCmsSelect &Sel, int acount)
+{
+
+// Process postive count
+//
+   if (acount > 0)
+      {char *spos = (*Sel.Path.Val == '/' ? Sel.Path.Val+1 : Sel.Path.Val);
+       char *slash;
+       while(acount)
+            {if (!(slash = index(spos, '/'))) return;
+             acount--; spos = slash+1;
+            }
+       *slash = 0;
+       Sel.AltHash = XrdOucCRC::Calc32C(Sel.Path.Val, slash - Sel.Path.Val);
+       *slash = '/';
+       Sel.Opts |= XrdCmsSelect::UseAH;
+       return;
+      }
+
+// Process negative count
+//
+   if (acount < 0)
+      {int i = Sel.Path.Len-1;
+       if (Sel.Path.Val[i] == '/') i--;
+
+       for(; i > 0; i--)
+           {if (Sel.Path.Val[i] == '/' && !(++acount)) break;}
+
+       if (i)
+          {Sel.AltHash = XrdOucCRC::Calc32C(Sel.Path.Val+i, Sel.Path.Len-i);
+           Sel.Opts |= XrdCmsSelect::UseAH;
+          }
+      }
 }

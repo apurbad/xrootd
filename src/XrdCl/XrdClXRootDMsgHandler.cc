@@ -29,7 +29,6 @@
 #include "XrdCl/XrdClXRootDTransport.hh"
 #include "XrdCl/XrdClMessage.hh"
 #include "XrdCl/XrdClURL.hh"
-#include "XrdCl/XrdClUglyHacks.hh"
 #include "XrdCl/XrdClUtils.hh"
 #include "XrdCl/XrdClTaskManager.hh"
 #include "XrdCl/XrdClJobManager.hh"
@@ -37,11 +36,19 @@
 #include "XrdCl/XrdClMessageUtils.hh"
 #include "XrdCl/XrdClLocalFileHandler.hh"
 #include "XrdCl/XrdClRedirectorRegistry.hh"
+#include "XrdCl/XrdClSocket.hh"
+#include "XrdCl/XrdClTls.hh"
+#include "XrdCl/XrdClOptimizers.hh"
 
-#include <arpa/inet.h>              // for network unmarshalling stuff
+#include "XrdOuc/XrdOucCRC.hh"
+#include "XrdOuc/XrdOucPrivateUtils.hh"
+
 #include "XrdSys/XrdSysPlatform.hh" // same as above
+#include "XrdSys/XrdSysAtomics.hh"
+#include "XrdSys/XrdSysPthread.hh"
 #include <memory>
 #include <sstream>
+#include <numeric>
 
 namespace
 {
@@ -99,8 +106,24 @@ namespace XrdCl
   //----------------------------------------------------------------------------
   // Examine an incoming message, and decide on the action to be taken
   //----------------------------------------------------------------------------
-  uint16_t XRootDMsgHandler::Examine( Message *msg )
+  uint16_t XRootDMsgHandler::Examine( std::shared_ptr<Message> &msg )
   {
+    const int sst = pSendingState.fetch_or( kSawResp );
+
+    if( !( sst & kSendDone ) && !( sst & kSawResp ) )
+    {
+      // we must have been sent although we haven't got the OnStatusReady
+      // notification yet. Set the inflight notice.
+
+      Log *log = DefaultEnv::GetLog();
+      log->Dump( XRootDMsg, "[%s] Message %s reply received before notification "
+                 "that it was sent, assuming it was sent ok.",
+                 pUrl.GetHostId().c_str(),
+                 pRequest->GetObfuscatedDescription().c_str() );
+
+      pMsgInFly = true;
+    }
+
     //--------------------------------------------------------------------------
     // if the MsgHandler is already being used to process another request
     // (kXR_oksofar) we need to wait
@@ -108,7 +131,7 @@ namespace XrdCl
     if( pOksofarAsAnswer )
     {
       XrdSysCondVarHelper lck( pCV );
-      while( pResponse != 0 ) pCV.Wait();
+      while( pResponse ) pCV.Wait();
     }
     else
     {
@@ -116,9 +139,9 @@ namespace XrdCl
       {
         Log *log = DefaultEnv::GetLog();
         log->Warning( ExDbgMsg, "[%s] MsgHandler is examining a response although "
-                                "it already owns a response: 0x%x (message: %s ).",
-                      pUrl.GetHostId().c_str(), this,
-                      pRequest->GetDescription().c_str() );
+                                "it already owns a response: %p (message: %s ).",
+                      pUrl.GetHostId().c_str(), (void*)this,
+                      pRequest->GetObfuscatedDescription().c_str() );
       }
     }
 
@@ -131,32 +154,12 @@ namespace XrdCl
     uint32_t        dlen   = 0;
 
     //--------------------------------------------------------------------------
-    // We got an async message
+    // We only care about async responses, but those are extracted now
+    // in the SocketHandler.
     //--------------------------------------------------------------------------
     if( rsp->hdr.status == kXR_attn )
     {
-      if( msg->GetSize() < 12 )
-        return Ignore;
-
-      //------------------------------------------------------------------------
-      // We only care about async responses
-      //------------------------------------------------------------------------
-      if( rsp->body.attn.actnum != (int32_t)htonl(kXR_asynresp) )
-        return Ignore;
-
-      if( msg->GetSize() < 24 )
-        return Ignore;
-
-      //------------------------------------------------------------------------
-      // Check if the message has the stream ID that we're interested in
-      //------------------------------------------------------------------------
-      ServerResponse *embRsp = (ServerResponse*)msg->GetBuffer(16);
-      if( embRsp->hdr.streamid[0] != req->header.streamid[0] ||
-          embRsp->hdr.streamid[1] != req->header.streamid[1] )
-        return Ignore;
-
-      status = ntohs( embRsp->hdr.status );
-      dlen   = ntohl( embRsp->hdr.dlen );
+      return Ignore;
     }
     //--------------------------------------------------------------------------
     // We got a sync message - check if it belongs to us
@@ -182,6 +185,7 @@ namespace XrdCl
     //    answer and we need to wait for more (default, no extra flag)
     //--------------------------------------------------------------------------
     pResponse = msg;
+    pBodyReader->SetDataLength( dlen );
 
     Log *log = DefaultEnv::GetLog();
     switch( status )
@@ -192,16 +196,16 @@ namespace XrdCl
       case kXR_error:
       case kXR_redirect:
       case kXR_wait:
-        return Take | RemoveHandler;
+        return RemoveHandler;
 
       case kXR_waitresp:
       {
         log->Dump( XRootDMsg, "[%s] Got kXR_waitresp response to "
                    "message %s", pUrl.GetHostId().c_str(),
-                   pRequest->GetDescription().c_str() );
+                   pRequest->GetObfuscatedDescription().c_str() );
 
-        pResponse = 0;
-        return Take | Ignore; // This must be handled synchronously!
+        pResponse.reset();
+        return Ignore; // This must be handled synchronously!
       }
 
       //------------------------------------------------------------------------
@@ -210,31 +214,26 @@ namespace XrdCl
       case kXR_ok:
       {
         //----------------------------------------------------------------------
-        // For kXR_read we read in raw mode if we haven't got the full message
-        // already (handler installed to late and the message has been cached)
+        // For kXR_read we read in raw mode
         //----------------------------------------------------------------------
         uint16_t reqId = ntohs( req->header.requestid );
-        if( reqId == kXR_read && msg->GetSize() == 8 )
+        if( reqId == kXR_read )
         {
-          pReadRawStarted = false;
-          pAsyncMsgSize   = dlen;
-          return Take | Raw | RemoveHandler;
+          return Raw | RemoveHandler;
         }
 
         //----------------------------------------------------------------------
         // kXR_readv is the same as kXR_read
         //----------------------------------------------------------------------
-        if( reqId == kXR_readv  && msg->GetSize() == 8 )
+        if( reqId == kXR_readv )
         {
-          pAsyncMsgSize      = dlen;
-          pReadVRawMsgOffset = 0;
-          return Take | Raw | RemoveHandler;
+          return Raw | RemoveHandler;
         }
 
         //----------------------------------------------------------------------
         // For everything else we just take what we got
         //----------------------------------------------------------------------
-        return Take | RemoveHandler;
+        return RemoveHandler;
       }
 
       //------------------------------------------------------------------------
@@ -245,12 +244,11 @@ namespace XrdCl
       {
         log->Dump( XRootDMsg, "[%s] Got a kXR_oksofar response to request "
                    "%s", pUrl.GetHostId().c_str(),
-                   pRequest->GetDescription().c_str() );
+                   pRequest->GetObfuscatedDescription().c_str() );
 
         if( !pOksofarAsAnswer )
         {
-          pResponse = 0;
-          pPartialResps.push_back( msg );
+          pPartialResps.emplace_back( std::move( pResponse ) );
         }
 
         //----------------------------------------------------------------------
@@ -261,17 +259,8 @@ namespace XrdCl
         uint16_t reqId = ntohs( req->header.requestid );
         if( reqId == kXR_read )
         {
-          if( msg->GetSize() == 8 )
-          {
-            pReadRawStarted = false;
-            pAsyncMsgSize   = dlen;
-            return Take | Raw | ( pOksofarAsAnswer ? 0 : NoProcess );
-          }
-          else
-          {
-            pReadRawCurrentOffset += dlen;
-            return Take | ( pOksofarAsAnswer ? 0 : NoProcess );
-          }
+          pTimeoutFence.store( true, std::memory_order_relaxed );
+          return Raw | ( pOksofarAsAnswer ? None : NoProcess );
         }
 
         //----------------------------------------------------------------------
@@ -279,26 +268,135 @@ namespace XrdCl
         //----------------------------------------------------------------------
         if( reqId == kXR_readv )
         {
-          if( msg->GetSize() == 8 )
-          {
-            pAsyncMsgSize      = dlen;
-            pReadVRawMsgOffset = 0;
-            return Take | Raw | ( pOksofarAsAnswer ? 0 : NoProcess );
-          }
-          else
-            return Take | ( pOksofarAsAnswer ? 0 : NoProcess );
+          pTimeoutFence.store( true, std::memory_order_relaxed );
+          return Raw | ( pOksofarAsAnswer ? None : NoProcess );
         }
 
-        return Take | ( pOksofarAsAnswer ? 0 : NoProcess );
+        return ( pOksofarAsAnswer ? None : NoProcess );
+      }
+
+      case kXR_status:
+      {
+        log->Dump( XRootDMsg, "[%s] Got a kXR_status response to request "
+                   "%s", pUrl.GetHostId().c_str(),
+                   pRequest->GetObfuscatedDescription().c_str() );
+
+        uint16_t reqId = ntohs( req->header.requestid );
+        if( reqId == kXR_pgwrite )
+        {
+          //--------------------------------------------------------------------
+          // In case of pgwrite by definition this wont be a partial response
+          // so we can already remove the handler from the in-queue
+          //--------------------------------------------------------------------
+          return RemoveHandler;
+        }
+
+        //----------------------------------------------------------------------
+        // Otherwise (pgread), first of all we need to read the body of the
+        // kXR_status response, we can handle the raw data (if any) only after
+        // we have the whole kXR_status body
+        //----------------------------------------------------------------------
+        pTimeoutFence.store( true, std::memory_order_relaxed );
+        return None;
       }
 
       //------------------------------------------------------------------------
       // Default
       //------------------------------------------------------------------------
       default:
-        return Take | RemoveHandler;
+        return RemoveHandler;
     }
-    return Take | RemoveHandler;
+    return RemoveHandler;
+  }
+
+  //----------------------------------------------------------------------------
+  // Reexamine the incoming message, and decide on the action to be taken
+  //----------------------------------------------------------------------------
+  uint16_t XRootDMsgHandler::InspectStatusRsp()
+  {
+    if( !pResponse )
+      return 0;
+
+    Log *log = DefaultEnv::GetLog();
+    ServerResponse *rsp = (ServerResponse *)pResponse->GetBuffer();
+
+    //--------------------------------------------------------------------------
+    // Additional action is only required for kXR_status
+    //--------------------------------------------------------------------------
+    if( rsp->hdr.status != kXR_status ) return 0;
+
+    //--------------------------------------------------------------------------
+    // Ignore malformed status response
+    //--------------------------------------------------------------------------
+    if( pResponse->GetSize() < sizeof( ServerResponseStatus ) )
+    {
+      log->Error( XRootDMsg, "[%s] kXR_status: invalid message size.", pUrl.GetHostId().c_str() );
+      return Corrupted;
+    }
+
+    ClientRequest  *req    = (ClientRequest *)pRequest->GetBuffer();
+    uint16_t reqId = ntohs( req->header.requestid );
+    //--------------------------------------------------------------------------
+    // Unmarshal the status body
+    //--------------------------------------------------------------------------
+    XRootDStatus st = XRootDTransport::UnMarshalStatusBody( *pResponse, reqId );
+
+    if( !st.IsOK() && st.code == errDataError )
+    {
+      log->Error( XRootDMsg, "[%s] %s", pUrl.GetHostId().c_str(),
+                  st.GetErrorMessage().c_str() );
+      return Corrupted;
+    }
+
+    if( !st.IsOK() )
+    {
+      log->Error( XRootDMsg, "[%s] Failed to unmarshall status body.",
+                  pUrl.GetHostId().c_str() );
+      pStatus = st;
+      HandleRspOrQueue();
+      return Ignore;
+    }
+
+    //--------------------------------------------------------------------------
+    // Common handling for partial results
+    //--------------------------------------------------------------------------
+    ServerResponseV2 *rspst   = (ServerResponseV2*)pResponse->GetBuffer();
+    if( rspst->status.bdy.resptype == XrdProto::kXR_PartialResult )
+    {
+      pPartialResps.push_back( std::move( pResponse ) );
+    }
+
+    //--------------------------------------------------------------------------
+    // Decide the actions that we need to take
+    //--------------------------------------------------------------------------
+    uint16_t action = 0;
+    if( reqId == kXR_pgread )
+    {
+      //----------------------------------------------------------------------
+      // The message contains only Status header and body but no raw data
+      //----------------------------------------------------------------------
+      if( !pPageReader )
+        pPageReader.reset( new AsyncPageReader( *pChunkList, pCrc32cDigests ) );
+      pPageReader->SetRsp( rspst );
+
+      action |= Raw;
+
+      if( rspst->status.bdy.resptype == XrdProto::kXR_PartialResult )
+        action |= NoProcess;
+      else
+        action |= RemoveHandler;
+    }
+    else if( reqId == kXR_pgwrite )
+    {
+      // if data corruption has been detected on the server side we will
+      // send some additional data pointing to the pages that need to be
+      // retransmitted
+      if( size_t( sizeof( ServerResponseHeader ) + rspst->status.hdr.dlen + rspst->status.bdy.dlen ) >
+        pResponse->GetCursor() )
+        action |= More;
+    }
+
+    return action;
   }
 
   //----------------------------------------------------------------------------
@@ -313,77 +411,46 @@ namespace XrdCl
   //----------------------------------------------------------------------------
   //! Process the message if it was "taken" by the examine action
   //----------------------------------------------------------------------------
-  void XRootDMsgHandler::Process( Message *msg )
+  void XRootDMsgHandler::Process()
   {
     Log *log = DefaultEnv::GetLog();
 
-    ServerResponse *rsp = (ServerResponse *)msg->GetBuffer();
+    ServerResponse *rsp = (ServerResponse *)pResponse->GetBuffer();
+
     ClientRequest  *req = (ClientRequest *)pRequest->GetBuffer();
-
-    //--------------------------------------------------------------------------
-    // We got an async message
-    //--------------------------------------------------------------------------
-    if( rsp->hdr.status == kXR_attn )
-    {
-      log->Dump( XRootDMsg, "[%s] Got an async response to message %s, "
-                 "processing it", pUrl.GetHostId().c_str(),
-                 pRequest->GetDescription().c_str() );
-      Message *embededMsg = new Message( rsp->hdr.dlen-8 );
-      embededMsg->Append( msg->GetBuffer( 16 ), rsp->hdr.dlen-8 );
-      XRDCL_SMART_PTR_T<Message> msgPtr( msg );
-      pResponse = embededMsg; // this can never happen for oksofars
-
-      // we need to unmarshall the header by hand
-      XRootDTransport::UnMarshallHeader( embededMsg );
-
-      //------------------------------------------------------------------------
-      // Check if the dlen field of the embedded message is consistent with
-      // the dlen value of the original message
-      //------------------------------------------------------------------------
-      ServerResponse *embRsp = (ServerResponse *)embededMsg->GetBuffer();
-      if( embRsp->hdr.dlen != rsp->hdr.dlen-16 )
-      {
-        log->Error( XRootDMsg, "[%s] Sizes of the async response to %s and the "
-                    "embedded message are inconsistent. Expected %d, got %d.",
-                    pUrl.GetHostId().c_str(), pRequest->GetDescription().c_str(),
-                    rsp->hdr.dlen-16, embRsp->hdr.dlen);
-
-        pStatus = Status( stFatal, errInvalidMessage );
-        HandleResponse();
-        return;
-      }
-
-      Process( embededMsg );
-      return;
-    }
 
     //--------------------------------------------------------------------------
     // If it is a local file, it can be only a metalink redirector
     //--------------------------------------------------------------------------
     if( pUrl.IsLocalFile() && pUrl.IsMetalink() )
-    {
-      pHosts->back().flags    = kXR_isManager | kXR_attrMeta;
       pHosts->back().protocol = kXR_PROTOCOLVERSION;
-    }
+
     //--------------------------------------------------------------------------
     // We got an answer, check who we were talking to
     //--------------------------------------------------------------------------
     else
     {
       AnyObject  qryResult;
-      int       *qryResponse = 0;
+      int       *qryResponse = nullptr;
       pPostMaster->QueryTransport( pUrl, XRootDQuery::ServerFlags, qryResult );
       qryResult.Get( qryResponse );
-      pHosts->back().flags = *qryResponse; delete qryResponse; qryResponse = 0;
+      if (qryResponse) {
+        pHosts->back().flags = *qryResponse;
+        delete qryResponse;
+        qryResponse = nullptr;
+      }
       pPostMaster->QueryTransport( pUrl, XRootDQuery::ProtocolVersion, qryResult );
       qryResult.Get( qryResponse );
-      pHosts->back().protocol = *qryResponse; delete qryResponse;
+      if (qryResponse) {
+        pHosts->back().protocol = *qryResponse;
+        delete qryResponse;
+      }
     }
 
     //--------------------------------------------------------------------------
     // Process the message
     //--------------------------------------------------------------------------
-    Status st = XRootDTransport::UnMarshallBody( msg, req->header.requestid );
+    Status st = XRootDTransport::UnMarshallBody( pResponse.get(), req->header.requestid );
     if( !st.IsOK() )
     {
       pStatus = Status( stFatal, errInvalidMessage );
@@ -412,7 +479,17 @@ namespace XrdCl
       {
         log->Dump( XRootDMsg, "[%s] Got a kXR_ok response to request %s",
                    pUrl.GetHostId().c_str(),
-                   pRequest->GetDescription().c_str() );
+                   pRequest->GetObfuscatedDescription().c_str() );
+        pStatus  = Status();
+        HandleResponse();
+        return;
+      }
+
+      case kXR_status:
+      {
+        log->Dump( XRootDMsg, "[%s] Got a kXR_status response to request %s",
+                    pUrl.GetHostId().c_str(),
+                    pRequest->GetObfuscatedDescription().c_str() );
         pStatus   = Status();
         HandleResponse();
         return;
@@ -425,8 +502,8 @@ namespace XrdCl
       {
         log->Dump( XRootDMsg, "[%s] Got a kXR_oksofar response to request %s",
                    pUrl.GetHostId().c_str(),
-                   pRequest->GetDescription().c_str() );
-        pStatus   = Status( stOK, suContinue );
+                   pRequest->GetObfuscatedDescription().c_str() );
+        pStatus  = Status( stOK, suContinue );
         HandleResponse();
         return;
       }
@@ -440,12 +517,11 @@ namespace XrdCl
         memcpy( errmsg, rsp->body.error.errmsg, rsp->hdr.dlen-4 );
         log->Dump( XRootDMsg, "[%s] Got a kXR_error response to request %s "
                    "[%d] %s", pUrl.GetHostId().c_str(),
-                   pRequest->GetDescription().c_str(), rsp->body.error.errnum,
+                   pRequest->GetObfuscatedDescription().c_str(), rsp->body.error.errnum,
                    errmsg );
         delete [] errmsg;
 
-        HandleError( Status(stError, errErrorResponse, rsp->body.error.errnum),
-                     pResponse );
+        HandleError( Status(stError, errErrorResponse, rsp->body.error.errnum) );
         return;
       }
 
@@ -454,9 +530,6 @@ namespace XrdCl
       //------------------------------------------------------------------------
       case kXR_redirect:
       {
-        XRDCL_SMART_PTR_T<Message> msgPtr( pResponse );
-        pResponse = 0;
-
         if( rsp->hdr.dlen <= 4 )
         {
           log->Error( XRootDMsg, "[%s] Got invalid redirect response.",
@@ -473,7 +546,7 @@ namespace XrdCl
         delete [] urlInfoBuff;
         log->Dump( XRootDMsg, "[%s] Got kXR_redirect response to "
                    "message %s: %s, port %d", pUrl.GetHostId().c_str(),
-                   pRequest->GetDescription().c_str(), urlInfo.c_str(),
+                   pRequest->GetObfuscatedDescription().c_str(), urlInfo.c_str(),
                    rsp->body.redirect.port );
 
         //----------------------------------------------------------------------
@@ -484,7 +557,7 @@ namespace XrdCl
           log->Warning( XRootDMsg, "[%s] Redirect limit has been reached for "
                      "message %s, the last known error is: %s",
                      pUrl.GetHostId().c_str(),
-                     pRequest->GetDescription().c_str(),
+                     pRequest->GetObfuscatedDescription().c_str(),
                      pLastError.ToString().c_str() );
 
 
@@ -514,7 +587,7 @@ namespace XrdCl
               log->Dump( XRootDMsg, "[%s] Current server has been assigned "
                          "as a load-balancer for message %s",
                          pUrl.GetHostId().c_str(),
-                         pRequest->GetDescription().c_str() );
+                         pRequest->GetObfuscatedDescription().c_str() );
               HostList::iterator it;
               for( it = pHosts->begin(); it != pHosts->end(); ++it )
                 it->loadBalancer = false;
@@ -541,8 +614,34 @@ namespace XrdCl
         std::ostringstream o;
 
         o << urlComponents[0];
-        if( rsp->body.redirect.port != -1 )
+        if( rsp->body.redirect.port > 0 )
           o << ":" << rsp->body.redirect.port << "/";
+        else if( rsp->body.redirect.port < 0 )
+        {
+          //--------------------------------------------------------------------
+          // check if the manager wants to enforce write recovery at himself
+          // (beware we are dealing here with negative flags)
+          //--------------------------------------------------------------------
+          if( ~uint32_t( rsp->body.redirect.port ) & kXR_recoverWrts )
+            pHosts->back().flags |= kXR_recoverWrts;
+
+          //--------------------------------------------------------------------
+          // check if the manager wants to collapse the communication channel
+          // (the redirect host is to replace the current host)
+          //--------------------------------------------------------------------
+          if( ~uint32_t( rsp->body.redirect.port ) & kXR_collapseRedir )
+          {
+            std::string url( rsp->body.redirect.host, rsp->hdr.dlen-4 );
+            pPostMaster->CollapseRedirect( pUrl, url );
+          }
+
+          if( ~uint32_t( rsp->body.redirect.port ) & kXR_ecRedir )
+          {
+            std::string url( rsp->body.redirect.host, rsp->hdr.dlen-4 );
+            if( Utils::CheckEC( pRequest, url ) )
+              pRedirectAsAnswer = true;
+          }
+        }
 
         URL newUrl = URL( o.str() );
         if( !newUrl.IsValid() )
@@ -563,6 +662,8 @@ namespace XrdCl
         //----------------------------------------------------------------------
         // Forward any "xrd.*" params from the original client request also to
         // the new redirection url
+        // Also, we need to preserve any "xrdcl.*' as they are important for
+        // our internal workflows.
         //----------------------------------------------------------------------
         std::ostringstream ossXrd;
         const URL::ParamsMap &urlParams = pUrl.GetParams();
@@ -570,7 +671,8 @@ namespace XrdCl
         for(URL::ParamsMap::const_iterator it = urlParams.begin();
             it != urlParams.end(); ++it )
         {
-          if( it->first.compare( 0, 4, "xrd." ) )
+          if( it->first.compare( 0, 4, "xrd." ) &&
+              it->first.compare( 0, 6, "xrdcl." ) )
             continue;
 
           ossXrd << it->first << '=' << it->second << '&';
@@ -587,6 +689,9 @@ namespace XrdCl
           std::ostringstream o;
           o << "fake://fake:111//fake?";
           o << urlComponents[1];
+
+          if( urlComponents.size() == 3 )
+            o << '?' << urlComponents[2];
 
           if (!xrdCgi.empty())
           {
@@ -612,14 +717,14 @@ namespace XrdCl
         //----------------------------------------------------------------------
         // Check if we need to return the URL as a response
         //----------------------------------------------------------------------
-        if( newUrl.GetProtocol() != "root" && newUrl.GetProtocol() != "xroot" &&
+        if( newUrl.GetProtocol() != "root"  && newUrl.GetProtocol() != "xroot"  &&
+            newUrl.GetProtocol() != "roots" && newUrl.GetProtocol() != "xroots" &&
             !newUrl.IsLocalFile() )
           pRedirectAsAnswer = true;
 
         if( pRedirectAsAnswer )
         {
           pStatus   = Status( stError, errRedirect );
-          pResponse = msgPtr.release();
           HandleResponse();
           return;
         }
@@ -637,6 +742,13 @@ namespace XrdCl
         }
 
         //----------------------------------------------------------------------
+        // Make sure we don't change the protocol by accident (root vs roots)
+        //----------------------------------------------------------------------
+        if( ( pUrl.GetProtocol() == "roots" || pUrl.GetProtocol() == "xroots" ) &&
+            ( newUrl.GetProtocol() == "root" || newUrl.GetProtocol() == "xroot" ) )
+          newUrl.SetProtocol( "roots" );
+
+        //----------------------------------------------------------------------
         // Send the request to the new location
         //----------------------------------------------------------------------
         HandleError( RetryAtServer( newUrl, RedirectEntry::EntryRedirect ) );
@@ -648,8 +760,6 @@ namespace XrdCl
       //------------------------------------------------------------------------
       case kXR_wait:
       {
-        XRDCL_SMART_PTR_T<Message> msgPtr( pResponse );
-        pResponse = 0;
         uint32_t waitSeconds = 0;
 
         if( rsp->hdr.dlen >= 4 )
@@ -659,7 +769,7 @@ namespace XrdCl
           memcpy( infoMsg, rsp->body.wait.infomsg, rsp->hdr.dlen-4 );
           log->Dump( XRootDMsg, "[%s] Got kXR_wait response of %d seconds to "
                      "message %s: %s", pUrl.GetHostId().c_str(),
-                     rsp->body.wait.seconds, pRequest->GetDescription().c_str(),
+                     rsp->body.wait.seconds, pRequest->GetObfuscatedDescription().c_str(),
                      infoMsg );
           delete [] infoMsg;
           waitSeconds = rsp->body.wait.seconds;
@@ -668,7 +778,7 @@ namespace XrdCl
         {
           log->Dump( XRootDMsg, "[%s] Got kXR_wait response of 0 seconds to "
                      "message %s", pUrl.GetHostId().c_str(),
-                     pRequest->GetDescription().c_str() );
+                     pRequest->GetObfuscatedDescription().c_str() );
         }
 
         pAggregatedWaitTime += waitSeconds;
@@ -676,7 +786,7 @@ namespace XrdCl
         // We need a special case if the data node comes from metalink
         // redirector. In this case it might make more sense to try the
         // next entry in the Metalink than wait.
-        if( OmitWait( pRequest, pLoadBalancer.url ) )
+        if( OmitWait( *pRequest, pLoadBalancer.url ) )
         {
           int maxWait = DefaultMaxMetalinkWait;
           DefaultEnv::GetEnv()->GetInt( "MaxMetalinkWait", maxWait );
@@ -708,9 +818,9 @@ namespace XrdCl
 
         if( resendTime < pExpiration )
         {
-          log->Debug( ExDbgMsg, "[%s] Scheduling WaitTask for MsgHandler: 0x%x (message: %s ).",
-                      pUrl.GetHostId().c_str(), this,
-                      pRequest->GetDescription().c_str() );
+          log->Debug( ExDbgMsg, "[%s] Scheduling WaitTask for MsgHandler: %p (message: %s ).",
+                      pUrl.GetHostId().c_str(), (void*)this,
+                      pRequest->GetObfuscatedDescription().c_str() );
 
           TaskManager *taskMgr = pPostMaster->GetTaskManager();
           taskMgr->RegisterTask( new WaitTask( this ), resendTime );
@@ -719,9 +829,8 @@ namespace XrdCl
         {
           log->Debug( XRootDMsg, "[%s] Wait time is too long, timing out %s",
                       pUrl.GetHostId().c_str(),
-                      pRequest->GetDescription().c_str() );
-          pStatus   = Status( stError, errOperationExpired );
-          HandleResponse();
+                      pRequest->GetObfuscatedDescription().c_str() );
+          HandleError( Status( stError, errOperationExpired) );
         }
         return;
       }
@@ -734,9 +843,6 @@ namespace XrdCl
       //------------------------------------------------------------------------
       case kXR_waitresp:
       {
-        XRDCL_SMART_PTR_T<Message> msgPtr( pResponse );
-        pResponse = 0;
-
         if( rsp->hdr.dlen < 4 )
         {
           log->Error( XRootDMsg, "[%s] Got invalid waitresp response.",
@@ -749,7 +855,7 @@ namespace XrdCl
         log->Dump( XRootDMsg, "[%s] Got kXR_waitresp response of %d seconds to "
                    "message %s", pUrl.GetHostId().c_str(),
                    rsp->body.waitresp.seconds,
-                   pRequest->GetDescription().c_str() );
+                   pRequest->GetObfuscatedDescription().c_str() );
         return;
       }
 
@@ -758,11 +864,9 @@ namespace XrdCl
       //------------------------------------------------------------------------
       default:
       {
-        XRDCL_SMART_PTR_T<Message> msgPtr( pResponse );
-        pResponse = 0;
         log->Dump( XRootDMsg, "[%s] Got unrecognized response %d to "
                    "message %s", pUrl.GetHostId().c_str(),
-                   rsp->hdr.status, pRequest->GetDescription().c_str() );
+                   rsp->hdr.status, pRequest->GetObfuscatedDescription().c_str() );
         pStatus   = Status( stError, errInvalidResponse );
         HandleResponse();
         return;
@@ -775,344 +879,80 @@ namespace XrdCl
   //----------------------------------------------------------------------------
   // Handle an event other that a message arrival - may be timeout
   //----------------------------------------------------------------------------
-  uint8_t XRootDMsgHandler::OnStreamEvent( StreamEvent event,
-                                           uint16_t    streamNum,
-                                           Status      status )
+  uint8_t XRootDMsgHandler::OnStreamEvent( StreamEvent   event,
+                                           XRootDStatus  status )
   {
     Log *log = DefaultEnv::GetLog();
     log->Dump( XRootDMsg, "[%s] Stream event reported for msg %s",
-               pUrl.GetHostId().c_str(), pRequest->GetDescription().c_str() );
+               pUrl.GetHostId().c_str(), pRequest->GetObfuscatedDescription().c_str() );
 
     if( event == Ready )
       return 0;
 
-    if( streamNum != 0 )
+    if( pTimeoutFence.load( std::memory_order_relaxed ) )
       return 0;
 
-    HandleError( status, 0 );
+    HandleError( status );
     return RemoveHandler;
   }
 
   //----------------------------------------------------------------------------
   // Read message body directly from a socket
   //----------------------------------------------------------------------------
-  Status XRootDMsgHandler::ReadMessageBody( Message  *msg,
-                                            int       socket,
-                                            uint32_t &bytesRead )
+  XRootDStatus XRootDMsgHandler::ReadMessageBody( Message*,
+                                                  Socket   *socket,
+                                                  uint32_t &bytesRead )
   {
     ClientRequest *req = (ClientRequest *)pRequest->GetBuffer();
     uint16_t reqId = ntohs( req->header.requestid );
-    if( reqId == kXR_read )
-      return ReadRawRead( msg, socket, bytesRead );
 
-    if( reqId == kXR_readv )
-      return ReadRawReadV( msg, socket, bytesRead );
+    if( reqId == kXR_pgread )
+      return pPageReader->Read( *socket, bytesRead );
 
-    return ReadRawOther( msg, socket, bytesRead );
-  }
-
-  //----------------------------------------------------------------------------
-  // Handle a kXR_read in raw mode
-  //----------------------------------------------------------------------------
-  Status XRootDMsgHandler::ReadRawRead( Message  *msg,
-                                        int       socket,
-                                        uint32_t &bytesRead )
-  {
-    Log *log = DefaultEnv::GetLog();
-
-    //--------------------------------------------------------------------------
-    // We need to check if we have and overflow, before we start reading
-    // anything
-    //--------------------------------------------------------------------------
-    if( !pReadRawStarted )
-    {
-      ChunkInfo chunk  = pChunkList->front();
-      pAsyncOffset     = 0;
-      pAsyncReadSize   = pAsyncMsgSize;
-      pAsyncReadBuffer = ((char*)chunk.buffer)+pReadRawCurrentOffset;
-      if( pReadRawCurrentOffset + pAsyncMsgSize > chunk.length )
-      {
-        log->Error( XRootDMsg, "[%s] Overflow data while reading response to %s"
-                    ": expected: %d, got %d bytes",
-                   pUrl.GetHostId().c_str(), pRequest->GetDescription().c_str(),
-                   chunk.length, pReadRawCurrentOffset + pAsyncMsgSize );
-
-        pChunkStatus.front().sizeError = true;
-        pOtherRawStarted               = false;
-      }
-      else
-        pReadRawCurrentOffset += pAsyncMsgSize;
-      pReadRawStarted = true;
-    }
-
-    //--------------------------------------------------------------------------
-    // If we have an overflow we discard all the incoming data. We do this
-    // instead of just quitting in order to keep the stream sane.
-    //--------------------------------------------------------------------------
-    if( pChunkStatus.front().sizeError )
-      return ReadRawOther( msg, socket, bytesRead );
-
-    //--------------------------------------------------------------------------
-    // Read the data
-    //--------------------------------------------------------------------------
-    return ReadAsync( socket, bytesRead );
- }
-
-  //----------------------------------------------------------------------------
-  // Handle a kXR_readv in raw mode
-  //----------------------------------------------------------------------------
-  Status XRootDMsgHandler::ReadRawReadV( Message  *msg,
-                                         int       socket,
-                                         uint32_t &bytesRead )
-  {
-    if( pReadVRawMsgOffset == pAsyncMsgSize )
-      return Status( stOK, suDone );
-
-    Log *log = DefaultEnv::GetLog();
-
-    //--------------------------------------------------------------------------
-    // We've had an error and we are in the discarding mode
-    //--------------------------------------------------------------------------
-    if( pReadVRawMsgDiscard )
-    {
-      Status st = ReadAsync( socket, bytesRead );
-
-      if( st.IsOK() && st.code == suDone )
-      {
-        pReadVRawMsgOffset          += pAsyncReadSize;
-        pReadVRawChunkHeaderDone    = false;
-        pReadVRawChunkHeaderStarted = false;
-        pReadVRawMsgDiscard         = false;
-        delete [] pAsyncReadBuffer;
-
-        if( pReadVRawMsgOffset != pAsyncMsgSize )
-          st.code = suRetry;
-
-        log->Dump( XRootDMsg, "[%s] ReadRawReadV: Discarded %d bytes, "
-                   "current offset: %d/%d", pUrl.GetHostId().c_str(),
-                   pAsyncReadSize, pReadVRawMsgOffset, pAsyncMsgSize );
-      }
-      return st;
-    }
-
-    //--------------------------------------------------------------------------
-    // Handle chunk header
-    //--------------------------------------------------------------------------
-    if( !pReadVRawChunkHeaderDone )
-    {
-      //------------------------------------------------------------------------
-      // Set up the header reading
-      //------------------------------------------------------------------------
-      if( !pReadVRawChunkHeaderStarted )
-      {
-        pReadVRawChunkHeaderStarted = true;
-
-        //----------------------------------------------------------------------
-        // We cannot afford to read the next header from the stream because
-        // we will cross the message boundary
-        //----------------------------------------------------------------------
-        if( pReadVRawMsgOffset + 16 > pAsyncMsgSize )
-        {
-          uint32_t discardSize = pAsyncMsgSize - pReadVRawMsgOffset;
-          log->Error( XRootDMsg, "[%s] ReadRawReadV: No enough data to read "
-                      "another chunk header. Discarding %d bytes.",
-                      pUrl.GetHostId().c_str(), discardSize );
-
-          pReadVRawMsgDiscard = true;
-          pAsyncOffset        = 0;
-          pAsyncReadSize      = discardSize;
-          pAsyncReadBuffer    = new char[discardSize];
-          return Status( stOK, suRetry );
-        }
-
-        //----------------------------------------------------------------------
-        // We set up reading of the next header
-        //----------------------------------------------------------------------
-        pAsyncOffset     = 0;
-        pAsyncReadSize   = 16;
-        pAsyncReadBuffer = (char*)&pReadVRawChunkHeader;
-      }
-
-      //------------------------------------------------------------------------
-      // Do the reading
-      //------------------------------------------------------------------------
-      Status st = ReadAsync( socket, bytesRead );
-
-      //------------------------------------------------------------------------
-      // Finalize the header and set everything up for the actual buffer
-      //------------------------------------------------------------------------
-      if( st.IsOK() && st.code == suDone )
-      {
-        pReadVRawChunkHeaderDone =  true;
-        pReadVRawMsgOffset       += 16;
-
-        pReadVRawChunkHeader.rlen   = ntohl( pReadVRawChunkHeader.rlen );
-        pReadVRawChunkHeader.offset = ntohll( pReadVRawChunkHeader.offset );
-
-        //----------------------------------------------------------------------
-        // Find the buffer corresponding to the chunk
-        //----------------------------------------------------------------------
-        bool chunkFound = false;
-        for( int i = pReadVRawChunkIndex; i < (int)pChunkList->size(); ++i )
-        {
-          if( (*pChunkList)[i].offset == (uint64_t)pReadVRawChunkHeader.offset &&
-              (*pChunkList)[i].length == (uint32_t)pReadVRawChunkHeader.rlen )
-          {
-            chunkFound = true;
-            pReadVRawChunkIndex = i;
-            break;
-          }
-        }
-
-        //----------------------------------------------------------------------
-        // If the chunk was no found we discard the chunk
-        //----------------------------------------------------------------------
-        if( !chunkFound )
-        {
-          log->Error( XRootDMsg, "[%s] ReadRawReadV: Impossible to find chunk "
-                      "buffer corresponding to %d bytes at %ld",
-                      pUrl.GetHostId().c_str(), pReadVRawChunkHeader.rlen,
-                      pReadVRawChunkHeader.offset );
-
-          uint32_t discardSize = pReadVRawChunkHeader.rlen;
-          if( pReadVRawMsgOffset + discardSize > pAsyncMsgSize )
-            discardSize = pAsyncMsgSize - pReadVRawMsgOffset;
-          pReadVRawMsgDiscard = true;
-          pAsyncOffset        = 0;
-          pAsyncReadSize      = discardSize;
-          pAsyncReadBuffer    = new char[discardSize];
-
-          log->Dump( XRootDMsg, "[%s] ReadRawReadV: Discarding %d bytes",
-                     pUrl.GetHostId().c_str(), discardSize );
-          return Status( stOK, suRetry );
-        }
-
-        //----------------------------------------------------------------------
-        // The chunk was found, but reading all the data will cross the message
-        // boundary
-        //----------------------------------------------------------------------
-        if( pReadVRawMsgOffset + pReadVRawChunkHeader.rlen > pAsyncMsgSize )
-        {
-          uint32_t discardSize = pAsyncMsgSize - pReadVRawMsgOffset;
-
-          log->Error( XRootDMsg, "[%s] ReadRawReadV: Malformed chunk header: "
-                      "reading %d bytes from message would cross the message "
-                      "boundary, discarding %d bytes.", pUrl.GetHostId().c_str(),
-                      pReadVRawChunkHeader.rlen, discardSize );
-
-          pReadVRawMsgDiscard = true;
-          pAsyncOffset        = 0;
-          pAsyncReadSize      = discardSize;
-          pAsyncReadBuffer    = new char[discardSize];
-          pChunkStatus[pReadVRawChunkIndex].sizeError = true;
-          return Status( stOK, suRetry );
-        }
-
-        //----------------------------------------------------------------------
-        // We're good
-        //----------------------------------------------------------------------
-        pAsyncOffset     = 0;
-        pAsyncReadSize   = pReadVRawChunkHeader.rlen;
-        pAsyncReadBuffer = (char*)(*pChunkList)[pReadVRawChunkIndex].buffer;
-      }
-
-      //------------------------------------------------------------------------
-      // We've seen a reading error
-      //------------------------------------------------------------------------
-      if( !st.IsOK() )
-        return st;
-
-      //------------------------------------------------------------------------
-      // If we are not done reading the header, return back to the event loop.
-      //------------------------------------------------------------------------
-      if( st.IsOK() && st.code != suDone )
-        return st;
-    }
-
-    //--------------------------------------------------------------------------
-    // Read the body
-    //--------------------------------------------------------------------------
-    Status st = ReadAsync( socket, bytesRead );
-
-    if( st.IsOK() && st.code == suDone )
-    {
-
-      pReadVRawMsgOffset          += pAsyncReadSize;
-      pReadVRawChunkHeaderDone    = false;
-      pReadVRawChunkHeaderStarted = false;
-      pChunkStatus[pReadVRawChunkIndex].done = true;
-
-      log->Dump( XRootDMsg, "[%s] ReadRawReadV: read buffer for chunk %d@%ld",
-                 pUrl.GetHostId().c_str(),
-                 pReadVRawChunkHeader.rlen, pReadVRawChunkHeader.offset,
-                 pReadVRawMsgOffset, pAsyncMsgSize );
-
-      if( pReadVRawMsgOffset < pAsyncMsgSize )
-        st.code = suRetry;
-    }
-    return st;
-  }
-
-  //----------------------------------------------------------------------------
-  // Handle anything other than kXR_read and kXR_readv in raw mode
-  //----------------------------------------------------------------------------
-  Status XRootDMsgHandler::ReadRawOther( Message  *msg,
-                                         int       socket,
-                                         uint32_t &bytesRead )
-  {
-    if( !pOtherRawStarted )
-    {
-      pAsyncOffset     = 0;
-      pAsyncReadSize   = pAsyncMsgSize;
-      pAsyncReadBuffer = new char[pAsyncMsgSize];
-      pOtherRawStarted = true;
-    }
-
-    Status st = ReadAsync( socket, bytesRead );
-
-    if( st.IsOK() && st.code == suRetry )
-      return st;
-
-    delete [] pAsyncReadBuffer;
-    pAsyncReadBuffer = 0;
-    pAsyncOffset     = pAsyncReadSize = 0;
-
-    return st;
-  }
-
-  //--------------------------------------------------------------------------
-  // Read a buffer asynchronously - depends on pAsyncBuffer, pAsyncSize
-  // and pAsyncOffset
-  //--------------------------------------------------------------------------
-  Status XRootDMsgHandler::ReadAsync( int socket, uint32_t &bytesRead )
-  {
-    char *buffer = pAsyncReadBuffer;
-    buffer += pAsyncOffset;
-    while( pAsyncOffset < pAsyncReadSize )
-    {
-      uint32_t toBeRead = pAsyncReadSize - pAsyncOffset;
-      int status = ::read( socket, buffer, toBeRead );
-      if( status < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) )
-        return Status( stOK, suRetry );
-
-      if( status <= 0 )
-        return Status( stError, errSocketError, errno );
-
-      pAsyncOffset     += status;
-      buffer           += status;
-      bytesRead        += status;
-    }
-    return Status( stOK, suDone );
+    return pBodyReader->Read( *socket, bytesRead );
   }
 
   //----------------------------------------------------------------------------
   // We're here when we requested sending something over the wire
-  // and there has been a status update on this action
+  // or other status update on this action.
+  // We can be called when message is still in out-queue, with an
+  // error status indicating message will not be sent.
   //----------------------------------------------------------------------------
   void XRootDMsgHandler::OnStatusReady( const Message *message,
-                                        Status         status )
+                                        XRootDStatus   status )
   {
     Log *log = DefaultEnv::GetLog();
+
+    const int sst = pSendingState.fetch_or( kSendDone );
+
+    // if we have already seen a response we can not be in the out-queue
+    // anymore, so we should be getting notified of a successful send.
+    // But if not, log and do our best to recover.
+    if( !status.IsOK() && ( ( sst & kFinalResp ) || ( sst & kSawResp ) ) )
+    {
+      log->Error( XRootDMsg, "[%s] Unexpected error for message %s. Trying to "
+                  "recover.", pUrl.GetHostId().c_str(),
+                  message->GetObfuscatedDescription().c_str() );
+      HandleError( status );
+      return;
+    }
+
+    if( sst & kFinalResp )
+    {
+      log->Dump( XRootDMsg, "[%s] Got late notification that outgoing message %s was "
+                 "sent, already have final response, queuing handler callback.",
+                 pUrl.GetHostId().c_str(), message->GetObfuscatedDescription().c_str() );
+      HandleRspOrQueue();
+      return;
+    }
+
+    if( sst & kSawResp )
+    {
+      log->Dump( XRootDMsg, "[%s] Got late notification that message %s has "
+                 "been successfully sent.",
+                 pUrl.GetHostId().c_str(), message->GetObfuscatedDescription().c_str() );
+      return;
+    }
 
     //--------------------------------------------------------------------------
     // We were successful, so we now need to listen for a response
@@ -1120,18 +960,10 @@ namespace XrdCl
     if( status.IsOK() )
     {
       log->Dump( XRootDMsg, "[%s] Message %s has been successfully sent.",
-                 pUrl.GetHostId().c_str(), message->GetDescription().c_str() );
+                 pUrl.GetHostId().c_str(), message->GetObfuscatedDescription().c_str() );
 
-      log->Debug( ExDbgMsg, "[%s] Moving MsgHandler: 0x%x (message: %s ) from out-queu to in-queue.",
-                  pUrl.GetHostId().c_str(), this,
-                  pRequest->GetDescription().c_str() );
-
-      Status st = pPostMaster->Receive( pUrl, this, pExpiration );
-      if( st.IsOK() )
-      {
-        pMsgInFly = true;
-        return;
-      }
+      pMsgInFly = true;
+      return;
     }
 
     //--------------------------------------------------------------------------
@@ -1139,8 +971,8 @@ namespace XrdCl
     //--------------------------------------------------------------------------
     log->Error( XRootDMsg, "[%s] Impossible to send message %s. Trying to "
                 "recover.", pUrl.GetHostId().c_str(),
-                message->GetDescription().c_str() );
-    HandleError( status, 0 );
+                message->GetObfuscatedDescription().c_str() );
+    HandleError( status );
   }
 
   //----------------------------------------------------------------------------
@@ -1150,23 +982,165 @@ namespace XrdCl
   {
     ClientRequest  *req = (ClientRequest *)pRequest->GetBuffer();
     uint16_t reqId = ntohs( req->header.requestid );
-    if( reqId == kXR_write || reqId == kXR_writev )
+    if( reqId == kXR_write || reqId == kXR_writev || reqId == kXR_pgwrite )
       return true;
+    // checkpoint + execute
+    if( reqId == kXR_chkpoint && req->chkpoint.opcode == kXR_ckpXeq )
+    {
+      ClientRequest *xeq = (ClientRequest*)pRequest->GetBuffer( sizeof( ClientRequest ) );
+      reqId = ntohs( xeq->header.requestid );
+      return reqId != kXR_truncate; // only checkpointed truncate does not have raw data
+    }
+
     return false;
   }
 
   //----------------------------------------------------------------------------
   // Write the message body
   //----------------------------------------------------------------------------
-  Status XRootDMsgHandler::WriteMessageBody( int       socket,
-                                             uint32_t &bytesRead )
+  XRootDStatus XRootDMsgHandler::WriteMessageBody( Socket   *socket,
+                                                   uint32_t &bytesWritten )
   {
-    (void)socket;
-    (void)bytesRead;
     //--------------------------------------------------------------------------
-    // We no longer support this type of body writing in XRootDMsgHandler
+    // First check if it is a PgWrite
     //--------------------------------------------------------------------------
-    return Status( stError, errNotSupported );
+    if( !pChunkList->empty() && !pCrc32cDigests.empty() )
+    {
+      //------------------------------------------------------------------------
+      // PgWrite will have just one chunk
+      //------------------------------------------------------------------------
+      ChunkInfo chunk = pChunkList->front();
+      //------------------------------------------------------------------------
+      // Calculate the size of the first and last page (in case the chunk is not
+      // 4KB aligned)
+      //------------------------------------------------------------------------
+      int fLen = 0, lLen = 0;
+      size_t nbpgs = XrdOucPgrwUtils::csNum( chunk.offset, chunk.length, fLen, lLen );
+
+      //------------------------------------------------------------------------
+      // Set the crc32c buffer if not ready yet
+      //------------------------------------------------------------------------
+      if( pPgWrtCksumBuff.GetCursor() == 0 )
+      {
+        uint32_t digest = htonl( pCrc32cDigests[pPgWrtCurrentPageNb] );
+        memcpy( pPgWrtCksumBuff.GetBuffer(), &digest, sizeof( uint32_t ) );
+      }
+
+      uint32_t btsLeft = chunk.length - pAsyncOffset;
+      uint32_t pglen   = ( pPgWrtCurrentPageNb == 0 ? fLen : XrdSys::PageSize ) - pPgWrtCurrentPageOffset;
+      if( pglen > btsLeft ) pglen = btsLeft;
+      char*    pgbuf   = static_cast<char*>( chunk.buffer ) + pAsyncOffset;
+
+      while( btsLeft > 0 )
+      {
+        // first write the crc32c digest
+        while( pPgWrtCksumBuff.GetCursor() < sizeof( uint32_t ) )
+        {
+          uint32_t dgstlen = sizeof( uint32_t ) - pPgWrtCksumBuff.GetCursor();
+          char*    dgstbuf = pPgWrtCksumBuff.GetBufferAtCursor();
+          int btswrt = 0;
+          Status st = socket->Send( dgstbuf, dgstlen, btswrt );
+          if( !st.IsOK() ) return st;
+          bytesWritten += btswrt;
+          pPgWrtCksumBuff.AdvanceCursor( btswrt );
+          if( st.code == suRetry ) return st;
+        }
+        // then write the raw data (one page)
+        int btswrt = 0;
+        Status st = socket->Send( pgbuf, pglen, btswrt );
+        if( !st.IsOK() ) return st;
+        pgbuf        += btswrt;
+        pglen        -= btswrt;
+        btsLeft      -= btswrt;
+        bytesWritten += btswrt;
+        pAsyncOffset += btswrt; // update the offset to the raw data
+        if( st.code == suRetry ) return st;
+        // if we managed to write all the data ...
+        if( pglen == 0 )
+        {
+          // move to the next page
+          ++pPgWrtCurrentPageNb;
+          if( pPgWrtCurrentPageNb < nbpgs )
+          {
+            // set the digest buffer
+            pPgWrtCksumBuff.SetCursor( 0 );
+            uint32_t digest = htonl( pCrc32cDigests[pPgWrtCurrentPageNb] );
+            memcpy( pPgWrtCksumBuff.GetBuffer(), &digest, sizeof( uint32_t ) );
+          }
+          // set the page length
+          pglen = XrdSys::PageSize;
+          if( pglen > btsLeft ) pglen = btsLeft;
+          // reset offset in the current page
+          pPgWrtCurrentPageOffset = 0;
+        }
+        else
+          // otherwise just adjust the offset in the current page
+          pPgWrtCurrentPageOffset += btswrt;
+
+      }
+    }
+    else if( !pChunkList->empty() )
+    {
+      size_t size = pChunkList->size();
+      for( size_t i = pAsyncChunkIndex ; i < size; ++i )
+      {
+        char     *buffer          = (char*)(*pChunkList)[i].buffer;
+        uint32_t  size            = (*pChunkList)[i].length;
+        size_t    leftToBeWritten = size - pAsyncOffset;
+
+        while( leftToBeWritten )
+        {
+          int btswrt = 0;
+          Status st = socket->Send( buffer + pAsyncOffset, leftToBeWritten, btswrt );
+          bytesWritten += btswrt;
+          if( !st.IsOK() || st.code == suRetry ) return st;
+          pAsyncOffset    += btswrt;
+          leftToBeWritten -= btswrt;
+        }
+        //----------------------------------------------------------------------
+        // Remember that we have moved to the next chunk, also clear the offset
+        // within the buffer as we are going to move to a new one
+        //----------------------------------------------------------------------
+        ++pAsyncChunkIndex;
+        pAsyncOffset = 0;
+      }
+    }
+    else
+    {
+      Log *log = DefaultEnv::GetLog();
+
+      //------------------------------------------------------------------------
+      // If the socket is encrypted we cannot use a kernel buffer, we have to
+      // convert to user space buffer
+      //------------------------------------------------------------------------
+      if( socket->IsEncrypted() )
+      {
+        log->Debug( XRootDMsg, "[%s] Channel is encrypted: cannot use kernel buffer.",
+                    pUrl.GetHostId().c_str() );
+
+        char *ubuff = 0;
+        ssize_t ret = XrdSys::Move( *pKBuff, ubuff );
+        if( ret < 0 ) return Status( stError, errInternal );
+        pChunkList->push_back( ChunkInfo( 0, ret, ubuff ) );
+        return WriteMessageBody( socket, bytesWritten );
+      }
+
+      //------------------------------------------------------------------------
+      // Send the data
+      //------------------------------------------------------------------------
+      while( !pKBuff->Empty() )
+      {
+        int btswrt = 0;
+        Status st = socket->Send( *pKBuff, btswrt );
+        bytesWritten += btswrt;
+        if( !st.IsOK() || st.code == suRetry ) return st;
+      }
+
+      log->Debug( XRootDMsg, "[%s] Request %s payload (kernel buffer) transferred to socket.",
+                  pUrl.GetHostId().c_str(), pRequest->GetObfuscatedDescription().c_str() );
+    }
+
+    return Status();
   }
 
   //----------------------------------------------------------------------------
@@ -1179,10 +1153,32 @@ namespace XrdCl
   }
 
   //----------------------------------------------------------------------------
+  // Bookkeeping after partial response has been received.
+  //----------------------------------------------------------------------------
+  void XRootDMsgHandler::PartialReceived()
+  {
+    pTimeoutFence.store( false, std::memory_order_relaxed ); // Take down the timeout fence
+  }
+
+  //----------------------------------------------------------------------------
   // Unpack the message and call the response handler
   //----------------------------------------------------------------------------
   void XRootDMsgHandler::HandleResponse()
   {
+    //--------------------------------------------------------------------------
+    // Is it a final response?
+    //--------------------------------------------------------------------------
+    bool finalrsp = !( pStatus.IsOK() && pStatus.code == suContinue );
+    if( finalrsp )
+    {
+      // Do not do final processing of the response if we haven't had
+      // confirmation the original request was sent (via OnStatusReady).
+      // The final processing will be triggered when we get the confirm.
+      const int sst = pSendingState.fetch_or( kFinalResp );
+      if( ( sst & kSawReadySend ) && !( sst & kSendDone ) )
+        return;
+    }
+
     //--------------------------------------------------------------------------
     // Process the response and notify the listener
     //--------------------------------------------------------------------------
@@ -1191,10 +1187,10 @@ namespace XrdCl
     AnyObject    *response = 0;
 
     Log *log = DefaultEnv::GetLog();
-    log->Debug( ExDbgMsg, "[%s] Calling MsgHandler: 0x%x (message: %s ) "
+    log->Debug( ExDbgMsg, "[%s] Calling MsgHandler: %p (message: %s ) "
                 "with status: %s.",
-                pUrl.GetHostId().c_str(), this,
-                pRequest->GetDescription().c_str(),
+                pUrl.GetHostId().c_str(), (void*)this,
+                pRequest->GetObfuscatedDescription().c_str(),
                 status->ToString().c_str() );
 
     if( status->IsOK() )
@@ -1219,26 +1215,19 @@ namespace XrdCl
     }
 
     //--------------------------------------------------------------------------
-    // Is it a final response?
-    //--------------------------------------------------------------------------
-    bool finalrsp = !( pStatus.IsOK() && pStatus.code == suContinue );
-
-    //--------------------------------------------------------------------------
     // Release the stream id
     //--------------------------------------------------------------------------
     if( pSidMgr && finalrsp )
     {
       ClientRequest *req = (ClientRequest *)pRequest->GetBuffer();
-      if( !status->IsOK() && pMsgInFly &&
-          ( status->code == errOperationExpired || status->code == errOperationInterrupted ) )
-        pSidMgr->TimeOutSID( req->header.streamid );
-      else
+      if( status->IsOK() || !pMsgInFly ||
+          !( status->code == errOperationExpired || status->code == errOperationInterrupted ) )
         pSidMgr->ReleaseSID( req->header.streamid );
     }
 
-    HostList *hosts = pHosts;
+    HostList *hosts = pHosts.release();
     if( !finalrsp )
-      pHosts = new HostList( *hosts );
+      pHosts.reset( new HostList( *hosts ) );
 
     pResponseHandler->HandleResponseWithHosts( status, response, hosts );
 
@@ -1254,8 +1243,8 @@ namespace XrdCl
     else
     {
       XrdSysCondVarHelper lck( pCV );
-      delete pResponse;
-      pResponse = 0;
+      pResponse.reset();
+      pTimeoutFence.store( false, std::memory_order_relaxed );
       pCV.Broadcast();
     }
   }
@@ -1276,11 +1265,12 @@ namespace XrdCl
       if( pStatus.code == errErrorResponse )
       {
         st->errNo = rsp->body.error.errnum;
-        char *errmsg = new char[rsp->hdr.dlen-3];
-        errmsg[rsp->hdr.dlen-4] = 0;
-        memcpy( errmsg, rsp->body.error.errmsg, rsp->hdr.dlen-4 );
+        // omit the last character as the string returned from the server
+        // (acording to protocol specs) should be null-terminated
+        std::string errmsg( rsp->body.error.errmsg, rsp->hdr.dlen-5 );
+        if( st->errNo == kXR_noReplicas && !pLastError.IsOK() )
+          errmsg += " Last seen error: " + pLastError.ToString();
         st->SetErrorMessage( errmsg );
-        delete [] errmsg;
       }
       else if( pStatus.code == errRedirect )
         st->SetErrorMessage( pRedirectUrl );
@@ -1309,13 +1299,6 @@ namespace XrdCl
       log->Error( XRootDMsg, "Internal Error: unable to process redirect" );
       return 0;
     }
-
-    //--------------------------------------------------------------------------
-    // We only handle the kXR_ok responses further down
-    //--------------------------------------------------------------------------
-    if( !( rsp->hdr.status == kXR_ok || ( pOksofarAsAnswer &&
-        rsp->hdr.status == kXR_oksofar ) ) )
-      return 0;
 
     Buffer    buff;
     uint32_t  length = 0;
@@ -1374,6 +1357,7 @@ namespace XrdCl
       case kXR_write:
       case kXR_writev:
       case kXR_sync:
+      case kXR_chkpoint:
         return Status();
 
       //------------------------------------------------------------------------
@@ -1389,7 +1373,7 @@ namespace XrdCl
 
         log->Dump( XRootDMsg, "[%s] Parsing the response to %s as "
                    "LocateInfo: %s", pUrl.GetHostId().c_str(),
-                   pRequest->GetDescription().c_str(), nullBuffer );
+                   pRequest->GetObfuscatedDescription().c_str(), nullBuffer );
         LocationInfo *data = new LocationInfo();
 
         if( data->ParseServerResponse( nullBuffer ) == false )
@@ -1426,7 +1410,7 @@ namespace XrdCl
 
           log->Dump( XRootDMsg, "[%s] Parsing the response to %s as "
                      "StatInfoVFS: %s", pUrl.GetHostId().c_str(),
-                     pRequest->GetDescription().c_str(), nullBuffer );
+                     pRequest->GetObfuscatedDescription().c_str(), nullBuffer );
 
           if( data->ParseServerResponse( nullBuffer ) == false )
           {
@@ -1452,7 +1436,7 @@ namespace XrdCl
 
           log->Dump( XRootDMsg, "[%s] Parsing the response to %s as StatInfo: "
                      "%s", pUrl.GetHostId().c_str(),
-                     pRequest->GetDescription().c_str(), nullBuffer );
+                     pRequest->GetObfuscatedDescription().c_str(), nullBuffer );
 
           if( data->ParseServerResponse( nullBuffer ) == false )
           {
@@ -1476,7 +1460,7 @@ namespace XrdCl
       {
         log->Dump( XRootDMsg, "[%s] Parsing the response to %s as ProtocolInfo",
                    pUrl.GetHostId().c_str(),
-                   pRequest->GetDescription().c_str() );
+                   pRequest->GetObfuscatedDescription().c_str() );
 
         if( rsp->hdr.dlen < 8 )
         {
@@ -1501,7 +1485,7 @@ namespace XrdCl
         AnyObject *obj = new AnyObject();
         log->Dump( XRootDMsg, "[%s] Parsing the response to %s as "
                    "DirectoryList", pUrl.GetHostId().c_str(),
-                   pRequest->GetDescription().c_str() );
+                   pRequest->GetObfuscatedDescription().c_str() );
 
         char *path = new char[req->dirlist.dlen+1];
         path[req->dirlist.dlen] = 0;
@@ -1548,7 +1532,7 @@ namespace XrdCl
       {
         log->Dump( XRootDMsg, "[%s] Parsing the response to %s as OpenInfo",
                    pUrl.GetHostId().c_str(),
-                   pRequest->GetDescription().c_str() );
+                   pRequest->GetObfuscatedDescription().c_str() );
 
         if( rsp->hdr.dlen < 4 )
         {
@@ -1567,7 +1551,7 @@ namespace XrdCl
         {
           log->Dump( XRootDMsg, "[%s] Parsing StatInfo in response to %s",
                      pUrl.GetHostId().c_str(),
-                     pRequest->GetDescription().c_str() );
+                     pRequest->GetObfuscatedDescription().c_str() );
 
           if( rsp->hdr.dlen >= 12 )
           {
@@ -1588,7 +1572,7 @@ namespace XrdCl
           {
             log->Error( XRootDMsg, "[%s] Unable to parse StatInfo in response "
                         "to %s", pUrl.GetHostId().c_str(),
-                        pRequest->GetDescription().c_str() );
+                        pRequest->GetObfuscatedDescription().c_str() );
             delete obj;
             return Status( stError, errInvalidResponse );
           }
@@ -1609,7 +1593,37 @@ namespace XrdCl
       {
         log->Dump( XRootDMsg, "[%s] Parsing the response to %s as ChunkInfo",
                    pUrl.GetHostId().c_str(),
-                   pRequest->GetDescription().c_str() );
+                   pRequest->GetObfuscatedDescription().c_str() );
+
+        for( uint32_t i = 0; i < pPartialResps.size(); ++i )
+        {
+          //--------------------------------------------------------------------
+          // we are expecting to have only the header in the message, the raw
+          // data have been readout into the user buffer
+          //--------------------------------------------------------------------
+          if( pPartialResps[i]->GetSize() > 8 )
+            return Status( stOK, errInternal );
+        }
+        //----------------------------------------------------------------------
+        // we are expecting to have only the header in the message, the raw
+        // data have been readout into the user buffer
+        //----------------------------------------------------------------------
+        if( pResponse->GetSize() > 8 )
+          return Status( stOK, errInternal );
+        //----------------------------------------------------------------------
+        // Get the response for the end user
+        //----------------------------------------------------------------------
+        return pBodyReader->GetResponse( response );
+      }
+
+      //------------------------------------------------------------------------
+      // kXR_pgread
+      //------------------------------------------------------------------------
+      case kXR_pgread:
+      {
+        log->Dump( XRootDMsg, "[%s] Parsing the response to %s as PageInfo",
+                   pUrl.GetHostId().c_str(),
+                   pRequest->GetObfuscatedDescription().c_str() );
 
         //----------------------------------------------------------------------
         // Glue in the cached responses if necessary
@@ -1617,29 +1631,30 @@ namespace XrdCl
         ChunkInfo  chunk         = pChunkList->front();
         bool       sizeMismatch  = false;
         uint32_t   currentOffset = 0;
-        char      *cursor        = (char*)chunk.buffer;
         for( uint32_t i = 0; i < pPartialResps.size(); ++i )
         {
-          ServerResponse *part = (ServerResponse*)pPartialResps[i]->GetBuffer();
+          ServerResponseV2 *part  = (ServerResponseV2*)pPartialResps[i]->GetBuffer();
 
-          if( currentOffset + part->hdr.dlen > chunk.length )
+          //--------------------------------------------------------------------
+          // the actual size of the raw data without the crc32c checksums
+          //--------------------------------------------------------------------
+          size_t datalen = part->status.bdy.dlen - NbPgPerRsp( part->info.pgread.offset,
+                           part->status.bdy.dlen ) * CksumSize;
+
+          if( currentOffset + datalen > chunk.length )
           {
             sizeMismatch = true;
             break;
           }
 
-          if( pPartialResps[i]->GetSize() > 8 )
-            memcpy( cursor, part->body.buffer.data, part->hdr.dlen );
-          currentOffset += part->hdr.dlen;
-          cursor        += part->hdr.dlen;
+          currentOffset += datalen;
         }
 
-        if( currentOffset + rsp->hdr.dlen <= chunk.length )
-        {
-          if( pResponse->GetSize() > 8 )
-            memcpy( cursor, rsp->body.buffer.data, rsp->hdr.dlen );
-          currentOffset += rsp->hdr.dlen;
-        }
+        ServerResponseV2 *rspst = (ServerResponseV2*)pResponse->GetBuffer();
+        size_t datalen = rspst->status.bdy.dlen - NbPgPerRsp( rspst->info.pgread.offset,
+                         rspst->status.bdy.dlen ) * CksumSize;
+        if( currentOffset + datalen <= chunk.length )
+          currentOffset += datalen;
         else
           sizeMismatch = true;
 
@@ -1651,39 +1666,92 @@ namespace XrdCl
           log->Error( XRootDMsg, "[%s] Handling response to %s: user supplied "
                       "buffer is too small for the received data.",
                       pUrl.GetHostId().c_str(),
-                      pRequest->GetDescription().c_str() );
+                      pRequest->GetObfuscatedDescription().c_str() );
           return Status( stError, errInvalidResponse );
         }
 
-        AnyObject *obj      = new AnyObject();
-        ChunkInfo *retChunk = new ChunkInfo( chunk.offset, currentOffset,
-                                             chunk.buffer );
-        obj->Set( retChunk );
+        AnyObject *obj   = new AnyObject();
+        PageInfo *pgInfo = new PageInfo( chunk.offset, currentOffset, chunk.buffer,
+                                         std::move( pCrc32cDigests) );
+
+        obj->Set( pgInfo );
         response = obj;
         return Status();
       }
+
+      //------------------------------------------------------------------------
+      // kXR_pgwrite
+      //------------------------------------------------------------------------
+      case kXR_pgwrite:
+      {
+        std::vector<std::tuple<uint64_t, uint32_t>> retries;
+
+        ServerResponseV2 *rsp = (ServerResponseV2*)pResponse->GetBuffer();
+        if( rsp->status.bdy.dlen > 0 )
+        {
+          ServerResponseBody_pgWrCSE *cse = (ServerResponseBody_pgWrCSE*)pResponse->GetBuffer( sizeof( ServerResponseV2 ) );
+          size_t pgcnt = ( rsp->status.bdy.dlen - 8 ) / sizeof( kXR_int64 );
+          retries.reserve( pgcnt );
+          kXR_int64 *pgoffs = (kXR_int64*)pResponse->GetBuffer( sizeof( ServerResponseV2 ) +
+                                                                sizeof( ServerResponseBody_pgWrCSE ) );
+
+          for( size_t i = 0; i < pgcnt; ++i )
+          {
+            uint32_t len = XrdSys::PageSize;
+            if( i == 0 ) len = cse->dlFirst;
+            else if( i == pgcnt - 1 ) len = cse->dlLast;
+            retries.push_back( std::make_tuple( pgoffs[i], len ) );
+          }
+        }
+
+        RetryInfo *info = new RetryInfo( std::move( retries ) );
+        AnyObject *obj   = new AnyObject();
+        obj->Set( info );
+        response = obj;
+
+        return Status();
+      }
+
 
       //------------------------------------------------------------------------
       // kXR_readv - we need to pass the length of the buffer to the user code
       //------------------------------------------------------------------------
       case kXR_readv:
       {
-        log->Dump( XRootDMsg, "[%s] Parsing the response to 0x%x as "
+        log->Dump( XRootDMsg, "[%s] Parsing the response to %s as "
                    "VectorReadInfo", pUrl.GetHostId().c_str(),
-                   pRequest->GetDescription().c_str() );
+                   pRequest->GetObfuscatedDescription().c_str() );
 
-        VectorReadInfo *info = new VectorReadInfo();
-        Status st = PostProcessReadV( info );
-        if( !st.IsOK() )
+        for( uint32_t i = 0; i < pPartialResps.size(); ++i )
         {
-          delete info;
-          return st;
+          //--------------------------------------------------------------------
+          // we are expecting to have only the header in the message, the raw
+          // data have been readout into the user buffer
+          //--------------------------------------------------------------------
+          if( pPartialResps[i]->GetSize() > 8 )
+            return Status( stOK, errInternal );
         }
+        //----------------------------------------------------------------------
+        // we are expecting to have only the header in the message, the raw
+        // data have been readout into the user buffer
+        //----------------------------------------------------------------------
+        if( pResponse->GetSize() > 8 )
+          return Status( stOK, errInternal );
+        //----------------------------------------------------------------------
+        // Get the response for the end user
+        //----------------------------------------------------------------------
+        return pBodyReader->GetResponse( response );
+      }
 
-        AnyObject *obj = new AnyObject();
-        obj->Set( info );
-        response = obj;
-        return Status();
+      //------------------------------------------------------------------------
+      // kXR_fattr
+      //------------------------------------------------------------------------
+      case kXR_fattr:
+      {
+        int   len  = rsp->hdr.dlen;
+        char* data = rsp->body.buffer.data;
+
+        return ParseXAttrResponse( data, len, response );
       }
 
       //------------------------------------------------------------------------
@@ -1697,7 +1765,7 @@ namespace XrdCl
         AnyObject *obj = new AnyObject();
         log->Dump( XRootDMsg, "[%s] Parsing the response to %s as BinaryData",
                    pUrl.GetHostId().c_str(),
-                   pRequest->GetDescription().c_str() );
+                   pRequest->GetObfuscatedDescription().c_str() );
 
         BinaryDataInfo *data = new BinaryDataInfo();
         data->Allocate( length );
@@ -1708,6 +1776,157 @@ namespace XrdCl
       }
     };
     return Status( stError, errInvalidMessage );
+  }
+
+  //------------------------------------------------------------------------
+  // Parse the response to kXR_fattr request and put it in an object that
+  // could be passed to the user
+  //------------------------------------------------------------------------
+  Status XRootDMsgHandler::ParseXAttrResponse( char *data, size_t len,
+                                               AnyObject *&response )
+  {
+    ClientRequest  *req = (ClientRequest *)pRequest->GetBuffer();
+//    Log            *log = DefaultEnv::GetLog(); //TODO
+
+    switch( req->fattr.subcode )
+    {
+      case kXR_fattrDel:
+      case kXR_fattrSet:
+      {
+        Status status;
+
+        kXR_char nerrs = 0;
+        if( !( status = ReadFromBuffer( data, len, nerrs ) ).IsOK() )
+          return status;
+
+        kXR_char nattr = 0;
+        if( !( status = ReadFromBuffer( data, len, nattr ) ).IsOK() )
+          return status;
+
+        std::vector<XAttrStatus> resp;
+        // read the namevec
+        for( kXR_char i = 0; i < nattr; ++i )
+        {
+          kXR_unt16 rc = 0;
+          if( !( status = ReadFromBuffer( data, len, rc ) ).IsOK() )
+            return status;
+          rc = ntohs( rc );
+
+          // count errors
+          if( rc ) --nerrs;
+
+          std::string name;
+          if( !( status = ReadFromBuffer( data, len, name ) ).IsOK() )
+            return status;
+
+          XRootDStatus st = rc ? XRootDStatus( stError, errErrorResponse, rc ) :
+                                 XRootDStatus();
+          resp.push_back( XAttrStatus( name, st ) );
+        }
+
+        // check if we read all the data and if the error count is OK
+        if( len != 0 || nerrs != 0 ) return Status( stError, errDataError );
+
+        // set up the response object
+        response = new AnyObject();
+        response->Set( new std::vector<XAttrStatus>( std::move( resp ) ) );
+
+        return Status();
+      }
+
+      case kXR_fattrGet:
+      {
+        Status status;
+
+        kXR_char nerrs = 0;
+        if( !( status = ReadFromBuffer( data, len, nerrs ) ).IsOK() )
+          return status;
+
+        kXR_char nattr = 0;
+        if( !( status = ReadFromBuffer( data, len, nattr ) ).IsOK() )
+          return status;
+
+        std::vector<XAttr> resp;
+        resp.reserve( nattr );
+
+        // read the name vec
+        for( kXR_char i = 0; i < nattr; ++i )
+        {
+          kXR_unt16 rc = 0;
+          if( !( status = ReadFromBuffer( data, len, rc ) ).IsOK() )
+            return status;
+          rc = ntohs( rc );
+
+          // count errors
+          if( rc ) --nerrs;
+
+          std::string name;
+          if( !( status = ReadFromBuffer( data, len, name ) ).IsOK() )
+            return status;
+
+          XRootDStatus st = rc ? XRootDStatus( stError, errErrorResponse, rc ) :
+                                 XRootDStatus();
+          resp.push_back( XAttr( name, st ) );
+        }
+
+        // read the value vec
+        for( kXR_char i = 0; i < nattr; ++i )
+        {
+          kXR_int32 vlen = 0;
+          if( !( status = ReadFromBuffer( data, len, vlen ) ).IsOK() )
+            return status;
+          vlen = ntohl( vlen );
+
+          std::string value;
+          if( !( status = ReadFromBuffer( data, len, vlen, value ) ).IsOK() )
+            return status;
+
+          resp[i].value.swap( value );
+        }
+
+        // check if we read all the data and if the error count is OK
+        if( len != 0 || nerrs != 0 ) return Status( stError, errDataError );
+
+        // set up the response object
+        response = new AnyObject();
+        response->Set( new std::vector<XAttr>( std::move( resp ) ) );
+
+        return Status();
+      }
+
+      case kXR_fattrList:
+      {
+        Status status;
+        std::vector<XAttr> resp;
+
+        while( len > 0 )
+        {
+          std::string name;
+          if( !( status = ReadFromBuffer( data, len, name ) ).IsOK() )
+            return status;
+
+          kXR_int32 vlen = 0;
+          if( !( status = ReadFromBuffer( data, len, vlen ) ).IsOK() )
+            return status;
+          vlen = ntohl( vlen );
+
+          std::string value;
+          if( !( status = ReadFromBuffer( data, len, vlen, value ) ).IsOK() )
+            return status;
+
+          resp.push_back( XAttr( name, value ) );
+        }
+
+        // set up the response object
+        response = new AnyObject();
+        response->Set( new std::vector<XAttr>( std::move( resp ) ) );
+
+        return Status();
+      }
+
+      default:
+        return Status( stError, errDataError );
+    }
   }
 
   //----------------------------------------------------------------------------
@@ -1745,11 +1964,14 @@ namespace XrdCl
       (surl.find('?') == std::string::npos) ? (surl += '?') :
           ((*surl.rbegin() != '&') ? (surl += '&') : (surl += ""));
       surl += xrdCgi;
-
       if (!authUrl.FromString(surl))
       {
-        log->Error( XRootDMsg, "[%s] Failed to build redirection URL from data:"
-		    "%s", surl.c_str());
+        std::string surlLog = surl;
+        if( unlikely( log->GetLevel() >= Log::ErrorMsg ) ) {
+          surlLog = obfuscateAuth(surlLog);
+        }
+        log->Error( XRootDMsg, "[%s] Failed to build redirection URL from data: %s",
+                    newUrl.GetHostId().c_str(), surl.c_str());
         return Status(stError, errInvalidRedirectURL);
       }
     }
@@ -1799,127 +2021,9 @@ namespace XrdCl
   }
 
   //----------------------------------------------------------------------------
-  // Post process vector read
-  //----------------------------------------------------------------------------
-  Status XRootDMsgHandler::PostProcessReadV( VectorReadInfo *vReadInfo )
-  {
-    //--------------------------------------------------------------------------
-    // Unpack the stuff that needs to be unpacked
-    //--------------------------------------------------------------------------
-    for( uint32_t i = 0; i < pPartialResps.size(); ++i )
-      if( pPartialResps[i]->GetSize() != 8 )
-        UnPackReadVResponse( pPartialResps[i] );
-
-    if( pResponse->GetSize() != 8 )
-      UnPackReadVResponse( pResponse );
-
-    //--------------------------------------------------------------------------
-    // See if all the chunks are OK and put them in the response
-    //--------------------------------------------------------------------------
-    uint32_t size = 0;
-    for( uint32_t i = 0; i < pChunkList->size(); ++i )
-    {
-      if( !pChunkStatus[i].done )
-        return Status( stFatal, errInvalidResponse );
-
-      vReadInfo->GetChunks().push_back(
-                      ChunkInfo( (*pChunkList)[i].offset,
-                                 (*pChunkList)[i].length,
-                                 (*pChunkList)[i].buffer ) );
-      size += (*pChunkList)[i].length;
-    }
-    vReadInfo->SetSize( size );
-    return Status();
-  }
-
-  //----------------------------------------------------------------------------
-  //! Unpack a single readv response
-  //----------------------------------------------------------------------------
-  Status XRootDMsgHandler::UnPackReadVResponse( Message *msg )
-  {
-    Log *log = DefaultEnv::GetLog();
-    log->Dump( XRootDMsg, "[%s] Handling response to %s: unpacking "
-               "data from a cached message", pUrl.GetHostId().c_str(),
-               pRequest->GetDescription().c_str() );
-
-    uint32_t  offset       = 0;
-    uint32_t  len          = msg->GetSize()-8;
-    uint32_t  currentChunk = 0;
-    char     *cursor       = msg->GetBuffer(8);
-
-    while( 1 )
-    {
-      //------------------------------------------------------------------------
-      // Check whether we should stop
-      //------------------------------------------------------------------------
-      if( offset+16 > len )
-        break;
-
-      //------------------------------------------------------------------------
-      // Extract and check the validity of the chunk
-      //------------------------------------------------------------------------
-      readahead_list *chunk = (readahead_list*)(cursor);
-      chunk->rlen   = ntohl( chunk->rlen );
-      chunk->offset = ntohll( chunk->offset );
-
-      bool chunkFound = false;
-      for( uint32_t i = currentChunk; i < pChunkList->size(); ++i )
-      {
-        if( (*pChunkList)[i].offset == (uint64_t)chunk->offset &&
-            (*pChunkList)[i].length == (uint32_t)chunk->rlen )
-        {
-          chunkFound   = true;
-          currentChunk = i;
-          break;
-        }
-      }
-
-      if( !chunkFound )
-      {
-        log->Error( XRootDMsg, "[%s] Handling response to %s: the response "
-                    "no corresponding chunk buffer found to store %d bytes "
-                    "at %ld", pUrl.GetHostId().c_str(),
-                    pRequest->GetDescription().c_str(), chunk->rlen,
-                    chunk->offset );
-        return Status( stFatal, errInvalidResponse );
-      }
-
-      //------------------------------------------------------------------------
-      // Extract the data
-      //------------------------------------------------------------------------
-      if( !(*pChunkList)[currentChunk].buffer )
-      {
-        log->Error( XRootDMsg, "[%s] Handling response to %s: the user "
-                    "supplied buffer is 0, discarding the data",
-                    pUrl.GetHostId().c_str(),
-                    pRequest->GetDescription().c_str() );
-      }
-      else
-      {
-        if( offset+chunk->rlen+16 > len )
-        {
-          log->Error( XRootDMsg, "[%s] Handling response to %s: copying "
-                      "requested data would cross message boundary",
-                      pUrl.GetHostId().c_str(),
-                      pRequest->GetDescription().c_str() );
-          return Status( stFatal, errInvalidResponse );
-        }
-        memcpy( (*pChunkList)[currentChunk].buffer, cursor+16, chunk->rlen );
-      }
-
-      pChunkStatus[currentChunk].done = true;
-
-      offset += (16 + chunk->rlen);
-      cursor += (16 + chunk->rlen);
-      ++currentChunk;
-    }
-    return Status();
-  }
-
-  //----------------------------------------------------------------------------
   // Recover error
   //----------------------------------------------------------------------------
-  void XRootDMsgHandler::HandleError( Status status, Message *msg )
+  void XRootDMsgHandler::HandleError( XRootDStatus status )
   {
     //--------------------------------------------------------------------------
     // If there was no error then do nothing
@@ -1927,12 +2031,39 @@ namespace XrdCl
     if( status.IsOK() )
       return;
 
-    pLastError = status;
+    if( pSidMgr && pMsgInFly && ( 
+        status.code == errOperationExpired ||
+        status.code == errOperationInterrupted ) )
+    {
+      ClientRequest *req = (ClientRequest *)pRequest->GetBuffer();
+      pSidMgr->TimeOutSID( req->header.streamid );
+    }
+
+    bool noreplicas = ( status.code == errErrorResponse &&
+                        status.errNo == kXR_noReplicas );
+
+    if( !noreplicas ) pLastError = status;
 
     Log *log = DefaultEnv::GetLog();
     log->Debug( XRootDMsg, "[%s] Handling error while processing %s: %s.",
-                pUrl.GetHostId().c_str(), pRequest->GetDescription().c_str(),
+                pUrl.GetHostId().c_str(), pRequest->GetObfuscatedDescription().c_str(),
                 status.ToString().c_str() );
+
+    //--------------------------------------------------------------------------
+    // Check if it is a fatal TLS error that has been marked as potentially
+    // recoverable, if yes check if we can downgrade from fatal to error.
+    //--------------------------------------------------------------------------
+    if( status.IsFatal() && status.code == errTlsError && status.errNo == EAGAIN )
+    {
+      if( pSslErrCnt < MaxSslErrRetry )
+      {
+        status.status &= ~stFatal; // switch off fatal&error bits
+        status.status |= stError;  // switch on error bit
+      }
+      ++pSslErrCnt; // count number of consecutive SSL errors
+    }
+    else
+      pSslErrCnt = 0;
 
     //--------------------------------------------------------------------------
     // We have got an error message, we can recover it at the load balancer if:
@@ -1949,8 +2080,6 @@ namespace XrdCl
         UpdateTriedCGI(status.errNo);
         if( status.errNo == kXR_NotFound || status.errNo == kXR_Overloaded )
           SwitchOnRefreshFlag();
-        delete pResponse;
-        pResponse = 0;
         HandleError( RetryAtServer( pLoadBalancer.url, RedirectEntry::EntryRetry ) );
         return;
       }
@@ -1973,7 +2102,7 @@ namespace XrdCl
     {
       log->Error( XRootDMsg, "[%s] Unable to get the response to request %s",
                   pUrl.GetHostId().c_str(),
-                  pRequest->GetDescription().c_str() );
+                  pRequest->GetObfuscatedDescription().c_str() );
       pStatus = status;
       HandleRspOrQueue();
       return;
@@ -1987,18 +2116,19 @@ namespace XrdCl
     if( pLoadBalancer.url.IsValid() &&
         pLoadBalancer.url.GetLocation() != pUrl.GetLocation() )
     {
-      UpdateTriedCGI();
+      UpdateTriedCGI( kXR_ServerError );
       HandleError( RetryAtServer( pLoadBalancer.url, RedirectEntry::EntryRetry ) );
       return;
     }
     else
     {
-      if( !status.IsFatal() && IsRetriable( pRequest ) )
+      if( !status.IsFatal() && IsRetriable() )
       {
         log->Info( XRootDMsg, "[%s] Retrying request: %s.",
                    pUrl.GetHostId().c_str(),
-                   pRequest->GetDescription().c_str() );
+                   pRequest->GetObfuscatedDescription().c_str() );
 
+        UpdateTriedCGI( kXR_ServerError );
         HandleError( RetryAtServer( pUrl, RedirectEntry::EntryRetry ) );
         return;
       }
@@ -2013,13 +2143,18 @@ namespace XrdCl
   //----------------------------------------------------------------------------
   Status XRootDMsgHandler::RetryAtServer( const URL &url, RedirectEntry::Type entryType )
   {
+    // prepare to possibly be requeued in the out-queue for a different channel,
+    // so reset sendingstate.
+    pSendingState = 0;
+
+    pResponse.reset();
     Log *log = DefaultEnv::GetLog();
 
     //--------------------------------------------------------------------------
     // Set up a redirect entry
     //--------------------------------------------------------------------------
     if( pRdirEntry ) pRedirectTraceBack.push_back( std::move( pRdirEntry ) );
-    pRdirEntry.reset( new RedirectEntry( pUrl.GetHostId(), url.GetHostId(), entryType ) );
+    pRdirEntry.reset( new RedirectEntry( pUrl.GetLocation(), url.GetLocation(), entryType ) );
 
     if( pUrl.GetLocation() != url.GetLocation() )
     {
@@ -2036,7 +2171,7 @@ namespace XrdCl
       if( pSidMgr )
       {
         pSidMgr->ReleaseSID( req->streamid );
-        pSidMgr = 0;
+        pSidMgr.reset();
       }
 
       // then get the new SIDManager
@@ -2044,25 +2179,13 @@ namespace XrdCl
       // file and in this case there is no SID)
       if( !url.IsLocalFile() )
       {
-        AnyObject sidMgrObj;
-        Status st = pPostMaster->QueryTransport( url, XRootDQuery::SIDManager,
-                                                sidMgrObj );
+        pSidMgr = SIDMgrPool::Instance().GetSIDMgr( url );
+        Status st = pSidMgr->AllocateSID( req->streamid );
         if( !st.IsOK() )
         {
           log->Error( XRootDMsg, "[%s] Impossible to send message %s.",
           pUrl.GetHostId().c_str(),
-          pRequest->GetDescription().c_str() );
-          return st;
-        }
-        sidMgrObj.Get( pSidMgr );
-
-        // and finally allocate new stream id
-        st = pSidMgr->AllocateSID( req->streamid );
-        if( !st.IsOK() )
-        {
-          log->Error( XRootDMsg, "[%s] Impossible to send message %s.",
-          pUrl.GetHostId().c_str(),
-          pRequest->GetDescription().c_str() );
+          pRequest->GetObfuscatedDescription().c_str() );
           return st;
         }
       }
@@ -2072,9 +2195,9 @@ namespace XrdCl
 
     if( pUrl.IsMetalink() && pFollowMetalink )
     {
-      log->Debug( ExDbgMsg, "[%s] Metaling redirection for MsgHandler: 0x%x (message: %s ).",
-                  pUrl.GetHostId().c_str(), this,
-                  pRequest->GetDescription().c_str() );
+      log->Debug( ExDbgMsg, "[%s] Metaling redirection for MsgHandler: %p (message: %s ).",
+                  pUrl.GetHostId().c_str(), (void*)this,
+                  pRequest->GetObfuscatedDescription().c_str() );
 
       return pPostMaster->Redirect( pUrl, pRequest, this );
     }
@@ -2085,9 +2208,9 @@ namespace XrdCl
     }
     else
     {
-      log->Debug( ExDbgMsg, "[%s] Retry at server MsgHandler: 0x%x (message: %s ).",
-                  pUrl.GetHostId().c_str(), this,
-                  pRequest->GetDescription().c_str() );
+      log->Debug( ExDbgMsg, "[%s] Retry at server MsgHandler: %p (message: %s ).",
+                  pUrl.GetHostId().c_str(), (void*)this,
+                  pRequest->GetObfuscatedDescription().c_str() );
       return pPostMaster->Send( pUrl, pRequest, this, true, pExpiration );
     }
   }
@@ -2183,15 +2306,29 @@ namespace XrdCl
   //------------------------------------------------------------------------
   void XRootDMsgHandler::HandleRspOrQueue()
   {
+    //--------------------------------------------------------------------------
+    // Is it a final response?
+    //--------------------------------------------------------------------------
+    bool finalrsp = !( pStatus.IsOK() && pStatus.code == suContinue );
+    if( finalrsp )
+    {
+      // Do not do final processing of the response if we haven't had
+      // confirmation the original request was sent (via OnStatusReady).
+      // The final processing will be triggered when we get the confirm.
+      const int sst = pSendingState.fetch_or( kFinalResp );
+      if( ( sst & kSawReadySend ) && !( sst & kSendDone ) )
+        return;
+    }
+
     JobManager *jobMgr = pPostMaster->GetJobManager();
     if( jobMgr->IsWorker() )
       HandleResponse();
     else
     {
       Log *log = DefaultEnv::GetLog();
-      log->Debug( ExDbgMsg, "[%s] Passing to the thread-pool MsgHandler: 0x%x (message: %s ).",
-                  pUrl.GetHostId().c_str(), this,
-                  pRequest->GetDescription().c_str() );
+      log->Debug( ExDbgMsg, "[%s] Passing to the thread-pool MsgHandler: %p (message: %s ).",
+                  pUrl.GetHostId().c_str(), (void*)this,
+                  pRequest->GetObfuscatedDescription().c_str() );
       jobMgr->QueueJob( new HandleRspJob( this ), 0 );
     }
   }
@@ -2202,13 +2339,13 @@ namespace XrdCl
   void XRootDMsgHandler::HandleLocalRedirect( URL *url )
   {
     Log *log = DefaultEnv::GetLog();
-    log->Debug( ExDbgMsg, "[%s] Handling local redirect - MsgHandler: 0x%x (message: %s ).",
-                pUrl.GetHostId().c_str(), this,
-                pRequest->GetDescription().c_str() );
+    log->Debug( ExDbgMsg, "[%s] Handling local redirect - MsgHandler: %p (message: %s ).",
+                pUrl.GetHostId().c_str(), (void*)this,
+                pRequest->GetObfuscatedDescription().c_str() );
 
     if( !pLFileHandler )
     {
-      HandleError( XRootDStatus( stError, errNotSupported ) );
+      HandleError( XRootDStatus( stFatal, errNotSupported ) );
       return;
     }
 
@@ -2223,7 +2360,7 @@ namespace XrdCl
 
     pResponseHandler->HandleResponseWithHosts( new XRootDStatus(),
                                                resp,
-                                               pHosts );
+                                               pHosts.release() );
     delete this;
 
     return;
@@ -2232,7 +2369,7 @@ namespace XrdCl
   //------------------------------------------------------------------------
   // Check if it is OK to retry this request
   //------------------------------------------------------------------------
-  bool XRootDMsgHandler::IsRetriable( Message *request )
+  bool XRootDMsgHandler::IsRetriable()
   {
     std::string value;
     DefaultEnv::GetEnv()->GetString( "OpenRecovery", value );
@@ -2251,7 +2388,7 @@ namespace XrdCl
         log->Debug( XRootDMsg,
                     "[%s] Not allowed to retry open request (OpenRecovery disabled): %s.",
                     pUrl.GetHostId().c_str(),
-                    pRequest->GetDescription().c_str() );
+                    pRequest->GetObfuscatedDescription().c_str() );
         // disallow retry if it is a mutable open
         return false;
       }
@@ -2264,7 +2401,7 @@ namespace XrdCl
   // Check if for given request and Metalink redirector  it is OK to omit
   // the kXR_wait and proceed straight to the next entry in the Metalink file
   //------------------------------------------------------------------------
-  bool XRootDMsgHandler::OmitWait( Message *request, const URL &url )
+  bool XRootDMsgHandler::OmitWait( Message &request, const URL &url )
   {
     // we can omit kXR_wait only if we have a Metalink redirector
     if( !url.IsMetalink() )
@@ -2272,7 +2409,7 @@ namespace XrdCl
 
     // we can omit kXR_wait only for requests that can be redirected
     // (kXR_read is the only stateful request that can be redirected)
-    ClientRequest *req = reinterpret_cast<ClientRequest*>( request->GetBuffer() );
+    ClientRequest *req = reinterpret_cast<ClientRequest*>( request.GetBuffer() );
     if( pStateful && req->header.requestid != kXR_read )
       return false;
 
@@ -2332,6 +2469,14 @@ namespace XrdCl
       return ret;
     }
 
+    // check if the load-balancer is a virtual (metalink) redirector,
+    // if yes there are even more errors that can be recovered
+    if( !( pLoadBalancer.flags & kXR_attrVirtRdr ) ) return false;
+
+    // those errors are retriable for virtual (metalink) redirectors
+    if( status.errNo == kXR_noserver || status.errNo == kXR_ArgTooLong )
+      return true;
+
     // otherwise it is a non-retriable error
     return false;
   }
@@ -2370,9 +2515,61 @@ namespace XrdCl
 
     Log *log = DefaultEnv::GetLog();
     if( warn )
-      log->Warning( XRootDMsg, sstrm.str().c_str() );
+      log->Warning( XRootDMsg, "%s", sstrm.str().c_str() );
     else
-      log->Debug( XRootDMsg, sstrm.str().c_str() );
+      log->Debug( XRootDMsg, "%s", sstrm.str().c_str() );
+  }
+  
+  // Read data from buffer
+  //------------------------------------------------------------------------
+  template<typename T>
+  Status XRootDMsgHandler::ReadFromBuffer( char *&buffer, size_t &buflen, T& result )
+  {
+    if( sizeof( T ) > buflen ) return Status( stError, errDataError );
+
+    memcpy(&result, buffer, sizeof(T));
+
+    buffer += sizeof( T );
+    buflen -= sizeof( T );
+
+    return Status();
+  }
+
+  //------------------------------------------------------------------------
+  // Read a string from buffer
+  //------------------------------------------------------------------------
+  Status XRootDMsgHandler::ReadFromBuffer( char *&buffer, size_t &buflen, std::string &result )
+  {
+    Status status;
+    char c = 0;
+
+    while( true )
+    {
+      if( !( status = ReadFromBuffer( buffer, buflen, c ) ).IsOK() )
+        return status;
+
+      if( c == 0 ) break;
+      result += c;
+    }
+
+    return status;
+  }
+
+  //------------------------------------------------------------------------
+  // Read a string from buffer
+  //------------------------------------------------------------------------
+  Status XRootDMsgHandler::ReadFromBuffer( char *&buffer, size_t &buflen,
+                                           size_t size, std::string &result )
+  {
+    Status status;
+
+    if( size > buflen ) return Status( stError, errDataError );
+
+    result.append( buffer, size );
+    buffer += size;
+    buflen -= size;
+
+    return status;
   }
 
 }

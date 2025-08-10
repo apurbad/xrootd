@@ -21,8 +21,12 @@
 #include "XrdCl/XrdClConstants.hh"
 #include "XrdCl/XrdClURL.hh"
 #include "XrdCl/XrdClUtils.hh"
+#include "XrdOuc/XrdOucUtils.hh"
+#include "XrdOuc/XrdOucPrivateUtils.hh"
+#include "XrdCl/XrdClOptimizers.hh"
 
 #include <cstdlib>
+#include <cctype>
 #include <vector>
 #include <sstream>
 #include <algorithm>
@@ -42,6 +46,11 @@ namespace XrdCl
   //----------------------------------------------------------------------------
   URL::URL( const std::string &url ):
     pPort( 1094 )
+  {
+    FromString( url );
+  }
+
+  URL::URL( const char *url ) : pPort( 1094 )
   {
     FromString( url );
   }
@@ -150,6 +159,10 @@ namespace XrdCl
     //--------------------------------------------------------------------------
     // Dump the url
     //--------------------------------------------------------------------------
+    std::string urlLog = url;
+    if( unlikely(log->GetLevel() >= Log::DumpMsg)) {
+      urlLog = obfuscateAuth(urlLog);
+    }
     log->Dump( UtilityMsg,
                "URL: %s\n"
                "Protocol:  %s\n"
@@ -158,7 +171,7 @@ namespace XrdCl
                "Host Name: %s\n"
                "Port:      %d\n"
                "Path:      %s\n",
-               url.c_str(), pProtocol.c_str(), pUserName.c_str(),
+               urlLog.c_str(), pProtocol.c_str(), pUserName.c_str(),
                pPassword.c_str(), pHostName.c_str(), pPort, pPath.c_str() );
     return true;
   }
@@ -193,16 +206,12 @@ namespace XrdCl
       {
         pUserName = userPass.substr( 0, pos );
         pPassword = userPass.substr( pos+1 );
-        if( pPassword.empty() )
-          return false;
       }
       //------------------------------------------------------------------------
       // It's just the user name
       //------------------------------------------------------------------------
       else
         pUserName = userPass;
-      if( pUserName.empty() )
-        return false;
     }
 
     //--------------------------------------------------------------------------
@@ -226,13 +235,23 @@ namespace XrdCl
         // Check if we're IPv6 encoded IPv4
         //----------------------------------------------------------------------
         pos = pHostName.find( "." );
-        size_t pos2 = pHostName.find( "[::ffff" );
-        size_t pos3 = pHostName.find( "[::" );
-        if( pos != std::string::npos && pos3 != std::string::npos &&
-            pos2 == std::string::npos )
+        const size_t pos2 = pHostName.find( "[::" );
+        if( pos != std::string::npos && pos2 != std::string::npos )
         {
-          pHostName.erase( 0, 3 );
-          pHostName.erase( pHostName.length()-1, 1 );
+          std::string hl = pHostName;
+          std::transform(hl.begin(), hl.end(), hl.begin(),
+            [](unsigned char c){ return std::tolower(c); });
+          const size_t pos3 = hl.find( "[::ffff:" );
+          if ( pos3 != std::string::npos )
+          {
+            pHostName.erase( 0, 8 );
+            pHostName.erase( pHostName.length()-1, 1 );
+          }
+          else
+          {
+            pHostName.erase( 0, 3 );
+            pHostName.erase( pHostName.length()-1, 1 );
+          }
         }
       }
     }
@@ -259,8 +278,8 @@ namespace XrdCl
     if( !hostPort.empty() )
     {
       char *result;
-      pPort = ::strtol( hostPort.c_str(), &result, 0 );
-      if( *result != 0 )
+      pPort = ::strtol( hostPort.c_str(), &result, 10 );
+      if( *result != '\0' || pPort < 0 || pPort > 65535 )
         return false;
     }
 
@@ -282,9 +301,12 @@ namespace XrdCl
     else
       pPath = path;
 
-    std::string::iterator back = pPath.end() - 1;
-    if( pProtocol == "file" && *back == '/' )
-      pPath.erase( back );
+    if( !pPath.empty() )
+    {
+      std::string::iterator back = pPath.end() - 1;
+      if( pProtocol == "file" && *back == '/' )
+        pPath.erase( back );
+    }
 
     ComputeURL();
     return true;
@@ -340,6 +362,17 @@ namespace XrdCl
   }
 
   //------------------------------------------------------------------------
+  // Get the login token if present in the opaque info
+  //------------------------------------------------------------------------
+  std::string URL::GetLoginToken() const
+  {
+    auto itr = pParams.find( "xrd.logintoken" );
+    if( itr == pParams.end() )
+      return "";
+    return itr->second;
+  }
+
+  //------------------------------------------------------------------------
   //! Get the URL params as string
   //------------------------------------------------------------------------
   std::string URL::GetParamsAsString( bool filter ) const
@@ -358,7 +391,9 @@ namespace XrdCl
       if( it != pParams.begin() ) o << "&";
       o << it->first << "=" << it->second;
     }
-    return o.str();
+    std::string ret = o.str();
+    if( ret == "?" ) ret.clear();
+    return ret;
   }
 
   //------------------------------------------------------------------------
@@ -380,6 +415,13 @@ namespace XrdCl
     Utils::splitString( paramsVect, p, "&" );
     for( it = paramsVect.begin(); it != paramsVect.end(); ++it )
     {
+      if( it->empty() ) continue;
+      size_t qpos = it->find( '?' );
+      if( qpos != std::string::npos ) // we have login token
+      {
+        pParams["xrd.logintoken"] = it->substr( qpos + 1 );
+        it->erase( qpos );
+      }
       size_t pos = it->find( "=" );
       if( pos == std::string::npos )
         pParams[*it] = "";
@@ -434,10 +476,66 @@ namespace XrdCl
     return pProtocol == "file" && pHostName == "localhost";
   }
 
+  //------------------------------------------------------------------------
+  // Does the protocol indicate encryption
+  //------------------------------------------------------------------------
+  bool URL::IsSecure() const
+  {
+    return ( pProtocol == "roots" || pProtocol == "xroots" );
+  }
+
+  //------------------------------------------------------------------------
+  // Is the URL used in TPC context
+  //------------------------------------------------------------------------
+  bool URL::IsTPC() const
+  {
+    ParamsMap::const_iterator itr = pParams.find( "xrdcl.intent" );
+    if( itr != pParams.end() )
+      return itr->second == "tpc";
+    return false;
+  }
+
+  std::string URL::GetObfuscatedURL() const {
+    return obfuscateAuth(pURL);
+  }
+
   bool URL::PathEndsWith(const std::string & sufix) const
   {
     if (sufix.size() > pPath.size()) return false;
     return std::equal(sufix.rbegin(), sufix.rend(), pPath.rbegin() );
+  }
+
+  //------------------------------------------------------------------------
+  //Get the host part of the URL (user:password\@host:port) plus channel
+  //specific CGI (xrdcl.identity & xrd.gsiusrpxy)
+  //------------------------------------------------------------------------
+  std::string URL::GetChannelId() const
+  {
+    std::string ret = pProtocol + "://" + pHostId + "/";
+    bool hascgi = false;
+
+    std::string keys[] = { "xrdcl.intent",
+                           "xrd.gsiusrpxy",
+                           "xrd.gsiusrcrt",
+                           "xrd.gsiusrkey",
+                           "xrd.sss",
+                           "xrd.k5ccname" };
+    size_t size = sizeof( keys ) / sizeof( std::string );
+
+    for( size_t i = 0; i < size; ++i )
+    {
+      ParamsMap::const_iterator itr = pParams.find( keys[i] );
+      if( itr != pParams.end() )
+      {
+        ret += hascgi ? '&' : '?';
+        ret += itr->first;
+        ret += '=';
+        ret += itr->second;
+        hascgi = true;
+      }
+    }
+
+    return ret;
   }
 
   //----------------------------------------------------------------------------
@@ -465,8 +563,9 @@ namespace XrdCl
   //----------------------------------------------------------------------------
   void URL::ComputeURL()
   {
-    if( !IsValid() )
+    if( !IsValid() ) {
       pURL = "";
+    }
 
     std::ostringstream o;
     if( !pProtocol.empty() )

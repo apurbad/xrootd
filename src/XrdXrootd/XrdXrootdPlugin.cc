@@ -53,16 +53,16 @@ XrdProtocol *XrdgetProtocol(const char *pname, char *parms,
 
 // Put up the banner
 //
-   pi->eDest->Say("Copr.  2012 Stanford University, xrootd protocol "
+   pi->eDest->Say("Copr.  2012 Stanford University, xroot protocol "
                    kXR_PROTOCOLVSTRING, " version ", XrdVERSION);
-   pi->eDest->Say("++++++ xrootd protocol initialization started.");
+   pi->eDest->Say("++++++ xroot protocol initialization started.");
 
 // Return the protocol object to be used if static init succeeds
 //
    if (XrdXrootdProtocol::Configure(parms, pi))
       pp = (XrdProtocol *)new XrdXrootdProtocol();
       else txt = "failed.";
-    pi->eDest->Say("------ xrootd protocol initialization ", txt);
+    pi->eDest->Say("------ xroot protocol initialization ", txt);
    return pp;
 }
 }
@@ -74,7 +74,7 @@ XrdProtocol *XrdgetProtocol(const char *pname, char *parms,
 /******************************************************************************/
 
 // This function is called early on to determine the port we need to use. The
-// default is ostensibly 1094 but can be overidden; which we allow.
+// default is ostensibly 1094 but can be overridden; which we allow.
 //
 XrdVERSIONINFO(XrdgetProtocolPort,xrootd);
 

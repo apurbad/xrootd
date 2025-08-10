@@ -29,7 +29,7 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <stdarg.h>
+#include <cstdarg>
  
 //-----------------------------------------------------------------------------
 //! The XrdSsiLogger object is used to route messages to the default log file.
@@ -47,7 +47,7 @@ public:
 //! @param  pfx  !0 -> the text to prefix the message; the message is formed as
 //!                    <timestamp> pfx: txt1 [txt2] [txt3]\n
 //!         pfx  =0 -> add message to the log without a time stamp or prefix.
-//! @param  msg  the message to added to the log.
+//! @param  txt1,txt2,txt3  the message to be added to the log.
 //-----------------------------------------------------------------------------
 
 static void Msg(const char *pfx,    const char *txt1,
@@ -86,7 +86,7 @@ static void Msgv(const char *pfx, const char *fmt, va_list aP);
 //!
 //! @param  iovP pointer to an iovec that contains the message.
 //!              that a newline character is always appended to the message.
-//! @param  iobN the number of elements in the iovec.
+//! @param  iovN the number of elements in the iovec.
 //-----------------------------------------------------------------------------
 
 static void Msgv(struct iovec *iovP, int iovN);
@@ -118,14 +118,14 @@ enum mcbType {mcbAll=0, mcbClient, mcbServer};
 static bool SetMCB(MCB_t &mcbP, mcbType mcbt=mcbAll);
 
 //-----------------------------------------------------------------------------
-//! Define helper functions to allow ostream cerr output to appear in the log.
+//! Define helper functions to allow std::ostream std::cerr output to appear in the log.
 //! The following two functions are used with the macros below.
 //! The SSI_LOG macro preceedes the message with a time stamp; SSI_SAY does not.
-//! The endl ostream output item is automatically added to all output!
+//! The std::endl std::ostream output item is automatically added to all output!
 //-----------------------------------------------------------------------------
 
-#define SSI_LOG(x) {cerr <<XrdSSiLogger::TBeg()      <<x; XrdSsiLogger::TEnd();}
-#define SSI_SAY(x)        {XrdSSiLogger::TBeg();cerr <<x; XrdSsiLogger::TEnd();}
+#define SSI_LOG(x) {std::cerr <<XrdSSiLogger::TBeg()      <<x; XrdSsiLogger::TEnd();}
+#define SSI_SAY(x)        {XrdSSiLogger::TBeg();std::cerr <<x; XrdSsiLogger::TEnd();}
 
 static const char *TBeg();
 static void        TEnd();

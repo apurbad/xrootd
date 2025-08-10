@@ -28,11 +28,12 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <string.h>
+#include <string>
+#include <cstring>
 #include <strings.h>
 #include <sys/stat.h>
 #include <sys/types.h>
-#include <errno.h>
+#include <cerrno>
 
 #include "XrdVersion.hh"
 #include "XrdVersionPlugin.hh"
@@ -53,7 +54,7 @@
 /*                 M i s c e l l a n e o u s   D e f i n e s                  */
 /******************************************************************************/
 
-#define DEBUG(x) {if (DebugON) cerr <<"sec_PM: " <<x <<endl;}
+#define DEBUG(x) {if (DebugON) std::cerr <<"sec_PM: " <<x <<std::endl;}
   
 /******************************************************************************/
 /*                         L o c a l   C l a s s e s                          */
@@ -64,14 +65,16 @@ class XrdSecProtList
 public:
 
 XrdSecPMask_t    protnum;
+bool             needTLS;
 char             protid[XrdSecPROTOIDSIZE+1];
 char            *protargs;
 XrdSecProtocol  *(*ep)(PROTPARMS);
 XrdSecProtList  *Next;
 
-                XrdSecProtList(const char *pid, const char *parg)
+                XrdSecProtList(const char *pid, const char *parg, bool tls)
+                              : needTLS(tls), ep(0), Next(0)
                       {strncpy(protid, pid, sizeof(protid)-1);
-                       protid[XrdSecPROTOIDSIZE] = '\0'; ep = 0; Next = 0;
+                       protid[XrdSecPROTOIDSIZE] = '\0';
                        protargs = (parg ? strdup(parg): (char *)"");
                       }
                ~XrdSecProtList() {} // ProtList objects never get freed!
@@ -232,7 +235,7 @@ XrdSecProtocol *XrdSecPManager::Get(const char       *hname,
                      return pp;
                     }
                 }
-             if (erp->getErrInfo() != ENOENT) cerr <<erp->getErrText() <<endl;
+             if (erp->getErrInfo() != ENOENT) std::cerr <<erp->getErrText() <<std::endl;
             } else {DEBUG("Skipping " <<pname <<" only want " <<wantProt);}
          if (!nscan) break;
          *nscan = '&'; bp = nscan;
@@ -254,6 +257,7 @@ XrdSecProtList *XrdSecPManager::Add(XrdOucErrInfo  *eMsg, const char *pid,
                                     const char *parg)
 {
    XrdSecProtList *plp;
+   bool reqTLS = false;
 
 // Make sure we did not overflow the protocol stack
 //
@@ -262,9 +266,25 @@ XrdSecProtList *XrdSecPManager::Add(XrdOucErrInfo  *eMsg, const char *pid,
        return 0;
       }
 
+// Check if this protocol need TLS
+//
+   if (parg && !strncmp(parg, "TLS:",4))
+      {char pBuff[XrdSecPROTOIDSIZE+2];
+       *pBuff = ' ';
+       strcpy(pBuff+1, pid);  // We know it fits
+       if (!tlsProt) tlsProt = strdup(pBuff);
+          else {std::string tmp(tlsProt);
+                tmp.append(pBuff);
+                free(tlsProt);
+                tlsProt = strdup(tmp.c_str());
+               }
+        parg += 4; // Skip 'TLS:'
+        reqTLS = true;
+       }
+
 // Add this protocol to our protocol stack
 //
-   plp = new XrdSecProtList((char *)pid, parg);
+   plp = new XrdSecProtList((char *)pid, parg, reqTLS);
    plp->ep = ep;
    myMutex.Lock();
    if (Last) {Last->Next = plp; Last = plp;}

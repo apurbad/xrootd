@@ -31,7 +31,7 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#include <stdlib.h>
+#include <cstdlib>
 
 #include "XrdVersion.hh"
 #include "XrdOss/XrdOss.hh"
@@ -130,8 +130,7 @@ XrdOssStatInfo2_t XrdOssStatInfoInit2(XrdOss        *native_oss,
 
 // Process the configuration file so that we get the service provider object
 //
-   if (!Config.Configure(config_fn) || !Config.Configure(envP))
-      return 0;
+   if (!Config.Configure(config_fn, envP)) return 0;
 
 // Return the stat function
 //
@@ -144,3 +143,4 @@ XrdOssStatInfo2_t XrdOssStatInfoInit2(XrdOss        *native_oss,
 /******************************************************************************/
 
 XrdVERSIONINFO(XrdOssStatInfoInit,XrdSsiStat);
+XrdVERSIONINFO(XrdOssStatInfoInit2,XrdSsiStat2);

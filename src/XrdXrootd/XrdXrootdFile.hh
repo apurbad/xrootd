@@ -29,7 +29,8 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <string.h>
+#include <cstring>
+#include <set>
 #include <vector>
 
 #include "XProtocol/XPtypes.hh"
@@ -92,7 +93,9 @@ bool             noMore;
 
 class XrdSfsFile;
 class XrdXrootdFileLock;
+class XrdXrootdAioFob;
 class XrdXrootdMonitor;
+class XrdXrootdPgwFob;
 
 class XrdXrootdFile
 {
@@ -105,22 +108,27 @@ union {char       *mmAddr;       // Memory mapped location, if any
       };
 char              *FileKey;      // -> File hash name (actual file name now)
 char               FileMode;     // 'r' or 'w'
-char               AsyncMode;    // 1 -> if file in async r/w mode
-char               isMMapped;    // 1 -> file is memory mapped
-char               sfEnabled;    // 1 -> file is sendfile enabled
+bool               AsyncMode;    // 1 -> if file in async r/w mode
+bool               isMMapped;    // 1 -> file is memory mapped
+bool               sfEnabled;    // 1 -> file is sendfile enabled
 union {int         fdNum;        // File descriptor number if regular file
        int         fHandle;      // The file handle upon close()
       };
+XrdXrootdAioFob   *aioFob;       // Aio freight pointer for reads
+XrdXrootdPgwFob   *pgwFob;       // Pgw freight pointer for writes
 XrdXrootdFileHP   *fhProc;       // File handle processor (set at close time)
 const char        *ID;           // File user
 
 XrdXrootdFileStats Stats;        // File access statistics
 
-static void Init(XrdXrootdFileLock *lp, XrdSysError *erP, int sfok);
+static void Init(XrdXrootdFileLock *lp, XrdSysError *erP, bool sfok);
+
+       void Ref(int num);
+
+       void Serialize();
 
            XrdXrootdFile(const char *id, const char *path, XrdSfsFile *fp,
-                         char mode='r', bool async=false, int sfOK=0,
-                         struct stat *sP=0);
+                         char mode='r', bool async=false, struct stat *sP=0);
           ~XrdXrootdFile();
 
 private:
@@ -128,6 +136,11 @@ int bin2hex(char *outbuff, char *inbuff, int inlen);
 static XrdXrootdFileLock *Locker;
 static int                sfOK;
 static const char        *TraceID;
+
+int                       refCount;     // Reference counter
+int                       reserved;
+XrdSysSemaphore          *syncWait;
+XrdSysMutex               fileMutex;
 };
  
 /******************************************************************************/
@@ -155,9 +168,15 @@ public:
 
 inline XrdXrootdFile *Get(int fnum)
                          {if (fnum >= 0)
-                             {if (fnum < XRD_FTABSIZE) return FTab[fnum];
-                              if (XTab && (fnum-XRD_FTABSIZE)<XTnum)
-                                 return XTab[fnum-XRD_FTABSIZE];
+                             {if (fnum < XRD_FTABSIZE)
+                                 {if (FTab[fnum] != heldSpotP) return FTab[fnum];
+                                 } else {
+                                  if (XTab)
+                                     {int i = fnum - XRD_FTABSIZE;
+                                      if (i < XTnum &&  XTab[i] != heldSpotP)
+                                         return XTab[i];
+                                     }
+                                 }
                              }
                           return (XrdXrootdFile *)0;
                          }
@@ -167,6 +186,8 @@ inline XrdXrootdFile *Get(int fnum)
        XrdXrootdFileTable(unsigned int mid=0) : fhProc(0), FTfree(0), monID(mid),
                                                 XTab(0), XTnum(0), XTfree(0)
                          {memset((void *)FTab, 0, sizeof(FTab));}
+
+static XrdXrootdFile *heldSpotP;
 
 private:
 

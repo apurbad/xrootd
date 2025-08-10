@@ -30,7 +30,7 @@
 
 #include <unistd.h>
 #include <strings.h>
-#include <stdio.h>
+#include <cstdio>
 #include <sys/param.h>
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -38,6 +38,7 @@
 
 #include "XrdCms/XrdCmsClientConfig.hh"
 #include "XrdCms/XrdCmsClientMsg.hh"
+#include "XrdCms/XrdCmsPerfMon.hh"
 #include "XrdCms/XrdCmsSecurity.hh"
 #include "XrdCms/XrdCmsTrace.hh"
 #include "XrdCms/XrdCmsUtils.hh"
@@ -48,6 +49,15 @@
 #include "XrdOuc/XrdOucTList.hh"
 #include "XrdOuc/XrdOucUtils.hh"
 #include "XrdSys/XrdSysHeaders.hh"
+
+/******************************************************************************/
+/*                               G l o b a l s                                */
+/******************************************************************************/
+  
+namespace XrdCms
+{
+extern XrdVersionInfo myVersion;
+}
 
 using namespace XrdCms;
 
@@ -69,6 +79,11 @@ XrdCmsClientConfig::~XrdCmsClientConfig()
   while((tp = tpp)) {tpp = tp->next; delete tp;}
   tpp = PanList;
   while((tp = tpp)) {tpp = tp->next; delete tp;}
+
+  if (VNID_Lib)   free(VNID_Lib);
+  if (VNID_Parms) free(VNID_Parms);
+  if (prfLib)     free(prfLib);
+  if (prfParms)   free(prfParms);
 }
 
 /******************************************************************************/
@@ -95,9 +110,12 @@ int XrdCmsClientConfig::Configure(const char *cfn, configWhat What,
    myHost = getenv("XRDHOST");
    if (!myHost) myHost = "localhost";
    myName = XrdOucUtils::InstName(1);
-   CMSPath= strdup("/tmp/");
-   isMeta = How & configMeta;
-   isMan  = What& configMan;
+   CMSPath = getenv("XRDADMINPATH");
+   if (CMSPath && *CMSPath) CMSPath = strdup(CMSPath);
+      else CMSPath = XrdOucUtils::genPath("/tmp/",XrdOucUtils::InstName(myName,0));
+   isMeta = (How & configMeta) != 0;
+   isMan  = (What& configMan)  != 0;
+   isServer = What == configServer;
 
 // Process the configuration file
 //
@@ -114,10 +132,10 @@ int XrdCmsClientConfig::Configure(const char *cfn, configWhat What,
 
 // Set proper local socket path
 //
-   temp=XrdOucUtils::genPath(CMSPath, XrdOucUtils::InstName(-1), ".olb");
+   temp = XrdOucUtils::genPath(CMSPath, (const char *)0, ".olb");
    free(CMSPath); CMSPath = temp;
    XrdOucEnv::Export("XRDCMSPATH", temp);
-   XrdOucEnv::Export("XRDOLBPATH", temp); //Compatability
+   XrdOucEnv::Export("XRDOLBPATH", temp); //Compatibility
 
 // Determine what type of role we are playing
 //
@@ -177,6 +195,17 @@ int XrdCmsClientConfig::Configure(const char *cfn, configWhat What,
        NoGo = 1;
       }
 
+// Load the performance monitor (server pre-screened) if specified.
+//
+   if (prfLib && cmsMon)
+      {perfMon = XrdCmsUtils::loadPerfMon(&Say, prfLib, XrdCms::myVersion);
+       if (!perfMon || !perfMon->Configure(cfn, prfParms, *Say.logger(),
+                                           *cmsMon, 0, false))
+          {Say.Emsg("Config","Unable to configure performance monitor plugin.");
+           NoGo = 1;
+          }
+      }
+
    return NoGo;
 }
 
@@ -210,19 +239,21 @@ int XrdCmsClientConfig::ConfigProc(const char *ConfigFN)
        return 1;
       }
    Config.Attach(cfgFD);
+   static const char *cvec[] = { "*** cms plugin config:", 0 };
+   Config.Capture(cvec);
 
 // Now start reading records until eof.
 //
    while((var = Config.GetMyFirstWord()))
         {if (!strncmp(var, "cms.", 4)
-         ||  !strncmp(var, "odc.", 4)      // Compatability
+         ||  !strncmp(var, "odc.", 4)      // Compatibility
          ||  !strcmp(var, "all.manager")
          ||  !strcmp(var, "all.adminpath")
          ||  !strcmp(var, "olb.adminpath"))
             if (ConfigXeq(var+4, Config)) {Config.Echo(); NoGo = 1;}
         }
 
-// Now check if any errors occured during file i/o
+// Now check if any errors occurred during file i/o
 //
    if ((retc = Config.LastError()))
       NoGo = Say.Emsg("Config", retc, "read config file", ConfigFN);
@@ -273,10 +304,11 @@ int XrdCmsClientConfig::ConfigXeq(char *var, XrdOucStream &Config)
 
    // Process items. for either a local or a remote configuration
    //
+   TS_Xeq("adminpath",     xapath);
    TS_Xeq("cidtag",        xcidt);
    TS_Xeq("conwait",       xconw);
    TS_Xeq("manager",       xmang);
-   TS_Xeq("adminpath",     xapath);
+   TS_Xeq("perf",          xperf);
    TS_Xeq("request",       xreqs);
    TS_Xeq("trace",         xtrac);
    TS_Xeq("vnid",          xvnid);
@@ -318,7 +350,7 @@ int XrdCmsClientConfig::xapath(XrdOucStream &Config)
 // Record the path
 //
    if (CMSPath) free(CMSPath);
-   CMSPath = strdup(pval);
+   CMSPath = XrdOucUtils::genPath(pval,XrdOucUtils::InstName(myName,0));
    return 0;
 }
 
@@ -487,6 +519,64 @@ int XrdCmsClientConfig::xmang(XrdOucStream &Config)
    return (XrdCmsUtils::ParseMan(&Say, theList, hSpec, hPort, 0) ? 0 : 1);
 }
   
+
+/******************************************************************************/
+/*                                 x p e r f                                  */
+/******************************************************************************/
+
+/* Function: xperf
+
+   Purpose:  To parse the directive: perf [xrootd] [int <sec>]
+                                          [lib <lib> [<parms>] | pgm <pgm>]
+
+         int <time>    estimated time (seconds, M, H) between reports by <pgm>
+         lib <lib>     the shared library holding the XrdCmsPerf object that
+                       reports perf values. It must be the last option.
+         pgm <pgm>     program to start that will write perf values to standard
+                       out. It must be the last option. This is not supported
+                       when xrootd is specified.
+         xrootd        This directive only applies to the cms xrootd plugin.
+
+   Type: Server only, non-dynamic.
+
+   Output: 0 upon success or !0 upon failure. Ignored by manager.
+*/
+
+int XrdCmsClientConfig::xperf(XrdOucStream &Config)
+{   char *val;
+
+    if (!isServer) return Config.noEcho();
+
+    if (!(val = Config.GetWord()))
+       {Say.Emsg("Config", "perf options not specified"); return 1;}
+
+    if (strcmp("xrootd", val)) return Config.noEcho();
+    perfInt = 3*60;
+
+    do {     if (!strcmp("int", val))
+                {if (!(val = Config.GetWord()))
+                    {Say.Emsg("Config", "perf int value not specified");
+                     return 1;
+                    }
+                 if (XrdOuca2x::a2tm(Say,"perf int",val,&perfInt,0)) return 1;
+                }
+        else if (!strcmp("lib",  val))
+                {return (XrdOucUtils::parseLib(Say, Config, "perf lib",
+                                               prfLib, &prfParms) ? 0 : 1);
+                 break;
+                }
+        else if (!strcmp("pgm",  val))
+                {Say.Emsg("Config", "perf pgm is not supported for xrootd.");
+                 return 1;
+                }
+        else Say.Say("Config warning: ignoring invalid perf option '",val,"'.");
+       } while((val = Config.GetWord()));
+
+// All done.
+//
+    return 0;
+}
+
 /******************************************************************************/
 /*                                 x r e q s                                  */
 /******************************************************************************/

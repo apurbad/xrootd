@@ -27,12 +27,12 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <errno.h>
 #include <stddef.h>
-#include <stdlib.h>
+#include <cstdlib>
 #include <unistd.h>
-#include <stdio.h>
+#include <cstdio>
 
+#include "XrdSys/XrdSysE2T.hh"
 #include "XrdSys/XrdSysLogger.hh"
 #include "XrdSys/XrdSysLogging.hh"
 #include "XrdSys/XrdSysPlatform.hh"
@@ -83,7 +83,7 @@ bool XrdSysLogging::Configure(XrdSysLogger &logr, Parms &parms)
    if (parms.logfn)
       {if (strcmp(parms.logfn, "-") && (rc=logr.Bind(parms.logfn,parms.keepV)))
           {sprintf(eBuff, "Error %d (%s) binding to log file %s.\n",
-                   -rc, strerror(-rc), parms.logfn);
+                   -rc, XrdSysE2T(-rc), parms.logfn);
            return EMsg(logr, eBuff);
           }
        lclOut = true;
@@ -107,7 +107,7 @@ bool XrdSysLogging::Configure(XrdSysLogger &logr, Parms &parms)
 // Allocate a log buffer
 //
    int bsz = (parms.bufsz < 0 ? 65536 : parms.bufsz);
-   rc = posix_memalign(reinterpret_cast<void**>(&buffOrg), getpagesize(), bsz);
+   rc = posix_memalign((void **)&buffOrg, getpagesize(), bsz);
    if (rc != 0 || !buffOrg) return EMsg(logr, "Unable to allocate log buffer!\n");
 
    buffBeg = buffOrg + buffOvhd;
@@ -117,7 +117,7 @@ bool XrdSysLogging::Configure(XrdSysLogger &logr, Parms &parms)
 //
    if (XrdSysThread::Run(&lpiTID, Send2PI, (void *)0, 0, "LogPI handler"))
       {sprintf(eBuff, "Error %d (%s) starting LogPI handler.\n",
-                       errno, strerror(errno));
+                       errno, XrdSysE2T(errno));
        return EMsg(logr, eBuff);
       }
 
@@ -325,6 +325,7 @@ XrdSysLogging::MsgBuff *XrdSysLogging::getMsg(char **msgTxt, bool cont)
 
 void *XrdSysLogging::Send2PI(void *arg)
 {
+   (void)arg;
    MsgBuff *theMsg;
    char    *msgTxt, lstBuff[80];
    int      msgLen;

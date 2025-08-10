@@ -1,13 +1,16 @@
 
 #include "XrdThrottleManager.hh"
 
+#include "XrdOuc/XrdOucEnv.hh"
 #include "XrdSys/XrdSysAtomics.hh"
 #include "XrdSys/XrdSysTimer.hh"
-
-#include "XrdOuc/XrdOucEnv.hh"
+#include "XrdSys/XrdSysPthread.hh"
+#include "XrdXrootd/XrdXrootdGStream.hh"
 
 #define XRD_TRACE m_trace->
 #include "XrdThrottle/XrdThrottleTrace.hh"
+
+#include <sstream>
 
 const char *
 XrdThrottleManager::TraceID = "ThrottleManager";
@@ -15,9 +18,8 @@ XrdThrottleManager::TraceID = "ThrottleManager";
 const
 int XrdThrottleManager::m_max_users = 1024;
 
-#if defined(__linux__)
-int clock_id;
-int XrdThrottleTimer::clock_id = clock_getcpuclockid(0, &clock_id) != ENOENT ? CLOCK_THREAD_CPUTIME_ID : CLOCK_MONOTONIC;
+#if defined(__linux__) || defined(__APPLE__) || defined(__GNU__) || (defined(__FreeBSD_kernel__) && defined(__GLIBC__))
+clockid_t XrdThrottleTimer::clock_id = CLOCK_MONOTONIC;
 #else
 int XrdThrottleTimer::clock_id = 0;
 #endif
@@ -30,7 +32,7 @@ XrdThrottleManager::XrdThrottleManager(XrdSysError *lP, XrdOucTrace *tP) :
    m_ops_per_second(-1),
    m_concurrency_limit(-1),
    m_last_round_allocation(100*1024),
-   m_io_counter(0),
+   m_io_active(0),
    m_loadshed_host(""),
    m_loadshed_port(0),
    m_loadshed_frequency(0),
@@ -45,10 +47,10 @@ XrdThrottleManager::Init()
 {
    TRACE(DEBUG, "Initializing the throttle manager.");
    // Initialize all our shares to zero.
-   m_primary_bytes_shares.reserve(m_max_users);
-   m_secondary_bytes_shares.reserve(m_max_users);
-   m_primary_ops_shares.reserve(m_max_users);
-   m_secondary_ops_shares.reserve(m_max_users);
+   m_primary_bytes_shares.resize(m_max_users);
+   m_secondary_bytes_shares.resize(m_max_users);
+   m_primary_ops_shares.resize(m_max_users);
+   m_secondary_ops_shares.resize(m_max_users);
    // Allocate each user 100KB and 10 ops to bootstrap;
    for (int i=0; i<m_max_users; i++)
    {
@@ -103,6 +105,150 @@ XrdThrottleManager::StealShares(int uid, int &reqsize, int &reqops)
    TRACE(BANDWIDTH, "After stealing shares, " << reqsize << " of request bytes remain.");
    TRACE(IOPS, "After stealing shares, " << reqops << " of request ops remain.");
 }
+
+/*
+ * Increment the number of files held open by a given entity.  Returns false
+ * if the user is at the maximum; in this case, the internal counter is not
+ * incremented.
+ */
+bool
+XrdThrottleManager::OpenFile(const std::string &entity, std::string &error_message)
+{
+    if (m_max_open == 0 && m_max_conns == 0) return true;
+
+    const std::lock_guard<std::mutex> lock(m_file_mutex);
+    auto iter = m_file_counters.find(entity);
+    unsigned long cur_open_files = 0, cur_open_conns;
+    if (m_max_open) {
+        if (iter == m_file_counters.end()) {
+            m_file_counters[entity] = 1;
+            TRACE(FILES, "User " << entity << " has opened their first file");
+            cur_open_files = 1;
+        } else if (iter->second < m_max_open) {
+            iter->second++;
+            cur_open_files = iter->second;
+        } else {
+            std::stringstream ss;
+            ss <<  "User " << entity << " has hit the limit of " << m_max_open << " open files";
+            TRACE(FILES, ss.str());
+            error_message = ss.str();
+            return false;
+        }
+    }
+
+    if (m_max_conns) {
+        auto pid = XrdSysThread::Num();
+        auto conn_iter = m_active_conns.find(entity);
+        auto conn_count_iter = m_conn_counters.find(entity);
+        if ((conn_count_iter != m_conn_counters.end()) && (conn_count_iter->second == m_max_conns) &&
+            (conn_iter == m_active_conns.end() || ((*(conn_iter->second))[pid] == 0)))
+        {
+            // note: we are rolling back the increment in open files
+            if (m_max_open) iter->second--;
+            std::stringstream ss;
+            ss << "User " << entity << " has hit the limit of " << m_max_conns <<
+                " open connections";
+            TRACE(CONNS, ss.str());
+            error_message = ss.str();
+            return false;
+        }
+        if (conn_iter == m_active_conns.end()) {
+            std::unique_ptr<std::unordered_map<pid_t, unsigned long>> conn_map(
+                new std::unordered_map<pid_t, unsigned long>());
+            (*conn_map)[pid] = 1;
+            m_active_conns[entity] = std::move(conn_map);
+            if (conn_count_iter == m_conn_counters.end()) {
+                m_conn_counters[entity] = 1;
+                cur_open_conns = 1;
+            } else {
+                m_conn_counters[entity] ++;
+                cur_open_conns = m_conn_counters[entity];
+            }
+        } else {
+            auto pid_iter = conn_iter->second->find(pid);
+            if (pid_iter == conn_iter->second->end() || pid_iter->second == 0) {
+                (*(conn_iter->second))[pid] = 1;
+                conn_count_iter->second++;
+                cur_open_conns = conn_count_iter->second;
+            } else {
+                (*(conn_iter->second))[pid] ++;
+                cur_open_conns = conn_count_iter->second;
+           }
+        }
+        TRACE(CONNS, "User " << entity << " has " << cur_open_conns << " open connections");
+    }
+    if (m_max_open) TRACE(FILES, "User " << entity << " has " << cur_open_files << " open files");
+    return true;
+}
+
+
+/*
+ * Decrement the number of files held open by a given entity.
+ *
+ * Returns false if the value would have fallen below zero or
+ * if the entity isn't tracked.
+ */
+bool
+XrdThrottleManager::CloseFile(const std::string &entity)
+{
+    if (m_max_open == 0 && m_max_conns == 0) return true;
+
+    bool result = true;
+    const std::lock_guard<std::mutex> lock(m_file_mutex);
+    if (m_max_open) {
+        auto iter = m_file_counters.find(entity);
+        if (iter == m_file_counters.end()) {
+            TRACE(FILES, "WARNING: User " << entity << " closed a file but throttle plugin never saw an open file");
+            result = false;
+        } else if (iter->second == 0) {
+            TRACE(FILES, "WARNING: User " << entity << " closed a file but throttle plugin thinks all files were already closed");
+            result = false;
+        } else {
+            iter->second--;
+        }
+        if (result) TRACE(FILES, "User " << entity << " closed a file; " << iter->second <<
+                                 " remain open");
+    }
+
+    if (m_max_conns) {
+        auto pid = XrdSysThread::Num();
+        auto conn_iter = m_active_conns.find(entity);
+        auto conn_count_iter = m_conn_counters.find(entity);
+        if (conn_iter == m_active_conns.end() || !(conn_iter->second)) {
+            TRACE(CONNS, "WARNING: User " << entity << " closed a file on a connection we are not"
+                " tracking");
+            return false;
+        }
+        auto pid_iter = conn_iter->second->find(pid);
+        if (pid_iter == conn_iter->second->end()) {
+            TRACE(CONNS, "WARNING: User " << entity << " closed a file on a connection we are not"
+                " tracking");
+            return false;
+        }
+        if (pid_iter->second == 0) {
+            TRACE(CONNS, "WARNING: User " << entity << " closed a file on connection the throttle"
+                " plugin thinks was idle");
+        } else {
+            pid_iter->second--;
+        }
+        if (conn_count_iter == m_conn_counters.end()) {
+            TRACE(CONNS, "WARNING: User " << entity << " closed a file but the throttle plugin never"
+                " observed an open file");
+        } else if (pid_iter->second == 0) {
+            if (conn_count_iter->second == 0) {
+                TRACE(CONNS, "WARNING: User " << entity << " had a connection go idle but the "
+                    " throttle plugin already thought all connections were idle");
+            } else {
+                conn_count_iter->second--;
+                TRACE(CONNS, "User " << entity << " had connection on thread " << pid << " go idle; "
+                    << conn_count_iter->second << " active connections remain");
+            }
+        }
+    }
+
+    return result;
+}
+
 
 /*
  * Apply the throttle.  If there are no limits set, returns immediately.  Otherwise,
@@ -164,6 +310,47 @@ XrdThrottleManager::Recompute()
 {
    while (1)
    {
+      // The connection counter can accumulate a number of known-idle connections.
+      // We only need to keep long-term memory of idle ones.  Take this chance to garbage
+      // collect old connection counters.
+      if (m_max_open || m_max_conns) {
+          const std::lock_guard<std::mutex> lock(m_file_mutex);
+          for (auto iter = m_active_conns.begin(); iter != m_active_conns.end();)
+          {
+              auto & conn_count = *iter;
+              if (!conn_count.second) {
+                  iter = m_active_conns.erase(iter);
+                  continue;
+              }
+              for (auto iter2 = conn_count.second->begin(); iter2 != conn_count.second->end();) {
+                  if (iter2->second == 0) {
+                      iter2 = conn_count.second->erase(iter2);
+                  } else {
+                      iter2++;
+                  }
+              }
+              if (!conn_count.second->size()) {
+                  iter = m_active_conns.erase(iter);
+              } else {
+                  iter++;
+              }
+          }
+          for (auto iter = m_conn_counters.begin(); iter != m_conn_counters.end();) {
+              if (!iter->second) {
+                  iter = m_conn_counters.erase(iter);
+              } else {
+                  iter++;
+              }
+          }
+          for (auto iter = m_file_counters.begin(); iter != m_file_counters.end();) {
+              if (!iter->second) {
+                  iter = m_file_counters.erase(iter);
+              } else {
+                  iter++;
+              }
+          }
+      }
+
       TRACE(DEBUG, "Recomputing fairshares for throttle.");
       RecomputeInternal();
       TRACE(DEBUG, "Finished recomputing fairshares for throttle; sleeping for " << m_interval_length_seconds << " seconds.");
@@ -242,7 +429,10 @@ XrdThrottleManager::RecomputeInternal()
 
    // Update the IO counters
    m_compute_var.Lock();
-   m_stable_io_counter = AtomicGet(m_io_counter);
+   m_stable_io_active = AtomicGet(m_io_active);
+   auto io_active = m_stable_io_active;
+   m_stable_io_total = static_cast<unsigned>(AtomicGet(m_io_total));
+   auto io_total = m_stable_io_total;
    time_t secs; AtomicFZAP(secs, m_io_wait.tv_sec);
    long nsecs; AtomicFZAP(nsecs, m_io_wait.tv_nsec);
    m_stable_io_wait.tv_sec += static_cast<long>(secs * intervals_per_second);
@@ -250,10 +440,27 @@ XrdThrottleManager::RecomputeInternal()
    while (m_stable_io_wait.tv_nsec > 1000000000)
    {
       m_stable_io_wait.tv_nsec -= 1000000000;
-      m_stable_io_wait.tv_nsec --;
+      m_stable_io_wait.tv_sec ++;
    }
+   struct timespec io_wait_ts;
+   io_wait_ts.tv_sec = m_stable_io_wait.tv_sec;
+   io_wait_ts.tv_nsec = m_stable_io_wait.tv_nsec;
+
    m_compute_var.UnLock();
-   TRACE(IOLOAD, "Current IO counter is " << m_stable_io_counter << "; total IO wait time is " << (m_stable_io_wait.tv_sec*1000+m_stable_io_wait.tv_nsec/1000000) << "ms.");
+   uint64_t io_wait_ms = io_wait_ts.tv_sec*1000+io_wait_ts.tv_nsec/1000000;
+   TRACE(IOLOAD, "Current IO counter is " << io_active << "; total IO wait time is " << io_wait_ms << "ms.");
+   if (m_gstream)
+   {
+        char buf[128];
+        auto len = snprintf(buf, 128,
+                            R"({"event":"throttle_update","io_wait":%.4f,"io_active":%d,"io_total":%d})",
+                            static_cast<double>(io_wait_ms) / 1000.0, io_active, io_total);
+        auto suc = (len < 128) ? m_gstream->Insert(buf, len + 1) : false;
+        if (!suc)
+        {
+            TRACE(IOLOAD, "Failed g-stream insertion of throttle_update record (len=" << len << "): " << buf);
+        }
+   }
    m_compute_var.Broadcast();
 }
 
@@ -271,7 +478,7 @@ XrdThrottleManager::GetUid(const char *username)
       hval %= m_max_users;
       cur++;
    }
-   //cerr << "Calculated UID " << hval << " for " << username << endl;
+   //std::cerr << "Calculated UID " << hval << " for " << username << std::endl;
    return hval;
 }
 
@@ -282,17 +489,18 @@ XrdThrottleTimer
 XrdThrottleManager::StartIOTimer()
 {
    AtomicBeg(m_compute_var);
-   int cur_counter = AtomicInc(m_io_counter);
+   int cur_counter = AtomicInc(m_io_active);
+   AtomicInc(m_io_total);
    AtomicEnd(m_compute_var);
    while (m_concurrency_limit >= 0 && cur_counter > m_concurrency_limit)
    {
       AtomicBeg(m_compute_var);
       AtomicInc(m_loadshed_limit_hit);
-      AtomicDec(m_io_counter);
+      AtomicDec(m_io_active);
       AtomicEnd(m_compute_var);
       m_compute_var.Wait();
       AtomicBeg(m_compute_var);
-      cur_counter = AtomicInc(m_io_counter);
+      cur_counter = AtomicInc(m_io_active);
       AtomicEnd(m_compute_var);
    }
    return XrdThrottleTimer(*this);
@@ -305,7 +513,7 @@ void
 XrdThrottleManager::StopIOTimer(struct timespec timer)
 {
    AtomicBeg(m_compute_var);
-   AtomicDec(m_io_counter);
+   AtomicDec(m_io_active);
    AtomicAdd(m_io_wait.tv_sec, timer.tv_sec);
    // Note this may result in tv_nsec > 1e9
    AtomicAdd(m_io_wait.tv_nsec, timer.tv_nsec);

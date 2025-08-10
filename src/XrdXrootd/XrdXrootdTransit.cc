@@ -28,7 +28,7 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <string.h>
+#include <cstring>
 #include <unistd.h>
 #include <sys/uio.h>
 
@@ -39,6 +39,8 @@
 #include "Xrd/XrdBuffer.hh"
 #include "Xrd/XrdLink.hh"
 #include "XrdOuc/XrdOucErrInfo.hh"
+#include "XrdOuc/XrdOucUtils.hh"
+#include "XrdSfs/XrdSfsInterface.hh"
 #include "XrdSys/XrdSysAtomics.hh"
 #include "XrdXrootd/XrdXrootdStats.hh"
 #include "XrdXrootd/XrdXrootdTrace.hh"
@@ -50,7 +52,7 @@
 /*                        C l o b a l   S y m b o l s                         */
 /******************************************************************************/
   
-extern  XrdOucTrace *XrdXrootdTrace;
+extern  XrdSysTrace  XrdXrootdTrace;
 
 #undef  TRACELINK
 #define TRACELINK Link
@@ -132,18 +134,14 @@ int XrdXrootdTransit::AttnCont(XrdXrootdTransPend *tP,  int rcode,
        return 0;
       }
 
-// Send off the defered response
+// Send off the deferred response
 //
    rc = Send(rcode, ioV, ioN, ioL);
 
 // Handle end based on current state
 //
    if (rc >= 0 && !runWait)
-      {if (runDone)
-          {AtomicBeg(runMutex);
-           AtomicZAP(runStatus);
-           AtomicEnd(runMutex);
-          }
+      {if (runDone) runStatus.store(0, std::memory_order_release);
        if (reInvoke) Sched->Schedule((XrdJob *)&respJob);
            else Link->Enable();
       }
@@ -160,14 +158,10 @@ int XrdXrootdTransit::AttnCont(XrdXrootdTransPend *tP,  int rcode,
 bool XrdXrootdTransit::Disc()
 {
    char buff[128];
-   int rc;
 
 // We do not allow disconnection while we are active
 //
-   AtomicBeg(runMutex);
-   rc = AtomicInc(runStatus);
-   AtomicEnd(runMutex);
-   if (rc) return false;
+   if (runStatus.fetch_add(1, std::memory_order_acq_rel)) return false;
 
 // Reconnect original protocol to the link
 //
@@ -213,7 +207,7 @@ int XrdXrootdTransit::Fatal(int rc)
 
 void XrdXrootdTransit::Init(XrdScheduler *schedP, int qMax, int qTTL)
 {
-   TranStack.Set(schedP, XrdXrootdTrace, TRACE_MEM);
+   TranStack.Set(schedP, &XrdXrootdTrace, TRACE_MEM);
    TranStack.Set(qMax, qTTL);
 }
 
@@ -226,12 +220,9 @@ void XrdXrootdTransit::Init(XrdXrootd::Bridge::Result *respP, // Private
                             const char                *protP
                            )
 {
-   static XrdSysMutex myMutex;
-   static int bID = 0;
    XrdNetAddrInfo *addrP;
    const char *who;
    char uname[sizeof(Request.login.username)+1];
-   int pID, n;
 
 // Set standard stuff
 //
@@ -239,7 +230,7 @@ void XrdXrootdTransit::Init(XrdXrootd::Bridge::Result *respP, // Private
    runALen   = 0;
    runABsz   = 0;
    runError  = 0;
-   runStatus = 0;
+   runStatus.store(0, std::memory_order_release);
    runWait   = 0;
    runWTot   = 0;
    runWMax   = 3600;
@@ -250,6 +241,7 @@ void XrdXrootdTransit::Init(XrdXrootd::Bridge::Result *respP, // Private
    wBLen     = 0;
    respObj   = respP;
    pName     = protP;
+   mySID     = getSID();
 
 // Bind the protocol to the link
 //
@@ -262,18 +254,19 @@ void XrdXrootdTransit::Init(XrdXrootd::Bridge::Result *respP, // Private
 
 // Develop a trace identifier
 //
-   myMutex.Lock(); pID = ++bID; myMutex.UnLock();
-   n = strlen(nameP);
-   if (n >= int(sizeof(uname))) n = sizeof(uname)-1;
    strncpy(uname, nameP, sizeof(uname)-1);
-   uname[n] = 0;
-   linkP->setID(uname, pID);
+   uname[sizeof(uname)-1] = 0;
+   XrdOucUtils::Sanitize(uname);
+   linkP->setID(uname, mySID);
+
+// Place trace identifier everywhere is should be located
 
 // Indicate that this brige supports asynchronous responses
 //
-   CapVer = kXR_asyncap | kXR_ver002;
+   CapVer = (kXR_char) kXR_asyncap | (kXR_char) kXR_ver002;
 
-// Mark the client as IPv4 if they came in as IPv4 or mapped IPv4
+// Mark the client as IPv4 if they came in as IPv4 or mapped IPv4. Note
+// there is no way we can figure out if this is a dual-stack client.
 //
    addrP = Link->AddrInfo();
    if (addrP->isIPType(XrdNetAddrInfo::IPv4) || addrP->isMapped())
@@ -287,6 +280,9 @@ void XrdXrootdTransit::Init(XrdXrootd::Bridge::Result *respP, // Private
 // Now tie the security information
 //
    Client = (seceP ? seceP : &Entity);
+   Client->ueid = mySID;
+   Client->tident = Client->pident = Link->ID;
+   Client->addrInfo = addrP;
 
 // Allocate a monitoring object, if needed for this connection and record login
 //
@@ -305,6 +301,7 @@ void XrdXrootdTransit::Init(XrdXrootd::Bridge::Result *respP, // Private
 // Substitute our protocol for the existing one
 //
    realProt = linkP->setProtocol(this);
+   linkP->setProtName(protP);
    linkP->armBridge();
 
 // Document this login
@@ -316,6 +313,10 @@ void XrdXrootdTransit::Init(XrdXrootd::Bridge::Result *respP, // Private
 //
    Status = XRD_LOGGEDIN;
    cTime = time(0);
+
+// Propogate a connect through the whole system
+//
+   osFS->Connect(Client);
 }
   
 /******************************************************************************/
@@ -359,7 +360,7 @@ int XrdXrootdTransit::Process(XrdLink *lp)
 // called we need to dispatch that request. This may be iterative.
 //
 do{rc = realProt->Process((reInvoke ? 0 : lp));
-   if (rc >= 0 && runStatus)
+   if (rc >= 0 && runStatus.load(std::memory_order_acquire))
       {reInvoke = (rc == 0);
        if (runError) rc = Fatal(rc);
           else {runDone = false;
@@ -367,9 +368,7 @@ do{rc = realProt->Process((reInvoke ? 0 : lp));
                 if (rc >= 0)
                    {if (runWait) rc = -EINPROGRESS;
                     if (!runDone) return rc;
-                    AtomicBeg(runMutex);
-                    AtomicZAP(runStatus);
-                    AtomicEnd(runMutex);
+                    runStatus.store(0, std::memory_order_release);
                    }
                }
       } else reInvoke = false;
@@ -377,11 +376,7 @@ do{rc = realProt->Process((reInvoke ? 0 : lp));
 
 // Make sure that we indicate that we are no longer active
 //
-   if (runStatus)
-      {AtomicBeg(runMutex);
-       AtomicZAP(runStatus);
-       AtomicEnd(runMutex);
-      }
+   runStatus.store(0, std::memory_order_release);
 
 // All done
 //
@@ -397,15 +392,16 @@ void XrdXrootdTransit::Recycle(XrdLink *lp, int consec, const char *reason)
 
 // Set ourselves as active so we can't get more requests
 //
-   AtomicBeg(runMutex);
-   AtomicInc(runStatus);
-   AtomicEnd(runMutex);
+   runStatus.fetch_add(1, std::memory_order_acq_rel);
 
 // If we were active then we will need to quiesce before dismantling ourselves.
 // Note that Recycle() can only be called if the link is enabled. So, this bit
 // of code is improbable but we check it anyway.
 //
-   if (runWait > 0) Sched->Cancel(&waitJob);
+   if (runWait > 0) {
+       TRACEP(EMSG, "WARNING: Recycle is canceling wait job; the wait job might already be running during recycle.");
+       Sched->Cancel(&waitJob);
+   }
 
 // First we need to recycle the real protocol
 //
@@ -440,6 +436,12 @@ void XrdXrootdTransit::Redrive()
                                 {(char *)&eText,sizeof(eText)}};
    int rc;
 
+// Do some tracing
+//
+   TRACEP(REQ, "Bridge redrive runStatus="<<runStatus.load(std::memory_order_acquire)
+               <<" runError="<<runError
+               <<" runWait="<<runWait<<" runWTot="<<runWTot);
+
 // Update wait statistics
 //
    runWTot += runWait;
@@ -449,10 +451,19 @@ void XrdXrootdTransit::Redrive()
 // be deleted while a timer is outstanding as the link has been disabled. So,
 // we can reissue the request with little worry.
 //
+// This is a bit tricky here as a redriven request may result in a wait. If
+// this happens we cannot hand the result off to the real protocol until we
+// wait and successfully redrive. The wait handling occurs asynchronously
+// so all we need to do is honor it here.
+//
    if (!runALen || RunCopy(runArgs, runALen)) {
       do{rc = Process2();
-        if (rc == 0) {
+         TRACEP(REQ, "Bridge redrive Process2 rc="<<rc
+                     <<" runError="<<runError<<" runWait="<<runWait);
+        if (rc == 0 && !runWait && !runError) {
           rc = realProt->Process(NULL);
+          TRACEP(REQ, "Bridge redrive callback rc="<<rc
+                      <<" runStatus="<<runStatus.load(std::memory_order_acquire));
         }
       } while((rc == 0) && !runError && !runWait);
    }
@@ -465,11 +476,7 @@ void XrdXrootdTransit::Redrive()
 
 // Indicate we are no longer active
 //
-   if (runStatus)
-      {AtomicBeg(runMutex);
-       AtomicZAP(runStatus);
-       AtomicEnd(runMutex);
-      }
+   runStatus.store(0, std::memory_order_release);
 
 // If the link needs to be terminated, terminate the link. Otherwise, we can
 // enable the link for new requests at this point.
@@ -550,15 +557,16 @@ bool XrdXrootdTransit::ReqWrite(char *xdataP, int xdataL)
   
 bool XrdXrootdTransit::Run(const char *xreqP, char *xdataP, int xdataL)
 {
-   int movLen, rc;
+   int movLen;
 
 // We do not allow re-entry if we are curently processing a request.
 // It will be reset, as need, when a response is effected.
 //
-   AtomicBeg(runMutex);
-   rc = AtomicInc(runStatus);
-   AtomicEnd(runMutex);
-   if (rc) return false;
+
+   if (runStatus.fetch_add(1, std::memory_order_acq_rel))
+      {TRACEP(REQ, "Bridge request failed due to re-entry");
+       return false;
+      }
 
 // Copy the request header
 //
@@ -570,13 +578,17 @@ bool XrdXrootdTransit::Run(const char *xreqP, char *xdataP, int xdataL)
    if (Request.header.requestid & 0x8000
    || Request.header.requestid > static_cast<kXR_unt16>(kXR_truncate)
    || !reqTab[Request.header.requestid - kXR_auth])
-      return Fail(kXR_Unsupported, "Unsupported bridge request");
+      {TRACEP(REQ, "Unsupported bridge request");
+       return Fail(kXR_Unsupported, "Unsupported bridge request");
+      }
 
 // Validate the data length
 //
    Request.header.dlen      = ntohl(Request.header.dlen);
    if (Request.header.dlen < 0)
-      return Fail(kXR_ArgInvalid, "Invalid request data length");
+      {TRACEP(REQ, "Invalid request data length");
+       return Fail(kXR_ArgInvalid, "Invalid request data length");
+      }
 
 // Copy the stream id and trace this request
 //
@@ -598,7 +610,9 @@ bool XrdXrootdTransit::Run(const char *xreqP, char *xdataP, int xdataL)
        if (!runArgs || movLen > runABsz)
           {if (runArgs) free(runArgs);
            if (!(runArgs = (char *)malloc(movLen)))
-              return Fail(kXR_NoMemory, "Insufficient memory");
+              {TRACEP(REQ, "Failed to allocate memory");
+               return Fail(kXR_NoMemory, "Insufficient memory");
+              }
            runABsz = movLen;
           }
        memcpy(runArgs, xdataP, movLen); runALen = movLen;

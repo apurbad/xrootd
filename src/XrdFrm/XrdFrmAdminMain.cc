@@ -55,13 +55,13 @@ Where:
 /******************************************************************************/
   
 #include <unistd.h>
-#include <ctype.h>
-#include <errno.h>
+#include <cctype>
+#include <cerrno>
 #include <signal.h>
-#include <stdlib.h>
-#include <string.h>
+#include <cstdlib>
+#include <cstring>
 #include <strings.h>
-#include <stdio.h>
+#include <cstdio>
 #include <sys/param.h>
 
 #ifdef HAVE_READLINE
@@ -109,7 +109,7 @@ char *readline(const char *prompt)
 {
    char buff[4096];
   
-   cout << prompt;
+   std::cout << prompt;
    if (!fgets(buff, 4096, stdin) || *buff == '\n' || !strlen(buff)) return 0;
    return strdup(buff);
 }

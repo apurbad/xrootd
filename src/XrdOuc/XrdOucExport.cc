@@ -38,7 +38,7 @@
   
 /* Function: ParseDefs
 
-   Purpose:  Parse: defaults [[no]check] [[no]dread]
+   Purpose:  Parse: defaults [[no]cache] [[no]check] [[no]dread]
 
                              [[no]filter] [forcero]
 
@@ -75,6 +75,8 @@ unsigned long long XrdOucExport::ParseDefs(XrdOucStream      &Config,
         {"r/w",           XRDEXP_NOTRW,   0,              XRDEXP_ROW_X},
         {"inplace",       0,              XRDEXP_INPLACE, XRDEXP_INPLACE_X},
         {"outplace",      XRDEXP_INPLACE, 0,              XRDEXP_INPLACE_X},
+//      {"nocache",       XRDEXP_PFCACHE, 0,              XRDEXP_PFCACHE_X},
+        {"cache",         0,              XRDEXP_PFCACHE, XRDEXP_PFCACHE_X},
         {"nomig",         XRDEXP_MIG,     0,              XRDEXP_MIG_X},
         {"mig",           0,              XRDEXP_MIG,     XRDEXP_MIG_X},
         {"notmigratable", XRDEXP_MIG,     0,              XRDEXP_MIG_X},
@@ -140,6 +142,7 @@ unsigned long long XrdOucExport::ParseDefs(XrdOucStream      &Config,
 
              <path>    the path prefix that applies
              <options> a blank separated list of options:
+                       [no]cache    - is [not] file caching
                        [no]check    - [don't] check if new file exists in MSS
                        [no]dread    - [don't] read actual directory contents
                            forcero  - force r/w opens to r/o opens
@@ -192,7 +195,15 @@ XrdOucPList *XrdOucExport::ParsePath(XrdOucStream &Config, XrdSysError &Eroute,
                              "to be readonly");
        rpval |= XRDEXP_FORCERO;
       }
-   if (rpval & (XRDEXP_MLOK | XRDEXP_MKEEP)) rpval |= XRDEXP_MMAP;
+
+// noxattr conflicts with mig or purge
+//
+   if ((rpval & XRDEXP_NOXATTR) && (rpval & XRDEXP_MIGPRG))
+      {Eroute.Emsg("config", "noxattrs attribute is incompatible with "
+                   "mig and purge attributes.");
+       return 0;
+      }
+
 
 // Update the export list. If this path is being modified, turn off all bits
 // in the old path specified in the new path and then set the new bits.

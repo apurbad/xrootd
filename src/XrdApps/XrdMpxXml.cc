@@ -30,17 +30,16 @@
 
 #include <iostream>
 #include <map>
-#include <stdio.h>
-#include <string.h>
+#include <cstdio>
+#include <cstring>
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/uio.h>
-#include <time.h>
+#include <ctime>
 
 #include "XrdApps/XrdMpxXml.hh"
 #include "XrdOuc/XrdOucTokenizer.hh"
 
-using namespace std;
 
 /******************************************************************************/
 /*                      v n M a p   D e f i n i t i o n                       */
@@ -61,6 +60,7 @@ std::map<const char *, const char *, vCmp> vnMap {
 {"pgm",             "Server program: "},
 {"ins",             "Server instance:"},
 {"pid",             "Server process: "},
+{"site",            "Server sitename: "},
 {"ver",             "Server version: "},
 {"info.host",       "Host name:"},
 {"info.port",       "Port:"},
@@ -210,7 +210,7 @@ static const int   vMax = 15;
   
 int XrdMpxVar::Pop(const char *vName)
 {
-    if (Debug) cerr <<"Pop:  " <<(vName ? vName : "") <<"; var=" <<vBuff <<endl;
+    if (Debug) std::cerr <<"Pop:  " <<(vName ? vName : "") <<"; var=" <<vBuff <<std::endl;
     if (vNum < 0 || (vName && strcmp(vStack[vNum], vName))) return 0;
     vEnd = vStack[vNum]-1; *vEnd = '\0'; vNum--;
     return 1;
@@ -224,7 +224,7 @@ int XrdMpxVar::Push(const char *vName)
 {
    int n = strlen(vName);
 
-   if (Debug) cerr <<"Push: " <<vName <<"; var=" <<vBuff <<endl;
+   if (Debug) std::cerr <<"Push: " <<vName <<"; var=" <<vBuff <<std::endl;
    if (vNum >= vMax) return 0;
    if (vNum >= 0) *vEnd++ = '.';
       else         vEnd = vBuff;
@@ -394,6 +394,6 @@ void XrdMpxXml::getVars(XrdOucTokenizer &Data, VarInfo Var[])
   
 int XrdMpxXml::xmlErr(const char *t1, const char *t2, const char *t3)
 {
-   cerr <<"XrdMpxXml: " <<t1 <<' ' <<t2 <<' ' <<t3 <<endl;
+   std::cerr <<"XrdMpxXml: " <<t1 <<' ' <<t2 <<' ' <<t3 <<std::endl;
    return 0;
 }

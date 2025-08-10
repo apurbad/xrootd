@@ -28,9 +28,9 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <errno.h>
-#include <stdio.h>
-#include <string.h>
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
 
 #include "XrdVersion.hh"
 
@@ -85,7 +85,8 @@ bool  BadHdr(dbgHdr *dLine)
 
   
 void *LoggingStdErr(void *carg)
-      {XrdOucStream seStream;
+      {(void)carg;
+       XrdOucStream seStream;
        struct timeval seTime = {0,0};
        struct iovec   ioV;
 

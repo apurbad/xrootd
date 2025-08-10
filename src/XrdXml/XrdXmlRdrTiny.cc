@@ -27,16 +27,16 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <ctype.h>
-#include <errno.h>
-#include <stdlib.h>
-#include <string.h>
+#include <cctype>
+#include <cstdlib>
+#include <cstring>
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <iostream>
 
-#include "XrdXml/tinyxml.h"
+#include "XrdSys/XrdSysE2T.hh"
+#include "tinyxml.h"
 #include "XrdXml/XrdXmlRdrTiny.hh"
 
 /******************************************************************************/
@@ -98,7 +98,7 @@ XrdXmlRdrTiny::XrdXmlRdrTiny(bool &aOK, const char *fname, const char *enc) : re
 //
    if (stat(fname, &Stat))
       {eCode = errno;
-       snprintf(eText,sizeof(eText),"%s opening %s", strerror(errno), fname);
+       snprintf(eText,sizeof(eText),"%s opening %s", XrdSysE2T(errno), fname);
        aOK = false;
        return;
       }
@@ -113,7 +113,7 @@ XrdXmlRdrTiny::XrdXmlRdrTiny(bool &aOK, const char *fname, const char *enc) : re
        aOK = true;
       } else {
        if (!(etext = reader->ErrorDesc()) || *etext)
-          {if ((eCode = errno)) etext = strerror(errno);
+          {if ((eCode = errno)) etext = XrdSysE2T(errno);
               else etext =  "Unknown error";
           }
        snprintf(eText,sizeof(eText),"%s opening %s", etext, fname);

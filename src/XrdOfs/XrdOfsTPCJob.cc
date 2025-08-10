@@ -58,7 +58,7 @@ XrdOfsTPCJob::XrdOfsTPCJob(const char *Url, const char *Org,
                            const char *Cks, short lfnLoc[2],
                            const char *Spr, const char *Tpr)
                           : XrdOfsTPC(Url, Org, Lfn, Pfn, Cks, Spr, Tpr),
-                            myProg(0), Status(isWaiting)
+                            Next(0), myProg(0), eCode(0), Status(isWaiting)
 {  lfnPos[0] = lfnLoc[0]; lfnPos[1] = lfnLoc[1]; }
   
 /******************************************************************************/
@@ -94,9 +94,8 @@ void XrdOfsTPCJob::Del()
 
 // Delete the element if possible
 //
-   if (Refs <= 1) delete this;
-      else Refs--;
-   jobMutex.UnLock();
+   if (Refs <= 1)  {jobMutex.UnLock(); delete this;}
+      else {Refs--; jobMutex.UnLock();}
 }
 
 /******************************************************************************/

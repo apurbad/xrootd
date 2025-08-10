@@ -19,9 +19,11 @@
 #ifndef __XRD_CL_POST_MASTER_HH__
 #define __XRD_CL_POST_MASTER_HH__
 
-#include <stdint.h>
+#include <cstdint>
 #include <map>
 #include <vector>
+#include <functional>
+#include <memory>
 
 #include "XrdCl/XrdClStatus.hh"
 #include "XrdCl/XrdClURL.hh"
@@ -35,6 +37,9 @@ namespace XrdCl
   class TaskManager;
   class Channel;
   class JobManager;
+  class Job;
+
+  struct PostMasterImpl;
 
   //----------------------------------------------------------------------------
   //! A hub for dispatching and receiving messages
@@ -78,26 +83,6 @@ namespace XrdCl
       bool Reinitialize();
 
       //------------------------------------------------------------------------
-      //! Send a message synchronously - synchronously means that
-      //! it will block until the message is written to a socket
-      //!
-      //! DEADLOCK WARNING: no lock should be taken while calling this method
-      //! that are used in the callback as well.
-      //!
-      //! @param url     recipient of the message
-      //! @param msg     message to be sent
-      //! @param stateful physical stream disconnection causes an error
-      //! @param expires unix timestamp after which a failure should be
-      //!                reported if sending was unsuccessful
-      //! @return        success if the message has been pushed through the wire,
-      //!                failure otherwise
-      //------------------------------------------------------------------------
-      Status Send( const URL &url,
-                   Message   *msg,
-                   bool       stateful,
-                   time_t     expires );
-
-      //------------------------------------------------------------------------
       //! Send the message asynchronously - the message is inserted into the
       //! send queue and a listener is called when the message is succesfsully
       //! pushed through the wire or when the timeout elapses
@@ -114,48 +99,18 @@ namespace XrdCl
       //! @return              success if the message was successfully inserted
       //!                      into the send queues, failure otherwise
       //------------------------------------------------------------------------
-      Status Send( const URL            &url,
-                   Message              *msg,
-                   OutgoingMsgHandler   *handler,
-                   bool                  stateful,
-                   time_t                expires );
+      XRootDStatus Send( const URL    &url,
+                         Message      *msg,
+                         MsgHandler   *handler,
+                         bool          stateful,
+                         time_t        expires );
 
       //------------------------------------------------------------------------
       //!
       //------------------------------------------------------------------------
-      Status Redirect( const URL          &url,
-                       Message            *msg,
-                       IncomingMsgHandler *handler);
-
-      //------------------------------------------------------------------------
-      //! Synchronously receive a message - blocks until a message matching
-      //! a filter is found in the incoming queue or the timeout passes
-      //!
-      //! @param url     sender of the message
-      //! @param msg     reference to a message pointer, the pointer will
-      //!                point to the received message
-      //! @param filter  filter object defining what to look for
-      //! @param expires expiration timestamp
-      //! @return        success when the message has been received
-      //!                successfully, failure otherwise
-      //------------------------------------------------------------------------
-      Status Receive( const URL      &url,
-                      Message       *&msg,
-                      MessageFilter *filter,
-                      time_t         expires );
-
-      //------------------------------------------------------------------------
-      //! Listen to incoming messages, the listener is notified when a new
-      //! message arrives and when the timeout passes
-      //!
-      //! @param url     sender of the message
-      //! @param handler handler to be notified about new messages
-      //! @param expires expiration timestamp
-      //! @return        success when the listener has been inserted correctly
-      //------------------------------------------------------------------------
-      Status Receive( const URL          &url,
-                      IncomingMsgHandler *handler,
-                      time_t              expires );
+      Status Redirect( const URL  &url,
+                       Message    *msg,
+                       MsgHandler *handler);
 
       //------------------------------------------------------------------------
       //! Query the transport handler for a given URL
@@ -185,34 +140,78 @@ namespace XrdCl
       //------------------------------------------------------------------------
       //! Get the task manager object user by the post master
       //------------------------------------------------------------------------
-      TaskManager *GetTaskManager()
-      {
-        return pTaskManager;
-      }
+      TaskManager *GetTaskManager();
 
       //------------------------------------------------------------------------
       //! Get the job manager object user by the post master
       //------------------------------------------------------------------------
-      JobManager *GetJobManager()
-      {
-        return pJobManager;
-      }
+      JobManager *GetJobManager();
 
       //------------------------------------------------------------------------
       //! Shut down a channel
       //------------------------------------------------------------------------
       Status ForceDisconnect( const URL &url );
 
+      //------------------------------------------------------------------------
+      //! Shut down a channel
+      //------------------------------------------------------------------------
+      Status ForceDisconnect( const URL &url, bool hush );
+
+      //------------------------------------------------------------------------
+      //! Reconnect the channel
+      //------------------------------------------------------------------------
+      Status ForceReconnect( const URL &url );
+
+      //------------------------------------------------------------------------
+      //! Get the number of connected data streams
+      //------------------------------------------------------------------------
+      uint16_t NbConnectedStrm( const URL &url );
+
+      //------------------------------------------------------------------------
+      //! Set the on-connect handler for data streams
+      //------------------------------------------------------------------------
+      void SetOnDataConnectHandler( const URL            &url,
+                                    std::shared_ptr<Job>  onConnJob );
+
+      //------------------------------------------------------------------------
+      //! Set the global connection error handler
+      //------------------------------------------------------------------------
+      void SetOnConnectHandler( std::unique_ptr<Job> onConnJob );
+
+      //------------------------------------------------------------------------
+      //! Set the global on-error on-connect handler for control streams
+      //------------------------------------------------------------------------
+      void SetConnectionErrorHandler( std::function<void( const URL&, const XRootDStatus& )> handler );
+
+      //------------------------------------------------------------------------
+      //! Notify the global on-connect handler
+      //------------------------------------------------------------------------
+      void NotifyConnectHandler( const URL &url );
+
+      //------------------------------------------------------------------------
+      //! Notify the global error connection handler
+      //------------------------------------------------------------------------
+      void NotifyConnErrHandler( const URL &url, const XRootDStatus &status );
+
+      //------------------------------------------------------------------------
+      //! Collapse channel URL - replace the URL of the channel
+      //------------------------------------------------------------------------
+      void CollapseRedirect( const URL &oldurl, const URL &newURL );
+
+      //------------------------------------------------------------------------
+      //! Decrement file object instance count bound to this channel
+      //------------------------------------------------------------------------
+      void DecFileInstCnt( const URL &url );
+
+      //------------------------------------------------------------------------
+      //! @return : true if underlying threads are running, false otherwise
+      //------------------------------------------------------------------------
+      bool IsRunning();
+
     private:
       Channel *GetChannel( const URL &url );
 
-      typedef std::map<std::string, Channel*> ChannelMap;
-      Poller           *pPoller;
-      TaskManager      *pTaskManager;
-      ChannelMap        pChannelMap;
-      XrdSysMutex       pChannelMapMutex;
-      bool              pInitialized;
-      JobManager       *pJobManager;
+      std::unique_ptr<PostMasterImpl> pImpl;
   };
 }
 

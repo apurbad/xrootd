@@ -20,6 +20,9 @@
 #include "XrdCl/XrdClInQueue.hh"
 #include "XrdCl/XrdClPostMasterInterfaces.hh"
 #include "XrdCl/XrdClMessage.hh"
+#include "XrdCl/XrdClLog.hh"
+#include "XrdCl/XrdClDefaultEnv.hh"
+#include "XrdCl/XrdClConstants.hh"
 
 #include <arpa/inet.h>              // for network unmarshalling stuff
 
@@ -28,116 +31,48 @@ namespace XrdCl
   //----------------------------------------------------------------------------
   // Filter messages
   //----------------------------------------------------------------------------
-  bool InQueue::DiscardMessage(Message* msg, uint16_t& sid) const
+  bool InQueue::DiscardMessage( Message& msg, uint16_t& sid) const
   {
-    if( msg->GetSize() < 8 )
+    if( msg.GetSize() < 8 )
       return true;
 
-    ServerResponse *rsp = (ServerResponse *)msg->GetBuffer();
+    ServerResponse *rsp = (ServerResponse *)msg.GetBuffer();
 
-    // We got an async message
+    // We only care about async responses, but those are extracted now
+    // in the SocketHandler
     if( rsp->hdr.status == kXR_attn )
-    {
-      if( msg->GetSize() < 12 )
-	return true;
-
-      // We only care about async responses
-      if( rsp->body.attn.actnum != (int32_t)htonl(kXR_asynresp) )
-	return true;
-
-      if( msg->GetSize() < 24 )
-	return true;
-
-      ServerResponse *embRsp = (ServerResponse*)msg->GetBuffer(16);
-      sid = ((uint16_t)embRsp->hdr.streamid[1] << 8) | (uint16_t)embRsp->hdr.streamid[0];
-    }
+      return true;
     else
-    {
       sid = ((uint16_t)rsp->hdr.streamid[1] << 8) | (uint16_t)rsp->hdr.streamid[0];
-    }
 
     return false;
   }
 
   //----------------------------------------------------------------------------
-  // Add a message to the queue
-  //----------------------------------------------------------------------------
-  bool InQueue::AddMessage( Message *msg )
-  {
-    uint16_t            action  = 0;
-    IncomingMsgHandler* handler = 0;
-    uint16_t msgSid = 0;
-
-    if (DiscardMessage(msg, msgSid))
-    {
-      return true;
-    }
-
-    // Lookup the sid in the map of handlers
-    pMutex.Lock();
-    HandlerMap::iterator it = pHandlers.find(msgSid);
-
-    if (it != pHandlers.end())
-    {
-      handler = it->second.first;
-      action  = handler->Examine( msg );
-
-      if( action & IncomingMsgHandler::RemoveHandler )
-        pHandlers.erase( it );
-    }
-
-    if( !(action & IncomingMsgHandler::Take) )
-      pMessages[msgSid] = msg;
-
-    pMutex.UnLock();
-
-    if( handler && !(action & IncomingMsgHandler::NoProcess) )
-      handler->Process( msg );
-
-    return true;
-  }
-
-  //----------------------------------------------------------------------------
   // Add a listener that should be notified about incoming messages
   //----------------------------------------------------------------------------
-  void InQueue::AddMessageHandler( IncomingMsgHandler *handler, time_t expires )
+  void InQueue::AddMessageHandler( MsgHandler *handler, bool &rmMsg )
   {
-    uint16_t action = 0;
     uint16_t handlerSid = handler->GetSid();
     XrdSysMutexHelper scopedLock( pMutex );
-    MessageMap::iterator it = pMessages.find(handlerSid);
 
-    if (it != pMessages.end())
-    {
-      action = handler->Examine( it->second );
-
-      if( action & IncomingMsgHandler::Take )
-      {
-        if( !(action & IncomingMsgHandler::NoProcess ) )
-          handler->Process( it->second );
-
-        pMessages.erase( it );
-      }
-    }
-
-    if( !(action & IncomingMsgHandler::RemoveHandler) )
-      pHandlers[handlerSid] = HandlerAndExpire( handler, expires );
+    pHandlers[handlerSid] = HandlerAndExpire( handler, 0 );
   }
 
   //----------------------------------------------------------------------------
   // Get a message handler interested in receiving message whose header
   // is stored in msg
   //----------------------------------------------------------------------------
-  IncomingMsgHandler *InQueue::GetHandlerForMessage( Message  *msg,
-						     time_t   &expires,
-						     uint16_t &action )
+  MsgHandler *InQueue::GetHandlerForMessage( std::shared_ptr<Message> &msg,
+						                                 time_t                   &expires,
+						                                 uint16_t                 &action )
   {
     time_t   exp = 0;
     uint16_t act = 0;
     uint16_t msgSid = 0;
-    IncomingMsgHandler* handler = 0;
+    MsgHandler* handler = 0;
 
-    if (DiscardMessage(msg, msgSid))
+    if (DiscardMessage(*msg, msgSid))
     {
       return handler;
     }
@@ -147,12 +82,25 @@ namespace XrdCl
 
     if (it != pHandlers.end())
     {
+      Log *log = DefaultEnv::GetLog();
       handler = it->second.first;
       act     = handler->Examine( msg );
+      if( it->second.second == 0 ) {
+        it->second.second = handler->GetExpiration();
+        log->Debug( ExDbgMsg, "[handler: %p] Assigned expiration %lld.",
+                    (void*)handler, (long long)it->second.second );
+      }
       exp     = it->second.second;
+      log->Debug( ExDbgMsg, "[msg: %p] Assigned MsgHandler: %p.",
+                  (void*)msg.get(), (void*)handler );
 
-      if( act & IncomingMsgHandler::RemoveHandler )
+
+      if( act & MsgHandler::RemoveHandler )
+      {
         pHandlers.erase( it );
+        log->Debug( ExDbgMsg, "[handler: %p] Removed MsgHandler: %p from the in-queue.",
+                    (void*)handler, (void*)handler );
+      }
     }
 
     if( handler )
@@ -167,7 +115,7 @@ namespace XrdCl
   //----------------------------------------------------------------------------
   // Re-insert the handler without scanning the cached messages
   //----------------------------------------------------------------------------
-  void InQueue::ReAddMessageHandler( IncomingMsgHandler *handler,
+  void InQueue::ReAddMessageHandler( MsgHandler *handler,
 				     time_t              expires )
   {
     uint16_t handlerSid = handler->GetSid();
@@ -178,27 +126,30 @@ namespace XrdCl
   //----------------------------------------------------------------------------
   // Remove a listener
   //----------------------------------------------------------------------------
-  void InQueue::RemoveMessageHandler( IncomingMsgHandler *handler )
+  void InQueue::RemoveMessageHandler( MsgHandler *handler )
   {
     uint16_t handlerSid = handler->GetSid();
     XrdSysMutexHelper scopedLock( pMutex );
     pHandlers.erase(handlerSid);
+    Log *log = DefaultEnv::GetLog();
+    log->Debug( ExDbgMsg, "[handler: %p] Removed MsgHandler: %p from the in-queue.",
+                (void*)handler, (void*)handler );
+
   }
 
   //----------------------------------------------------------------------------
   // Report an event to the handlers
   //----------------------------------------------------------------------------
-  void InQueue::ReportStreamEvent( IncomingMsgHandler::StreamEvent event,
-				   uint16_t                        streamNum,
-				   Status                          status )
+  void InQueue::ReportStreamEvent( MsgHandler::StreamEvent event,
+				   XRootDStatus                    status )
   {
     uint8_t action = 0;
     XrdSysMutexHelper scopedLock( pMutex );
     for( HandlerMap::iterator it = pHandlers.begin(); it != pHandlers.end(); )
     {
-      action = it->second.first->OnStreamEvent( event, streamNum, status );
+      action = it->second.first->OnStreamEvent( event, status );
 
-      if( action & IncomingMsgHandler::RemoveHandler )
+      if( action & MsgHandler::RemoveHandler )
       {
         auto next = it; ++next;
         pHandlers.erase( it );
@@ -221,16 +172,40 @@ namespace XrdCl
     HandlerMap::iterator it = pHandlers.begin();
     while( it != pHandlers.end() )
     {
-      if( it->second.second <= now )
+      if( it->second.second && it->second.second <= now )
       {
-        it->second.first->OnStreamEvent( IncomingMsgHandler::Timeout, 0,
+        uint8_t act = it->second.first->OnStreamEvent( MsgHandler::Timeout,
                                          Status( stError, errOperationExpired ) );
         auto next = it; ++next;
-        pHandlers.erase( it );
+        if( act & MsgHandler::RemoveHandler )
+          pHandlers.erase( it );
         it = next;
       }
       else
         ++it;
     }
   }
+
+  //----------------------------------------------------------------------------
+  // Query the handler and extract the expiration time
+  //----------------------------------------------------------------------------
+  void InQueue::AssignTimeout( MsgHandler *handler )
+  {
+    uint16_t handlerSid = handler->GetSid();
+    XrdSysMutexHelper scopedLock( pMutex );
+    HandlerMap::iterator it = pHandlers.find( handlerSid );
+    if( it != pHandlers.end() )
+    {
+      if( it->second.second == 0 )
+      {
+        it->second.second   = handler->GetExpiration();
+
+        Log *log = DefaultEnv::GetLog();
+        log->Debug( ExDbgMsg, "[handler: %p] Assigned expiration %lld.",
+                    (void*)handler, (long long)it->second.second );
+
+      }
+    }
+  }
+
 }

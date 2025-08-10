@@ -30,7 +30,7 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <stdlib.h>
+#include <cstdlib>
 #include <sys/uio.h>
 
 #include "XrdCms/XrdCmsProtocol.hh"
@@ -75,6 +75,7 @@ void  BegAds();
 bool  CheckVNid(const char *xNid);
 int   Con2Ads(const char *pname);
 int   do_Login();
+void  do_Perf(bool alert=false);
 void  do_RmDid(int dotrim=0);
 void  do_RmDud(int dotrim=0);
 

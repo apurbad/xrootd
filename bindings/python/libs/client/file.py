@@ -44,10 +44,11 @@ class File(object):
     return self
 
   def __next__(self):
-    return self.__file.next()
+    return self.__file.__next__()
 
   # Python 2 compatibility
-  next = __next__
+  def next(self):
+    return self.__file.next()
 
   def open(self, url, flags=0, mode=0, timeout=0, callback=None):
     """Open the file pointed to by the given URL.
@@ -76,8 +77,8 @@ class File(object):
               object and None
 
     As of Python 2.5, you can avoid having to call this method explicitly if you
-    use the :keyword:`with` statement.  For example, the following code will
-    automatically close *f* when the :keyword:`with` block is exited::
+    use the `with` statement.  For example, the following code will
+    automatically close *f* when the `with` block is exited::
 
       from __future__ import with_statement # This isn't required in Python 2.6
 
@@ -291,3 +292,62 @@ class File(object):
     :type  name: string
     """
     return self.__file.get_property(name)
+
+  def set_xattr(self, attrs, timeout=0, callback=None):
+    """Set extended file attributes.
+
+    :param attrs: extended attributes to be set on the file
+    :type  attrs: list of tuples of name/value pairs
+    :returns:     tuple containing :mod:`XRootD.client.responses.XRootDStatus`
+                  object and :mod:`list of touples (string, XRootD.client.responses.XRootDStatus)` object
+    """
+    if callback:
+      callback = CallbackWrapper(callback, list)
+      return XRootDStatus(self.__file.set_xattr(attrs, timeout, callback))
+
+    status, response = self.__file.set_xattr(attrs, timeout)
+    return XRootDStatus(status), response
+
+  def get_xattr(self, attrs, timeout=0, callback=None):
+    """Get extended file attributes.
+
+    :param attrs: list of extended attribute names to be retrived
+    :type  attrs: list of strings
+    :returns:     tuple containing :mod:`XRootD.client.responses.XRootDStatus`
+                  object and :mod:`list of touples (string, string, XRootD.client.responses.XRootDStatus)` object
+    """
+    if callback:
+      callback = CallbackWrapper(callback, list)
+      return XRootDStatus(self.__file.get_xattr(attrs, timeout, callback))
+
+    status, response = self.__file.get_xattr(attrs, timeout)
+    return XRootDStatus(status), response
+
+  def del_xattr(self, attrs, timeout=0, callback=None):
+    """Delete extended file attributes.
+
+    :param attrs: list of extended attribute names to be deleted
+    :type  attrs: list of strings
+    :returns:     tuple containing :mod:`XRootD.client.responses.XRootDStatus`
+                  object and :mod:`list of touples (string, XRootD.client.responses.XRootDStatus)` object
+    """
+    if callback:
+      callback = CallbackWrapper(callback, list)
+      return XRootDStatus(self.__file.del_xattr(attrs, timeout, callback))
+
+    status, response = self.__file.del_xattr(attrs, timeout)
+    return XRootDStatus(status), response
+
+  def list_xattr(self, timeout=0, callback=None):
+    """List all extended file attributes.
+
+    :returns:     tuple containing :mod:`XRootD.client.responses.XRootDStatus`
+                  object and :mod:`list of touples (string, string, XRootD.client.responses.XRootDStatus)` object
+    """
+    if callback:
+      callback = CallbackWrapper(callback, list)
+      return XRootDStatus(self.__file.list_xattr(timeout, callback))
+
+    status, response = self.__file.list_xattr(timeout)
+    return XRootDStatus(status), response
+

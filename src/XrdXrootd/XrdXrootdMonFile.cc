@@ -28,7 +28,7 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <string.h>
+#include <cstring>
 
 #include "Xrd/XrdScheduler.hh"
 
@@ -44,15 +44,16 @@
 
 namespace XrdXrootdMonInfo
 {
-extern long long mySID;
+extern XrdScheduler *Sched;
+extern XrdSysError  *eDest;
+extern long long     mySID;
+extern int32_t       startTime;
 }
 
 /******************************************************************************/
 /*                        S t a t i c   M e m b e r s                         */
 /******************************************************************************/
                           
-XrdSysError         *XrdXrootdMonFile::eDest    = 0;
-XrdScheduler        *XrdXrootdMonFile::Sched    = 0;
 XrdSysMutex          XrdXrootdMonFile::bfMutex;
 XrdSysMutex          XrdXrootdMonFile::fmMutex;
 XrdXrootdMonFMap     XrdXrootdMonFile::fmMap[XrdXrootdMonFMap::mapNum];
@@ -70,6 +71,7 @@ int                  XrdXrootdMonFile::repTime  = 0;
 int                  XrdXrootdMonFile::fmHWM    =-1;
 int                  XrdXrootdMonFile::crecSize = 0;
 int                  XrdXrootdMonFile::xfrCnt   = 0;
+int                  XrdXrootdMonFile::fBsz    = 65472;
 int                  XrdXrootdMonFile::xfrRem   = 0;
 XrdXrootdMonFileXFR  XrdXrootdMonFile::xfrRec;
 short                XrdXrootdMonFile::crecNLen = 0;
@@ -173,7 +175,7 @@ void XrdXrootdMonFile::Close(XrdXrootdFileStats *fsP, bool isDisc)
 /*                              D e f a u l t s                               */
 /******************************************************************************/
   
-void XrdXrootdMonFile::Defaults(int intv, int opts, int xfrcnt)
+void XrdXrootdMonFile::Defaults(int intv, int opts, int xfrcnt, int fbsz)
 {
 
 // Set the reporting interval and I/O counter
@@ -181,6 +183,7 @@ void XrdXrootdMonFile::Defaults(int intv, int opts, int xfrcnt)
    repTime = intv;
    xfrCnt  = xfrcnt;
    xfrRem  = xfrcnt;
+   fBsz   =  (fbsz <= 0 ? 65472 : fbsz);
 
 // Expand out the options
 //
@@ -239,7 +242,7 @@ void XrdXrootdMonFile::DoIt()
 
 // Reschedule ourselves
 //
-   XrdXrootdMonitor::Sched->Schedule((XrdJob *)this, time(0)+repTime);
+   XrdXrootdMonInfo::Sched->Schedule((XrdJob *)this, time(0)+repTime);
 }
 
 /******************************************************************************/
@@ -318,21 +321,16 @@ void XrdXrootdMonFile::DoXFR(XrdXrootdFileStats *fsP)
 /*                                  I n i t                                   */
 /******************************************************************************/
   
-bool XrdXrootdMonFile::Init(XrdScheduler *sp, XrdSysError  *errp, int bfsz)
+bool XrdXrootdMonFile::Init()
 {
    XrdXrootdMonFile *mfP;
    int alignment, pagsz = getpagesize();
 
-// Set the variables
-//
-   Sched = sp;
-   eDest = errp;
-
 // Allocate a socket buffer
 //
-   alignment = (bfsz < pagsz ? 1024 : pagsz);
-   if (posix_memalign((void **)&repBuff, alignment, bfsz))
-      {eDest->Emsg("MonFile", "Unable to allocate monitor buffer.");
+   alignment = (fBsz < pagsz ? 1024 : pagsz);
+   if (posix_memalign((void **)&repBuff, alignment, fBsz))
+      {XrdXrootdMonInfo::eDest->Emsg("MonFile", "Unable to allocate monitor buffer.");
        return false;
       }
 
@@ -341,7 +339,7 @@ bool XrdXrootdMonFile::Init(XrdScheduler *sp, XrdSysError  *errp, int bfsz)
    repHdr = (XrdXrootdMonHeader *)repBuff;
    repHdr->code = XROOTD_MON_MAPFSTA;
    repHdr->pseq = 0;
-   repHdr->stod = XrdXrootdMonitor::startTime;
+   repHdr->stod = XrdXrootdMonInfo::startTime;
 
 // Set the time record (always present)
 //
@@ -357,7 +355,7 @@ bool XrdXrootdMonFile::Init(XrdScheduler *sp, XrdSysError  *errp, int bfsz)
 
 // Calculate the end nut the next slot always starts with a null pointer
 //
-   repLast = repBuff+bfsz-1;
+   repLast = repBuff+fBsz-1;
    repNext = 0;
 
 // Calculate the close record size and the initial flags
@@ -389,7 +387,7 @@ bool XrdXrootdMonFile::Init(XrdScheduler *sp, XrdSysError  *errp, int bfsz)
 
 // Schedule an the flushes
 //
-   XrdXrootdMonitor::Sched->Schedule((XrdJob *)mfP, time(0)+repTime);
+   XrdXrootdMonInfo::Sched->Schedule((XrdJob *)mfP, time(0)+repTime);
    return true;
 }
   
@@ -420,7 +418,7 @@ void XrdXrootdMonFile::Flush() // The bfMutex must be locked
 
 // Write this out
 //
-   XrdXrootdMonitor::Send(XROOTD_MON_FSTA, repBuff, bfSize);
+   XrdXrootdMonitor::Send(XROOTD_MON_FSTA, repBuff, bfSize, false);
    repTOD->tBeg = repTOD->tEnd;
    xfrRecs = totRecs = 0;
 }

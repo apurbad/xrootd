@@ -28,7 +28,7 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <string.h>
+#include <cstring>
 
 #include "XrdBwm/XrdBwmPolicy1.hh"
 
@@ -111,7 +111,7 @@ int  XrdBwmPolicy1::Done(int rHandle)
   
 int  XrdBwmPolicy1::Schedule(char *RespBuff, int RespSize, SchedParms &Parms)
 {
-   static const char *theWay[] = {"Incomming", "Outgoing"};
+   static const char *theWay[] = {"Incoming", "Outgoing"};
    refReq *rP;
    int myID;
 

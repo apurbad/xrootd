@@ -30,9 +30,9 @@
 //  Test program for XrdSecgsi
 //
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 
 #include <sys/types.h>
 #include <pwd.h>
@@ -62,7 +62,7 @@
 //
 // Globals 
 
-// #define PRINT(x) {cerr <<x <<endl;}
+// #define PRINT(x) {std::cerr <<x <<std::endl;}
 XrdCryptoFactory *gCryptoFactory = 0;
 
 XrdOucString EEcert = "";
@@ -87,7 +87,11 @@ static void pdots(const char *t, bool ok = 1)
    unsigned int i = 0;
    unsigned int l = (t) ? strlen (t) : 0;
    unsigned int np = PRTWIDTH - l - 8;
-   printf("|| %s ", t);
+   if (l > 0) {
+      printf("|| %s ", t);
+   } else {
+      printf("||  ");
+   }
    for (; i < np ; i++) { printf("."); }
    printf("  %s\n", (ok ? "PASSED" : "FAILED"));
 }
@@ -256,6 +260,10 @@ int main( int argc, char **argv )
       exit(1);
    }
 
+   // use recreated proxy certificate if it a proxy was not already set
+   if (!xPX)
+     xPX = xPXp;
+
    //
    pline("");
    pline("Load CA certificates");
@@ -276,6 +284,8 @@ int main( int argc, char **argv )
          pdots("Loading CA certificate", 1);
       } else {
          pdots("Loading CA certificate", 0);
+         rCAfound = 0;
+         break;
       }
       // Check if self-signed
       if (!strcmp(xCA[nCA]->IssuerHash(), xCA[nCA]->SubjectHash())) {
@@ -294,7 +304,7 @@ int main( int argc, char **argv )
    XrdCryptoRSA *key = 0;
    XrdCryptoX509Chain *chain = new XrdCryptoX509Chain();
    if (ParseFile) {
-      int nci = (*ParseFile)(PXcert.c_str(), chain);
+      int nci = (*ParseFile)(PXcert.c_str(), chain, 0);
       if (!(key = chain->Begin()->PKI())) {
          pdots("getting PKI", 0);
       }
@@ -325,7 +335,7 @@ int main( int argc, char **argv )
    pline("Testing ExportChain");
    XrdCryptoX509ExportChain_t ExportChain = gCryptoFactory->X509ExportChain();
    XrdSutBucket *chainbck = 0;
-   if (ExportChain) {
+   if (ExportChain && chain->End()) {
       chainbck = (*ExportChain)(chain, 0);
       pdots("Attach to X509ExportChain", 1);
    } else {

@@ -25,10 +25,10 @@
 #ifndef __XRD_CL_LOG_HH__
 #define __XRD_CL_LOG_HH__
 
-#include <stdarg.h>
+#include <cstdarg>
 #include <string>
 #include <map>
-#include <stdint.h>
+#include <cstdint>
 #include "XrdSys/XrdSysPthread.hh"
 
 //------------------------------------------------------------------------------
@@ -38,9 +38,7 @@
 // and the visibility is relatively undefined. However, we know the stores are
 // at least atomic.
 //------------------------------------------------------------------------------
-#if __cplusplus >= 201103L
 #include <atomic>
-#endif
 
 namespace XrdCl
 {
@@ -79,6 +77,7 @@ namespace XrdCl
       //------------------------------------------------------------------------
       void Close();
       virtual void Write( const std::string &message );
+
     private:
       int pFileDes;
   };
@@ -136,33 +135,53 @@ namespace XrdCl
       //------------------------------------------------------------------------
       //! Report an error
       //------------------------------------------------------------------------
-      void Error( uint64_t topic, const char *format, ... );
+      void Error( uint64_t topic, const char *format, ... )
+#if defined(__GNUC__)
+        __attribute__ ((__format__ (__printf__, 3, 4)))
+#endif
+        ;
 
       //------------------------------------------------------------------------
       //! Report a warning
       //------------------------------------------------------------------------
-      void Warning( uint64_t topic, const char *format, ... );
+      void Warning( uint64_t topic, const char *format, ... )
+#if defined(__GNUC__)
+        __attribute__ ((__format__ (__printf__, 3, 4)))
+#endif
+        ;
 
       //------------------------------------------------------------------------
       //! Print an info
       //------------------------------------------------------------------------
-      void Info( uint64_t topic, const char *format, ... );
+      void Info( uint64_t topic, const char *format, ... )
+#if defined(__GNUC__)
+        __attribute__ ((__format__ (__printf__, 3, 4)))
+#endif
+        ;
 
       //------------------------------------------------------------------------
       //! Print a debug message
       //------------------------------------------------------------------------
-      void Debug( uint64_t topic, const char *format, ... );
+      void Debug( uint64_t topic, const char *format, ... )
+#if defined(__GNUC__)
+        __attribute__ ((__format__ (__printf__, 3, 4)))
+#endif
+        ;
 
       //------------------------------------------------------------------------
       //! Print a dump message
       //------------------------------------------------------------------------
-      void Dump( uint64_t topic, const char *format, ... );
+      void Dump( uint64_t topic, const char *format, ... )
+#if defined(__GNUC__)
+        __attribute__ ((__format__ (__printf__, 3, 4)))
+#endif
+        ;
 
       //------------------------------------------------------------------------
       //! Always print the message
       //!
       //! @param level  log level
-      //! @param type   topic of the message
+      //! @param topic  topic of the message
       //! @param format format string - the same as in printf
       //! @param list   list of arguments
       //------------------------------------------------------------------------
@@ -222,17 +241,24 @@ namespace XrdCl
       //------------------------------------------------------------------------
       void SetTopicName( uint64_t topic, std::string name );
 
+
+      //------------------------------------------------------------------------
+      //! Register new topic
+      //------------------------------------------------------------------------
+      inline uint64_t RegisterTopic( const std::string &topic )
+      {
+        uint64_t tpcnb = pTopicMap.rbegin()->first << 1;
+        SetTopicName( tpcnb, topic );
+        return tpcnb;
+      }
+
       //------------------------------------------------------------------------
       //! Get the log level
       //------------------------------------------------------------------------
       LogLevel GetLevel() const
       {
-#if __cplusplus >= 201103L
         LogLevel lvl = pLevel.load(std::memory_order_relaxed);
         return lvl;
-#else
-        return pLevel;
-#endif
       }
 
       //------------------------------------------------------------------------
@@ -249,11 +275,8 @@ namespace XrdCl
       bool StringToLogLevel( const std::string &strLevel, LogLevel &level );
       std::string TopicToString( uint64_t topic );
 
-#if __cplusplus >= 201103L
       std::atomic<LogLevel> pLevel;
-#else
-      LogLevel    pLevel;
-#endif
+
       uint64_t    pMask[DumpMsg+1];
       LogOut     *pOutput;
       TopicMap    pTopicMap;

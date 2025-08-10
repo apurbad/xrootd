@@ -29,17 +29,18 @@
 /******************************************************************************/
 
 #include <unistd.h>
-#include <errno.h>
+#include <cerrno>
 #include <fcntl.h>
-#include <stdio.h>
+#include <cstdio>
 #include <strings.h>
-#include <time.h>
+#include <ctime>
 #include <utime.h>
 #include <sys/param.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 
 #include "XrdSys/XrdSysHeaders.hh"
+#include "XrdSys/XrdSysPlatform.hh"
 #include "XrdOss/XrdOssApi.hh"
 #include "XrdOss/XrdOssCache.hh"
 #include "XrdOss/XrdOssConfig.hh"
@@ -122,7 +123,6 @@ int XrdOssSys::Stat(const char *path, struct stat *buff, int opts,
 //
    if ((retc = MSS_Stat(remote_path, buff))) return retc;
    if (popts & XRDEXP_NOTRW) buff->st_mode &= ro_Mode;
-   buff->st_mode |= S_IFBLK;
    return XrdOssOK;
 }
 
@@ -212,7 +212,7 @@ int XrdOssSys::StatFS(const char *path, unsigned long long &Opt,
 /******************************************************************************/
 
 /*
-  Function: Return free space information based on a cahe group name.
+  Function: Return free space information based on a cache group name.
 
   Input:    Env         - Is the environment for cgi info.
             path        - Is the path name.
@@ -231,7 +231,7 @@ int XrdOssSys::StatLS(XrdOucEnv &env, const char *path, char *buff, int &blen)
    char *cgrp, cgbuff[XrdOssSpace::minSNbsz];
    int retc;
 
-// We provide psuedo support whould be not have a cache
+// We provide pseudo support whould be not have a cache
 //
    if (!XrdOssCache_Group::fsgroups)
       {unsigned long long Opt;
@@ -243,7 +243,7 @@ int XrdOssSys::StatLS(XrdOucEnv &env, const char *path, char *buff, int &blen)
        return XrdOssOK;
       }
 
-// Find the cache group. We provide psuedo support should we not have a cache
+// Find the cache group. We provide pseudo support should we not have a cache
 //
    if (!(cgrp = env.Get(OSS_CGROUP)))
       {if ((retc = getCname(path, &sbuff, cgbuff))) return retc;
@@ -273,15 +273,53 @@ int XrdOssSys::StatLS(XrdOucEnv &env, const char *path, char *buff, int &blen)
   Output:   Returns XrdOssOK upon success and -errno upon failure.
 */
 
-int XrdOssSys::StatPF(const char *path, struct stat *buff)
+int XrdOssSys::StatPF(const char *path, struct stat *buff, int opts)
 {
+   char lcl_path[MAXPATHLEN+1];
    int retc;
 
-// Stat the file in the local filesystem. Return result.
+// If just the maximum values wanted then we can return these right away
 //
-   retc = (STT_Func ? (*STT_Func)(path, buff, XRDOSS_resonly, 0) :
-                            stat (path, buff));
-   return (retc ? (errno ? -errno : -ENOMSG) : XrdOssOK);
+   if (opts & PF_dNums)
+      {XrdOssCache::DevInfo(*buff, true);
+       return 0;
+      }
+
+// Check if path is nil and do he appropriate thing
+//
+   if (!path)
+      {if (opts & PF_dInfo) XrdOssCache::DevInfo(*buff, false);
+          else return -EINVAL;
+       return 0;
+      }
+
+// Check if we should do lfn2pfn conversion (previously we didn't allow it)
+//
+   if (lcl_N2N && (opts & PF_isLFN))
+      {if ((retc = lcl_N2N->lfn2pfn(path, lcl_path, sizeof(lcl_path))))
+          return retc;
+       path = lcl_path;
+      }
+
+// We no longer use the custom stat plug-in for this function. It never
+// worked in the first place, anyway.
+//
+   if (stat(path, buff)) return (errno ? -errno : -ENOMSG);
+
+// Check of general stat information is to be returned
+//
+   if (opts %  PF_dStat)
+      {buff->st_rdev = 0;
+       return XrdOssOK;
+      }
+
+// Check if device info is to be returned
+//
+   if (opts & PF_dInfo) XrdOssCache::DevInfo(*buff);
+
+// All done
+//
+   return XrdOssOK;
 }
   
 /******************************************************************************/
@@ -300,7 +338,8 @@ int XrdOssSys::StatPF(const char *path, struct stat *buff)
 
 int XrdOssSys::StatVS(XrdOssVSInfo *sP, const char *sname, int updt)
 {
-   XrdOssCache_Space   CSpace;
+   XrdOssCache_Space CSpace;
+   XrdOssVSPart **vsP;
 
 // Check if we should update the statistics
 //
@@ -320,9 +359,17 @@ int XrdOssSys::StatVS(XrdOssVSInfo *sP, const char *sname, int updt)
        return XrdOssOK;
       }
 
+// Check if partition table wanted
+//
+   if (*sname != '+') vsP = 0;
+      else {sname++;
+            vsP = &(sP->vsPart);
+           }
+
 // Get the space stats
 //
-   if (!(sP->Extents=XrdOssCache_FS::getSpace(CSpace,sname))) return -ENOENT;
+   if (!(sP->Extents=XrdOssCache_FS::getSpace(CSpace, sname, vsP)))
+      return -ENOENT;
 
 // Return the result
 //
@@ -421,13 +468,13 @@ int XrdOssSys::getCname(const char *path, struct stat *sbuff, char *cgbuff)
 
 // Get regular stat informtion for this file
 //
-   if ((retc = stat(thePath, sbuff))) return retc;
+   if ((retc = stat(thePath, sbuff))) return -errno;
 
 // Now determine if we should get the cache group name. There is none
 // for offline files and it's always public for directories.
 //
-   if (S_ISDIR(sbuff->st_mode))          strcpy(cgbuff, "public");
-      else if (sbuff->st_mode & S_IFBLK) strcpy(cgbuff, "*");
+   if (S_ISDIR(sbuff->st_mode))         strcpy(cgbuff, "public");
+      else if (S_ISBLK(sbuff->st_mode)) strcpy(cgbuff, "*");
               else XrdOssPath::getCname(thePath, cgbuff);
 
 // All done
@@ -469,7 +516,6 @@ int XrdOssSys::getStats(char *buff, int blen)
                             + stagqsz + stagssz;
 
    XrdOssCache_Group  *fsg = XrdOssCache_Group::fsgroups;
-   XrdOssCache_Space   CSpace;
    OssDPath           *dpP = DPList;
    char *bp = buff;
    int dpNum = 0, spNum = 0, n, flen;
@@ -492,7 +538,8 @@ int XrdOssSys::getStats(char *buff, int blen)
 // Output individual entries
 //
    while(dpP && blen > 0)
-        {XrdOssCache_FS::freeSpace(CSpace, dpP->Path2);
+        {XrdOssCache_Space CSpace;
+         XrdOssCache_FS::freeSpace(CSpace, dpP->Path2);
          flen = snprintf(bp, blen, ptag2, dpNum, dpP->Path1, dpP->Path2,
                                    CSpace.Total>>10, CSpace.Free>>10,
                                    CSpace.Inodes,    CSpace.Inleft);
@@ -514,7 +561,8 @@ int XrdOssSys::getStats(char *buff, int blen)
 // Generate info for each path
 //
    while(fsg && blen > 0)
-        {n = XrdOssCache_FS::getSpace(CSpace, fsg);
+        {XrdOssCache_Space CSpace;
+         n = XrdOssCache_FS::getSpace(CSpace, fsg);
          flen = snprintf(bp, blen, stag2, spNum, fsg->group, CSpace.Total>>10,
                 CSpace.Free>>10, CSpace.Maxfree>>10, n, CSpace.Usage>>10);
          bp += flen; blen -= flen; spNum++;

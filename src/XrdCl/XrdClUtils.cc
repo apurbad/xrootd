@@ -21,6 +21,9 @@
 #include "XrdCl/XrdClDefaultEnv.hh"
 #include "XrdCl/XrdClConstants.hh"
 #include "XrdCl/XrdClCheckSumManager.hh"
+#include "XrdCl/XrdClRedirectorRegistry.hh"
+#include "XrdCl/XrdClMessage.hh"
+#include "XrdCl/XrdClOptimizers.hh"
 #include "XrdNet/XrdNetAddr.hh"
 
 #include <algorithm>
@@ -32,9 +35,17 @@
 #include <locale>
 #include <map>
 #include <string>
+#include <set>
+#include <cctype>
+#include <random>
+#include <chrono>
 
 #include <sys/types.h>
 #include <dirent.h>
+
+#if __cplusplus < 201103L
+#include <ctime>
+#endif
 
 namespace
 {
@@ -131,9 +142,8 @@ namespace XrdCl
                                   Utils::AddressType      type )
   {
     Log *log = DefaultEnv::GetLog();
-    XrdNetAddr *addrs;
-    int         nAddrs = 0;
     const char *err    = 0;
+    int ordn;
 
     //--------------------------------------------------------------------------
     // Resolve all the addresses
@@ -147,22 +157,6 @@ namespace XrdCl
     else if( type == IPAll ) opts = XrdNetUtils::allIPMap;
     else opts = XrdNetUtils::prefAuto;
 
-    err = XrdNetUtils::GetAddrs( o.str().c_str(), &addrs, nAddrs, opts );
-
-    if( err )
-    {
-      log->Error( UtilityMsg, "Unable to resolve %s: %s", o.str().c_str(),
-                  err );
-      return Status( stError, errInvalidAddr );
-    }
-
-    if( nAddrs == 0 )
-    {
-      log->Error( UtilityMsg, "No addresses for %s were found",
-                  o.str().c_str() );
-      return Status( stError, errInvalidAddr );
-    }
-
     //--------------------------------------------------------------------------
     // Check what are the preferences IPv6 or IPv4
     //--------------------------------------------------------------------------
@@ -175,34 +169,62 @@ namespace XrdCl
     // The preferred IP family goes to the back as it is easier to remove
     // items from the back of the vector
     //--------------------------------------------------------------------------
-    std::vector<XrdNetAddr> result( nAddrs );
-    auto itr  = result.begin();
-    auto ritr = result.end() - 1;
+    opts |= (preferIPv4 ? XrdNetUtils::order64 : XrdNetUtils::order46);
 
-    for( int i = 0; i < nAddrs; ++i )
+    //--------------------------------------------------------------------------
+    // Now get all of the properly partitioned addresses; ordn will hold the
+    // number of non-preferred addresses at the front of the table.
+    //--------------------------------------------------------------------------
+    err = XrdNetUtils::GetAddrs( o.str(), addresses, &ordn, opts );
+
+    if( err )
     {
-      bool isIPv4 = addrs[i].isIPType( XrdNetAddrInfo::IPv4 ) ||
-          ( addrs[i].isIPType( XrdNetAddrInfo::IPv6 ) && addrs[i].isMapped() );
+      log->Error( UtilityMsg, "Unable to resolve %s: %s", o.str().c_str(),
+                  err );
+      return Status( stError, errInvalidAddr );
+    }
 
-      auto store = preferIPv4 ?
-                   ( isIPv4 ? ritr-- : itr++ ) :
-                   ( isIPv4 ? itr++ : ritr-- );
-
-      *store = addrs[i];
+    if( addresses.size() == 0 )
+    {
+      log->Error( UtilityMsg, "No addresses for %s were found",
+                  o.str().c_str() );
+      return Status( stError, errInvalidAddr );
     }
 
     //--------------------------------------------------------------------------
     // Shuffle each partition
     //--------------------------------------------------------------------------
-    std::random_shuffle( result.begin(), itr );
-    std::random_shuffle( itr, result.end() );
+
+    int ipNoShuffle = DefaultIPNoShuffle;
+    Env *env = DefaultEnv::GetEnv();
+    env->GetInt( "IPNoShuffle", ipNoShuffle );
+
+    if( !ipNoShuffle )
+    {
+#if __cplusplus < 201103L
+      // initialize the random generator only once
+      static struct only_once_t
+      {
+        only_once_t()
+        {
+          std::srand ( unsigned ( std::time(0) ) );
+        }
+      } only_once;
+
+      std::random_shuffle( addresses.begin(), addresses.begin() + ordn );
+      std::random_shuffle( addresses.begin() + ordn, addresses.end() );
+#else
+      static std::default_random_engine rand_engine(
+          std::chrono::system_clock::now().time_since_epoch().count() );
+
+      std::shuffle( addresses.begin(), addresses.begin() + ordn, rand_engine );
+      std::shuffle( addresses.begin() + ordn, addresses.end(), rand_engine );
+#endif
+    }
 
     //--------------------------------------------------------------------------
-    // Return result through output parameter
+    // Return status as the result is already in the output parameter
     //--------------------------------------------------------------------------
-    addresses.swap( result );
-    delete [] addrs;
-
     return Status();
   }
 
@@ -224,7 +246,7 @@ namespace XrdCl
       addrStr += ", ";
     }
     addrStr.erase( addrStr.length()-2, 2 );
-    log->Debug( type, "[%s] Found %d address(es): %s",
+    log->Debug( type, "[%s] Found %zu address(es): %s",
                       hostId.c_str(), addresses.size(), addrStr.c_str() );
   }
 
@@ -256,15 +278,14 @@ namespace XrdCl
   //----------------------------------------------------------------------------
   XRootDStatus Utils::GetRemoteCheckSum( std::string       &checkSum,
                                          const std::string &checkSumType,
-                                         const std::string &server,
-                                         const std::string &path )
+                                         const URL         &url )
   {
-    FileSystem   *fs = new FileSystem( URL( server ) );
+    FileSystem   *fs = new FileSystem( url );
     // add the 'cks.type' cgi tag in order to
     // select the proper checksum type in case
     // the server supports more than one checksum
-    size_t pos = path.find( '?' );
-    std::string cksPath = path + ( pos == std::string::npos ? '?' : '&' ) + "cks.type=" + checkSumType;
+    size_t pos = url.GetPath().find( '?' );
+    std::string cksPath = url.GetPath() + ( pos == std::string::npos ? '?' : '&' ) + "cks.type=" + checkSumType;
     Buffer        arg; arg.FromString( cksPath );
     Buffer       *cksResponse = 0;
     XRootDStatus  st;
@@ -298,7 +319,7 @@ namespace XrdCl
     checkSum += NormalizeChecksum( elems[0], elems[1] );
 
     log->Dump( UtilityMsg, "Checksum for %s checksum: %s",
-               path.c_str(), checkSum.c_str() );
+               url.GetPath().c_str(), checkSum.c_str() );
 
     return XRootDStatus();
   }
@@ -366,7 +387,7 @@ namespace XrdCl
 
     FileSystem    sourceDSFS( server );
     Buffer        queryArg; queryArg.FromString( "tpc" );
-    Buffer       *queryResponse;
+    Buffer       *queryResponse = 0;
     XRootDStatus  st;
     st = sourceDSFS.Query( QueryCode::Config, queryArg, queryResponse,
                            timeout );
@@ -374,6 +395,13 @@ namespace XrdCl
     {
       log->Error( UtilityMsg, "Cannot query source data server %s: %s",
                   server.c_str(), st.ToStr().c_str() );
+      st.status = stFatal;
+      return st;
+    }
+
+    if( !queryResponse )
+    {
+      log->Error( UtilityMsg, "Cannot query source data server: empty response." );
       st.status = stFatal;
       return st;
     }
@@ -403,7 +431,7 @@ namespace XrdCl
 
     FileSystem    sourceDSFS( server );
     Buffer        queryArg; queryArg.FromString( "tpc tpcdlg" );
-    Buffer       *queryResponse;
+    Buffer       *queryResponse = 0;
     XRootDStatus  st;
     st = sourceDSFS.Query( QueryCode::Config, queryArg, queryResponse,
                            timeout );
@@ -415,13 +443,28 @@ namespace XrdCl
       return st;
     }
 
+    if( !queryResponse )
+    {
+      log->Error( UtilityMsg, "Cannot query source data server: empty response." );
+      st.status = stFatal;
+      return st;
+    }
+
     std::string answer = queryResponse->ToString();
     delete queryResponse;
+
+    if( answer.empty() )
+    {
+      log->Error( UtilityMsg, "Cannot query source data server: empty response." );
+      st.status = stFatal;
+      return st;
+    }
 
     std::vector<std::string> resp;
     Utils::splitString( resp, answer, "\n" );
 
-    if( !isdigit( resp[0][0]) || atoi( resp[0].c_str() ) == 0 )
+    if( resp.empty() || resp[0].empty() ||
+        !isdigit( resp[0][0]) || atoi( resp[0].c_str() ) == 0 )
     {
       log->Debug( UtilityMsg, "Third party copy not supported at: %s",
                   server.c_str() );
@@ -517,6 +560,46 @@ namespace XrdCl
     return Status();
   }
 
+  //------------------------------------------------------------------------
+  //! Process a config directory and return key-value pairs
+  //------------------------------------------------------------------------
+  Status Utils::ProcessConfigDir( std::map<std::string, std::string> &config,
+                                  const std::string                  &dir )
+  {
+    Log *log = DefaultEnv::GetLog();
+    log->Debug( UtilityMsg, "Processing configuration files in %s...",
+                dir.c_str());
+
+    std::vector<std::string> entries;
+    Status st = Utils::GetDirectoryEntries( entries, dir );
+    if( !st.IsOK() )
+    {
+      log->Debug( UtilityMsg, "Unable to process directory %s: %s",
+                  dir.c_str(), st.ToString().c_str() );
+      return st;
+    }
+
+    static const std::string suffix   = ".conf";
+    for( auto &entry : entries )
+    {
+      std::string confFile = dir + "/" + entry;
+
+      if( confFile.length() <= suffix.length() )
+        continue;
+      if( !std::equal( suffix.rbegin(), suffix.rend(), confFile.rbegin() ) )
+        continue;
+
+      st = ProcessConfig( config, confFile );
+      if( !st.IsOK() )
+      {
+        log->Debug( UtilityMsg, "Unable to process configuration file %s: %s",
+                    confFile.c_str(), st.ToString().c_str() );
+      }
+    }
+
+    return Status();
+  }
+
   //----------------------------------------------------------------------------
   // Trim a string
   //----------------------------------------------------------------------------
@@ -536,12 +619,14 @@ namespace XrdCl
                                const char         *format,
                                const PropertyList &list )
   {
-    PropertyList::PropertyMap::const_iterator it;
-    std::string keyVals;
-    for( it = list.begin(); it != list.end(); ++it )
-      keyVals += "'" + it->first + "' = '" + it->second + "', ";
-    keyVals.erase( keyVals.length()-2, 2 );
-    log->Dump( topic, format, keyVals.c_str() );
+    if( unlikely(log->GetLevel() >= Log::DumpMsg) ) {
+      PropertyList::PropertyMap::const_iterator it;
+      std::string keyVals;
+      for (it = list.begin(); it != list.end(); ++it)
+        keyVals += "'" + it->first + "' = '" + obfuscateAuth(it->second) + "', ";
+      keyVals.erase(keyVals.length() - 2, 2);
+      log->Dump(topic, format, keyVals.c_str());
+    }
   }
 
   //----------------------------------------------------------------------------
@@ -572,5 +657,265 @@ namespace XrdCl
       return checksum.substr(i);
     }
     return checksum;
+  }
+
+  //----------------------------------------------------------------------------
+  // Get supported checksum types for given URL
+  //----------------------------------------------------------------------------
+  std::vector<std::string> Utils::GetSupportedCheckSums( const XrdCl::URL &url )
+  {
+    std::vector<std::string> ret;
+
+    FileSystem fs( url );
+    Buffer  arg; arg.FromString( "chksum" );
+    Buffer *resp = 0;
+    XRootDStatus st = fs.Query( QueryCode::Config, arg, resp );
+    if( st.IsOK() )
+    {
+      std::string response = resp->ToString();
+      if( response != "chksum" )
+      {
+        // we are expecting a response of format: '0:zcrc32,1:adler32'
+        std::vector<std::string> result;
+        Utils::splitString( result, response, "," );
+
+        std::vector<std::string>::iterator itr = result.begin();
+        for( ; itr != result.end(); ++itr )
+        {
+          size_t pos = itr->find( ':' );
+          if( pos == std::string::npos ) continue;
+          std::string cksname = itr->substr( pos + 1 );
+          // remove all white spaces
+          cksname.erase( std::remove_if( cksname.begin(), cksname.end(), ::isspace ), 
+                         cksname.end() );
+          ret.push_back( std::move( cksname ) );
+        }
+      }
+    }
+
+    return ret;
+  }
+
+
+  //------------------------------------------------------------------------
+  //! Check if this client can support given EC redirect
+  //------------------------------------------------------------------------
+  bool Utils::CheckEC( const Message *req, const URL &url )
+  {
+#ifdef WITH_XRDEC
+    // make sure that if we will be writing it is a new file
+    ClientRequest *request = (ClientRequest*)req->GetBuffer();
+    uint16_t options = ntohs( request->open.options );
+    bool open_wrt = ( options & kXR_open_updt ) || ( options & kXR_open_wrto );
+    bool open_new = ( options & kXR_new );
+    if( open_wrt && !open_new ) return false;
+
+    const URL::ParamsMap &params = url.GetParams();
+    // make sure all the xrdec. tokens are present and the values are sane
+    URL::ParamsMap::const_iterator itr = params.find( "xrdec.nbdta" );
+    if( itr == params.end() ) return false;
+    size_t nbdta = std::stoul( itr->second );
+
+    itr = params.find( "xrdec.nbprt" );
+    if( itr == params.end() ) return false;
+    size_t nbprt = std::stoul( itr->second );
+
+    itr = params.find( "xrdec.blksz" );
+    if( itr == params.end() ) return false;
+
+    itr = params.find( "xrdec.plgr" );
+    if( itr == params.end() ) return false;
+    std::vector<std::string> plgr;
+    splitString( plgr, itr->second, "," );
+    if( plgr.size() < nbdta + nbprt ) return false;
+
+    itr = params.find( "xrdec.objid" );
+    if( itr == params.end() ) return false;
+
+    itr = params.find( "xrdec.format" );
+    if( itr == params.end() ) return false;
+    size_t format = std::stoul( itr->second );
+    if( format != 1 ) return false; // TODO use constant
+
+    itr = params.find( "xrdec.dtacgi" );
+    if( itr != params.end() )
+    {
+      std::vector<std::string> dtacgi;
+      splitString( dtacgi, itr->second, "," );
+      if( plgr.size() != dtacgi.size() ) return false;
+    }
+
+    itr = params.find( "xrdec.mdtacgi" );
+    if( itr != params.end() )
+    {
+      std::vector<std::string> mdtacgi;
+      splitString( mdtacgi, itr->second, "," );
+      if( plgr.size() != mdtacgi.size() ) return false;
+    }
+
+    itr = params.find( "xrdec.cosc" );
+    if( itr == params.end() ) return false;
+    std::string cosc = itr->second;
+    if( cosc != "true" && cosc != "false" ) return false;
+
+    return true;
+#else
+    return false;
+#endif
+  }
+
+
+  //----------------------------------------------------------------------------
+  //! Automatically infer the right checksum type
+  //----------------------------------------------------------------------------
+  std::string Utils::InferChecksumType( const XrdCl::URL &source,
+                                        const XrdCl::URL &destination,
+                                        bool              zip)
+  {
+    //--------------------------------------------------------------------------
+    // If both files are local we won't be checksumming at all
+    //--------------------------------------------------------------------------
+    if( source.IsLocalFile() && !source.IsMetalink() && destination.IsLocalFile() ) return std::string();
+
+    // checksums supported by local files
+    std::set<std::string> local_supported;
+    local_supported.insert( "adler32" );
+    local_supported.insert( "crc32" );
+    local_supported.insert( "md5" );
+    local_supported.insert( "zcrc32" );
+
+    std::vector<std::string> srccks;
+
+    if( source.IsMetalink() )
+    {
+      int useMtlnCksum = DefaultZipMtlnCksum;
+      Env *env = DefaultEnv::GetEnv();
+      env->GetInt( "ZipMtlnCksum", useMtlnCksum );
+
+      //------------------------------------------------------------------------
+      // In case of ZIP use other checksums than zcrc32 only if the user
+      // requested it explicitly.
+      //------------------------------------------------------------------------
+      if( !zip || ( zip && useMtlnCksum ) )
+      {
+        RedirectorRegistry &registry   = RedirectorRegistry::Instance();
+        VirtualRedirector  *redirector = registry.Get( source );
+        std::vector<std::string> cks = redirector->GetSupportedCheckSums();
+        srccks.insert( srccks.end(), cks.begin(), cks.end() );
+      }
+    }
+
+    if( zip )
+    {
+      //------------------------------------------------------------------------
+      // In case of ZIP we can always extract the checksum from the archive
+      //------------------------------------------------------------------------
+      srccks.push_back( "zcrc32" );
+    }
+    else if( source.GetProtocol() == "root" || source.GetProtocol() == "xroot" )
+    {
+      //------------------------------------------------------------------------
+      // If the source is a remote endpoint query the supported checksums
+      //------------------------------------------------------------------------
+      std::vector<std::string> cks = GetSupportedCheckSums( source );
+      srccks.insert( srccks.end(), cks.begin(), cks.end() );
+    }
+
+    std::vector<std::string> dstcks;
+
+    if( destination.GetProtocol() == "root" ||
+        destination.GetProtocol() == "xroot" )
+    {
+      //------------------------------------------------------------------------
+      // If the destination is a remote endpoint query the supported checksums
+      //------------------------------------------------------------------------
+      std::vector<std::string> cks = GetSupportedCheckSums( destination );
+      dstcks.insert( dstcks.end(), cks.begin(), cks.end() );
+    }
+
+    //--------------------------------------------------------------------------
+    // Now we have all the information we need, we can infer the right checksum
+    // type!!!
+    //
+    // First check if source is local
+    //--------------------------------------------------------------------------
+    if( source.IsLocalFile() && !source.IsMetalink() )
+    {
+      std::vector<std::string>::iterator itr = dstcks.begin();
+      for( ; itr != dstcks.end(); ++itr )
+        if( local_supported.count( *itr ) ) return *itr;
+      return std::string();
+    }
+
+    //--------------------------------------------------------------------------
+    // then check if destination is local
+    //--------------------------------------------------------------------------
+    if( destination.IsLocalFile() )
+    {
+      std::vector<std::string>::iterator itr = srccks.begin();
+      for( ; itr != srccks.end(); ++itr )
+        if( local_supported.count( *itr ) ) return *itr;
+      return std::string();
+    }
+
+    //--------------------------------------------------------------------------
+    // if both source and destination are remote look for a checksum that can
+    // satisfy both
+    //--------------------------------------------------------------------------
+    std::set<std::string> dst_supported( dstcks.begin(), dstcks.end() );
+    std::vector<std::string>::iterator itr = srccks.begin();
+    for( ; itr != srccks.end(); ++itr )
+      if( dst_supported.count( *itr ) ) return *itr;
+    return std::string();
+  }
+
+  //----------------------------------------------------------------------------
+  //! Split chunks in a ChunkList into one or more ChunkLists
+  //----------------------------------------------------------------------------
+  void Utils::SplitChunks( std::vector<ChunkList> &listsvec,
+                           const ChunkList        &chunks,
+                           const uint32_t          maxcs,
+                           const size_t            maxc )
+  {
+    listsvec.clear();
+    if( !chunks.size() ) return;
+
+    listsvec.emplace_back();
+    ChunkList *c    = &listsvec.back();
+    const size_t cs = chunks.size();
+    size_t idx      = 0;
+    size_t nc       = 0;
+    ChunkInfo tmpc;
+
+    c->reserve( cs );
+
+    while( idx < cs )
+    {
+      if( maxc && nc >= maxc )
+      {
+        listsvec.emplace_back();
+        c = &listsvec.back();
+        c->reserve( cs - idx );
+        nc = 0;
+      }
+
+      if( tmpc.length == 0 )
+        tmpc = chunks[idx];
+
+      if( maxcs && tmpc.length > maxcs )
+      {
+        c->emplace_back( tmpc.offset, maxcs, tmpc.buffer );
+        tmpc.offset += maxcs;
+        tmpc.length -= maxcs;
+        tmpc.buffer  = static_cast<char*>( tmpc.buffer ) + maxcs;
+      }
+      else
+      {
+        c->emplace_back( tmpc.offset, tmpc.length, tmpc.buffer );
+        tmpc.length = 0;
+        ++idx;
+      }
+      ++nc;
+    }
   }
 }

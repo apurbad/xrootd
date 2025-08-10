@@ -32,15 +32,15 @@
 /*                                                                            */
 /* ************************************************************************** */
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <unistd.h>
 #include <pwd.h>
-#include <time.h>
+#include <ctime>
 
 
 #include "XrdOuc/XrdOucString.hh"
@@ -61,7 +61,7 @@
 
 #include "XrdSecgsi/XrdSecgsiTrace.hh"
 
-#define PRT(x) {cerr <<x <<endl;}
+#define PRT(x) {std::cerr <<x <<std::endl;}
 
 //
 // enum
@@ -110,7 +110,7 @@ XrdOucString EEcert = "";
 XrdOucString EEkey  = "";
 XrdOucString PXcert = "";
 XrdOucString Valid  = "12:00";
-int          Bits   = 512;
+int          Bits   = 2048;
 int          PathLength = 0;
 int          ClockSkew = 30;
 // For error logging and tracing
@@ -224,7 +224,7 @@ int main( int argc, char **argv )
       // Display info about existing proxies
       // Parse the proxy file
       cPXp = new XrdCryptogsiX509Chain();
-      nci = (*ParseFile)(PXcert.c_str(), cPXp);
+      nci = (*ParseFile)(PXcert.c_str(), cPXp, 0);
       if (nci < 2) {
          if (Exists) {
             exitrc = 1;
@@ -425,7 +425,7 @@ int ParseArguments(int argc, char **argv)
             ++argv;
             if (argc >= 0 && (*argv && *(argv)[0] != '-')) {
                Bits = strtol(*argv, 0, 10);
-               Bits = (Bits > 512) ? Bits : 512;
+               Bits = (Bits > 2048) ? Bits : 2048;
                if (errno == ERANGE) {
                   PRT("++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++");
                   PRT("+ Option '-bits' requires a number: ignoring               +");
@@ -663,7 +663,7 @@ void Menu()
                                    " for which proxies are wanted");
    PRT("    -key      <file>       Non-standard location of the private"
                                    " key to be used to sign the proxy");
-   PRT("    -bits     <bits>       strength in bits of the key [512]");
+   PRT("    -bits     <bits>       strength in bits of the key [2048]");
    PRT("    -valid    <hh:mm>      Time validity of the proxy certificate [12:00]");
    PRT("    -path-length <len>     max number of descendent levels below"
                                    " this proxy [0] ");

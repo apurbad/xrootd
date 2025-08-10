@@ -30,15 +30,15 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
   
-#include <stdlib.h>
-#include <string.h>
+#include <cstdlib>
+#include <cstring>
 
 class XrdCpFile
 {
 public:
 
-enum PType {isOther = 0, isDir,  isFile,  isStdIO,
-            isXroot,     isHttp, isHttps, isDevNull, isDevZero
+enum PType {isOther = 0, isDir,    isFile, isStdIO,
+            isXroot,     isXroots, isHttp, isHttps, isPelican, isDevNull, isDevZero
            };
 
 XrdCpFile        *Next;         // -> Next file in list

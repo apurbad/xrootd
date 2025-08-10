@@ -70,8 +70,6 @@ public:
                              const XrdSecEntity     *client,
                              const char             *opaque = 0);
 
-        void           EnvInfo(XrdOucEnv *envP);
-
         int            exists(const char                *fileName,
                                     XrdSfsFileExistence &exists_flag,
                                     XrdOucErrInfo       &eInfo,
@@ -134,6 +132,8 @@ const   char          *getVersion();
 
 // Management functions
 //
+        void           setFeatures(XrdSfsFileSystem *prevFS);
+
 static  void           setMax(int mVal) {freeMax = mVal;}
 
                        XrdSsiSfs() {}

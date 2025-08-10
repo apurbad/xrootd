@@ -54,7 +54,7 @@ dirent64 *XrdPosixDir::nextEntry(dirent64 *dp)
 
 // Reread the directory if we need to (rewind forces this)
 //
-   if (!myDirVec && !Open()) {eNum = errno; return 0;}
+   if (!myDirVec && !Open()) {eNum = errno; return 0;} // Open() sets ecMsg
 
 // Check if dir is empty or all entries have been read
 //
@@ -71,9 +71,9 @@ dirent64 *XrdPosixDir::nextEntry(dirent64 *dp)
    if (!dp) dp = myDirEnt;
    if (d_nlen > maxDlen) d_nlen = maxDlen;
 #ifndef __solaris__
-   dp->d_type   = DT_DIR;
+   dp->d_type   = DT_UNKNOWN;
 #endif
-#if defined(__APPLE__) || defined(__FreeBSD__)
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__GNU__) || (defined(__FreeBSD_kernel__) && defined(__GLIBC__))
    dp->d_fileno = nxtEnt;
    dp->d_namlen = d_nlen;
 #else
@@ -83,10 +83,26 @@ dirent64 *XrdPosixDir::nextEntry(dirent64 *dp)
    dp->d_reclen = d_nlen + dirhdrln;
    strncpy(dp->d_name, d_name, d_nlen);
    dp->d_name[d_nlen] = '\0';
+
+   // Note we fail if the stat info is needed but not available
+   int rc;
+   if (myBuf && (rc = XrdPosixMap::Entry2Buf(*dirEnt, *myBuf, ecMsg)))
+      {eNum = rc;
+       dp = nullptr;
+      }
    nxtEnt++;
    return dp;
 }
-  
+
+/******************************************************************************/
+/*                               S t a t R e t                                */
+/******************************************************************************/
+int XrdPosixDir::StatRet(struct stat *buf)
+{
+   myBuf = buf;
+   return 0;
+}
+
 /******************************************************************************/
 /*                                  O p e n                                   */
 /******************************************************************************/
@@ -100,15 +116,17 @@ DIR *XrdPosixDir::Open()
 // some system the dirent structure does not include the name buffer
 //
    if (!myDirEnt && !(myDirEnt = (dirent64 *)malloc(dEntSize)))
-      {errno = ENOMEM; return (DIR *)0;}
+      {ecMsg.SetErrno(ENOMEM);
+       return (DIR*)0;
+      }
 
 // Get the directory list
 //
    rc = XrdPosixMap::Result(DAdmin.Xrd.DirList(DAdmin.Url.GetPathWithParams(),
                                                XrdPosixGlobals::dlFlag,
-                                               myDirVec, (uint16_t)0));
+                                               myDirVec, (uint16_t)0),ecMsg);
 
-// If we failed, return a zero pointer
+// If we failed, return a zero pointer ote that Result() set errno for us
 //
    if (rc) return (DIR *)0;
 

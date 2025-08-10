@@ -30,9 +30,9 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
   
-#include <inttypes.h>
-#include <stdlib.h>
-#include <string.h>
+#include <cinttypes>
+#include <cstdlib>
+#include <cstring>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -55,13 +55,23 @@ class XrdNetAddrInfo
 public:
 
 //------------------------------------------------------------------------------
+//! Provide the protocol languag being spoken (e.g. xroot, http, etc).
+//!
+//! @return Pointer to the protocol language being used. If unknown, nil ia
+//!         returned. Use the isUsingTLS() method to see if a secure version of
+//!         the protocol is being used.
+//------------------------------------------------------------------------------
+
+const char *Dialect() {return protName;}
+
+//------------------------------------------------------------------------------
 //! Provide our address family.
 //!
 //! @return Success: Returns AF_INET, AF_INET6, or AF_UNIX.
 //!         Failure: Returns 0, address is not valid.
 //------------------------------------------------------------------------------
 
-inline int  Family() const {return static_cast<int>(IP.Addr.sa_family);}
+int         Family() const {return static_cast<int>(IP.Addr.sa_family);}
 
 //------------------------------------------------------------------------------
 //! Format our address into a supplied buffer with one of the following layouts
@@ -133,7 +143,7 @@ static bool isHostName(const char *name);
 
 enum IPType {IPv4 = AF_INET, IPv6 = AF_INET6, IPuX = AF_UNIX};
 
-inline bool isIPType(IPType ipType) const {return IP.Addr.sa_family == ipType;}
+bool        isIPType(IPType ipType) const {return IP.Addr.sa_family == ipType;}
 
 //------------------------------------------------------------------------------
 //! Indicate whether or not our address is an IPv4 mapped to IPv6 address.
@@ -142,7 +152,7 @@ inline bool isIPType(IPType ipType) const {return IP.Addr.sa_family == ipType;}
 //!         False: The address is not a mapped IPv4 address.
 //------------------------------------------------------------------------------
 
-inline bool isMapped() const {return IP.Addr.sa_family == AF_INET6
+bool        isMapped() const {return IP.Addr.sa_family == AF_INET6
                                   && IN6_IS_ADDR_V4MAPPED(&IP.v6.sin6_addr);
                              }
 
@@ -165,6 +175,15 @@ bool        isPrivate();
 bool        isRegistered();
 
 //------------------------------------------------------------------------------
+//! Indicate whether or not the endpoint is using TLS for communications.
+//!
+//! @return True:    This address is     using TLS.
+//!         False:   This address is not using TLS.
+//------------------------------------------------------------------------------
+
+bool        isUsingTLS();
+
+//------------------------------------------------------------------------------
 //! Obtain the location of this address.
 //!
 //! @return !0       pointer to the unverified location information. Not all
@@ -177,13 +196,14 @@ struct LocInfo
        unsigned char  Region;     //!< Region (may combine adjacent countries)
        unsigned char  Locale;     //!< Locale (may combine adjacent regions)
                 char  TimeZone;   //!< +/- hours from GMT (-128 if not set)
-                char  Reserved;
+                char  Flags;      //!< Flags
                 short Speed;      //!< I/F speed (Gb*1024/100)(not supported)
                 int   Latitude;   //!< Degrees +/- xx.xxxxxx  (not supported)
                 int   Longtitude; //!< Degrees +/- xx.xxxxxx  (not supported)
 
-                LocInfo() : Region(0), Locale(0), TimeZone(-128), Reserved(0),
+                LocInfo() : Region(0), Locale(0), TimeZone(-128), Flags(0),
                             Speed(0), Latitude(0), Longtitude(0) {*Country = 0;}
+
        };
 
 const struct
@@ -213,7 +233,7 @@ const char *Name(const char *eName=0, const char **eText=0);
 //! Use SockSize() to get its logical length.
 //------------------------------------------------------------------------------
 
-inline const
+const
 XrdNetSockAddr  *NetAddr() {return (sockAddr == (void *)&IP ? &IP : 0);}
 
 //------------------------------------------------------------------------------
@@ -232,7 +252,7 @@ int         Port();
 //!         Failure: Returns 0, address is not valid.
 //------------------------------------------------------------------------------
 
-inline int  Protocol() {return static_cast<int>(protType);}
+int         Protocol() {return static_cast<int>(protType);}
 
 //------------------------------------------------------------------------------
 //! Check if the IP address in this object is the same as the one passed.
@@ -243,7 +263,9 @@ inline int  Protocol() {return static_cast<int>(protType);}
 //!
 //! @return Success: True  (addresses are     the same).
 //!         Failure: False (addresses are not the same).
-//-----------------------------------------------------------------------------sav-
+//!
+//! Note: implemented in terms of const version
+//------------------------------------------------------------------------------
 
 int         Same(const XrdNetAddrInfo *ipAddr, bool plusPort=false);
 
@@ -254,7 +276,7 @@ int         Same(const XrdNetAddrInfo *ipAddr, bool plusPort=false);
 //! or when Set() is called. Use SockSize() to get its length.
 //------------------------------------------------------------------------------
 
-inline const
+const
 sockaddr   *SockAddr() {return sockAddr;}
 
 //------------------------------------------------------------------------------
@@ -264,8 +286,7 @@ sockaddr   *SockAddr() {return sockAddr;}
 //!         Failure: Returns 0, address is not valid.
 //------------------------------------------------------------------------------
 
-inline
-SOCKLEN_t   SockSize() {return addrSize;}
+SOCKLEN_t   SockSize() {return static_cast<SOCKLEN_t>(addrSize);}
 
 //------------------------------------------------------------------------------
 //! Get the associated file descriptor.
@@ -273,7 +294,7 @@ SOCKLEN_t   SockSize() {return addrSize;}
 //! @return The associated file descriptor. If negative, no association exists.
 //------------------------------------------------------------------------------
 
-inline int  SockFD() {return (sockNum ? static_cast<int>(sockNum) : -1);}
+int         SockFD() {return (sockNum ? sockNum : -1);}
 
 //------------------------------------------------------------------------------
 //! Assignment operator
@@ -284,6 +305,8 @@ XrdNetAddrInfo &operator=(XrdNetAddrInfo const &rhs)
                    {memmove(&IP, &rhs.IP, sizeof(IP));
                     addrSize = rhs.addrSize; sockNum = rhs.sockNum;
                     protType = rhs.protType;
+                    protFlgs = rhs.protFlgs;
+                    protName = rhs.protName;
                     if (hostName) free(hostName);
                     hostName = (rhs.hostName ? strdup(rhs.hostName):0);
                     addrLoc = rhs.addrLoc;
@@ -310,7 +333,8 @@ XrdNetAddrInfo &operator=(XrdNetAddrInfo const &rhs)
 //! Constructor
 //------------------------------------------------------------------------------
 
-            XrdNetAddrInfo() : hostName(0), addrSize(0), protType(0), sockNum(0)
+            XrdNetAddrInfo() : hostName(0), addrSize(0), protType(0),
+                               protFlgs(0), sockNum(0), protName(0)
                            {IP.Addr.sa_family = 0;
                             sockAddr = &IP.Addr;
                            }
@@ -338,8 +362,14 @@ union {struct sockaddr    *sockAddr;
       };
 char                      *hostName;
 LocInfo                    addrLoc;
-SOCKLEN_t                  addrSize;
-short                      protType;
-unsigned short             sockNum;
+unsigned short             addrSize;
+unsigned char              protType;
+unsigned char              protFlgs;
+int                        sockNum;
+const char                *protName;
+
+// Flag settings in protFlgs
+//
+static const char          isTLS = 0x01; //!< Location using TLS
 };
 #endif

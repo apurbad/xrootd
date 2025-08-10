@@ -55,10 +55,11 @@ namespace XrdThrottle {
 XrdSfsFileSystem *
 XrdSfsGetFileSystem_Internal(XrdSfsFileSystem *native_fs,
                             XrdSysLogger     *lp,
-                            const char       *configfn)
+                            const char       *configfn,
+                            XrdOucEnv        *envP)
 {
    FileSystem* fs = NULL;
-   FileSystem::Initialize(fs, native_fs, lp, configfn);
+   FileSystem::Initialize(fs, native_fs, lp, configfn, envP);
    return fs;
 }
 }
@@ -70,11 +71,21 @@ XrdSfsGetFileSystem(XrdSfsFileSystem *native_fs,
                     XrdSysLogger     *lp,
                     const char       *configfn)
 {
-   return XrdSfsGetFileSystem_Internal(native_fs, lp, configfn);
+   return XrdSfsGetFileSystem_Internal(native_fs, lp, configfn, nullptr);
+}
+
+XrdSfsFileSystem *
+XrdSfsGetFileSystem2(XrdSfsFileSystem *native_fs,
+                    XrdSysLogger     *lp,
+                    const char       *configfn,
+                    XrdOucEnv        *envP)
+{
+   return XrdSfsGetFileSystem_Internal(native_fs, lp, configfn, envP);
 }
 }
 
 XrdVERSIONINFO(XrdSfsGetFileSystem, FileSystem);
+XrdVERSIONINFO(XrdSfsGetFileSystem2, FileSystem);
 
 FileSystem* FileSystem::m_instance = 0;
 
@@ -90,7 +101,8 @@ void
 FileSystem::Initialize(FileSystem      *&fs,
                        XrdSfsFileSystem *native_fs, 
                        XrdSysLogger     *lp,
-                       const char       *configfn)
+                       const char       *configfn,
+                       XrdOucEnv        *envP)
 {
    fs = NULL;
    if (m_instance == NULL && !(m_instance = new FileSystem()))
@@ -103,7 +115,7 @@ FileSystem::Initialize(FileSystem      *&fs,
       fs->m_config_file = configfn;
       fs->m_eroute.logger(lp);
       fs->m_eroute.Say("Initializing a Throttled file system.");
-      if (fs->Configure(fs->m_eroute, native_fs))
+      if (fs->Configure(fs->m_eroute, native_fs, envP))
       {
          fs->m_eroute.Say("Initialization of throttled file system failed.");
          fs = NULL;
@@ -116,7 +128,7 @@ FileSystem::Initialize(FileSystem      *&fs,
 
 #define TS_Xeq(key, func) NoGo = (strcmp(key, var) == 0) ? func(Config) : 0
 int
-FileSystem::Configure(XrdSysError & log, XrdSfsFileSystem *native_fs)
+FileSystem::Configure(XrdSysError & log, XrdSfsFileSystem *native_fs, XrdOucEnv *envP)
 {
    XrdOucEnv myEnv;
    XrdOucStream Config(&m_eroute, getenv("XRDINSTANCE"), &myEnv, "(Throttle Config)> ");
@@ -132,6 +144,8 @@ FileSystem::Configure(XrdSysError & log, XrdSfsFileSystem *native_fs)
       return 1;
    }
    Config.Attach(cfgFD);
+   static const char *cvec[] = { "*** throttle (ofs) plugin config:", 0 };
+   Config.Capture(cvec);
 
    std::string fslib = OFS_NAME;
 
@@ -145,6 +159,8 @@ FileSystem::Configure(XrdSysError & log, XrdSfsFileSystem *native_fs)
          if (!val || !val[0]) {log.Emsg("Config", "fslib not specified."); continue;}
          fslib = val;
       }
+      TS_Xeq("throttle.max_open_files", xmaxopen);
+      TS_Xeq("throttle.max_active_connections", xmaxconn);
       TS_Xeq("throttle.throttle", xthrottle);
       TS_Xeq("throttle.loadshed", xloadshed);
       TS_Xeq("throttle.trace", xtrace);
@@ -161,8 +177,71 @@ FileSystem::Configure(XrdSysError & log, XrdSfsFileSystem *native_fs)
    // Overwrite the environment variable saying that throttling is the fslib.
    XrdOucEnv::Export("XRDOFSLIB", fslib.c_str());
 
+   if (envP)
+   {
+       auto gstream = reinterpret_cast<XrdXrootdGStream*>(envP->GetPtr("Throttle.gStream*"));
+       log.Say("Config", "Throttle g-stream has", gstream ? "" : " NOT", " been configured via xrootd.mongstream directive");
+       m_throttle.SetMonitor(gstream);
+   }
+
+   // The Feature function is not a virtual but implemented by the base class to
+   // look at a protected member.  Thus, to forward the call, we need to copy
+   // from the underlying filesystem
+   FeatureSet = m_sfs_ptr->Features();
    return 0;
 }
+
+/******************************************************************************/
+/*                            x m a x o p e n                                 */
+/******************************************************************************/
+
+/* Function: xmaxopen
+
+   Purpose:  Parse the directive: throttle.max_open_files <limit>
+
+             <limit>   maximum number of open file handles for a unique entity.
+
+  Output: 0 upon success or !0 upon failure.
+*/
+int
+FileSystem::xmaxopen(XrdOucStream &Config)
+{
+    auto val = Config.GetWord();
+    if (!val || val[0] == '\0')
+       {m_eroute.Emsg("Config", "Max open files not specified!  Example usage: throttle.max_open_files 16000");}
+    long long max_open = -1;
+    if (XrdOuca2x::a2sz(m_eroute, "max open files value", val, &max_open, 1)) return 1;
+
+    m_throttle.SetMaxOpen(max_open);
+    return 0;
+}
+
+
+/******************************************************************************/
+/*                            x m a x c o n n                                 */
+/******************************************************************************/
+
+/* Function: xmaxconn
+
+   Purpose:  Parse the directive: throttle.max_active_connections <limit>
+
+             <limit>   maximum number of connections with at least one open file for a given entity
+
+  Output: 0 upon success or !0 upon failure.
+*/
+int
+FileSystem::xmaxconn(XrdOucStream &Config)
+{
+    auto val = Config.GetWord();
+    if (!val || val[0] == '\0')
+       {m_eroute.Emsg("Config", "Max active cconnections not specified!  Example usage: throttle.max_active_connections 4000");}
+    long long max_conn = -1;
+    if (XrdOuca2x::a2sz(m_eroute, "max active connections value", val, &max_conn, 1)) return 1;
+
+    m_throttle.SetMaxConns(max_conn);
+    return 0;
+}
+
 
 /******************************************************************************/
 /*                            x t h r o t t l e                               */
@@ -304,6 +383,8 @@ int FileSystem::xtrace(XrdOucStream &Config)
       {"iops",      TRACE_IOPS},
       {"bandwidth", TRACE_BANDWIDTH},
       {"ioload",    TRACE_IOLOAD},
+      {"files",     TRACE_FILES},
+      {"connections",TRACE_CONNS},
    };
    int i, neg, trval = 0, numopts = sizeof(tropts)/sizeof(struct traceopts);
 

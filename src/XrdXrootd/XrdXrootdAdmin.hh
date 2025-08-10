@@ -30,7 +30,7 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
   
-#include <stdlib.h>
+#include <cstdlib>
 #include <netinet/in.h>
 
 #include "Xrd/XrdLinkMatch.hh"
@@ -56,18 +56,13 @@ static int   Init(XrdSysError *erp, XrdNetSocket *asock);
       ~XrdXrootdAdmin() {}
 
 private:
-int   do_Abort();
 int   do_Cj();
-int   do_Cont();
-int   do_Disc();
 int   do_Login();
 int   do_Lsc();
 int   do_Lsj();
 int   do_Lsj_Xeq(XrdXrootdJob *jp);
 int   do_Lsd();
 int   do_Msg();
-int   do_Pause();
-int   do_Red();
 char *getMsg(char *msg, int &mlen);
 int   getreqID();
 int   getTarget(const char *act, char **rest=0);

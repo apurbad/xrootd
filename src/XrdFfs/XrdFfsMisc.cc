@@ -28,7 +28,7 @@
 /******************************************************************************/
 
 #define _FILE_OFFSET_BITS 64
-#include <string.h>
+#include <cstring>
 #include <sys/types.h>
 //#include <sys/xattr.h>
 #include <iostream>
@@ -37,13 +37,14 @@
 //#include <netdb.h>
 #include <pwd.h>
 #include <grp.h>
-#include <time.h>
+#include <ctime>
 #include <pthread.h>
-#include <stdio.h>
+#include <cstdio>
 #include <syslog.h>
 
 #include "XrdNet/XrdNetAddr.hh"
 #include "XrdNet/XrdNetUtils.hh"
+#include "XrdOuc/XrdOucECMsg.hh"
 #include "XrdPosix/XrdPosixAdmin.hh"
 #include "XrdSec/XrdSecEntity.hh"
 #include "XrdSecsss/XrdSecsssID.hh"
@@ -52,7 +53,7 @@
 #include "XrdFfs/XrdFfsMisc.hh"
 #include "XrdFfs/XrdFfsPosix.hh"
 #include "XrdFfs/XrdFfsQueue.hh"
-#include "XrdPosix/XrdPosixXrootd.hh"
+#include "XrdPosix/XrdPosixConfig.hh"
 
 #ifdef __cplusplus
   extern "C" {
@@ -75,7 +76,8 @@ char XrdFfsMisc_get_current_url(const char *oldurl, char *newurl)
         return 1;
     }
 
-    XrdPosixAdmin adm(oldurl);
+    XrdOucECMsg   ecMsg;
+    XrdPosixAdmin adm(oldurl,ecMsg);
     if (adm.isOK() && adm.Stat())
     {
 // We might have been redirected to a destination server. Better 
@@ -100,7 +102,8 @@ char* XrdFfsMisc_getNameByAddr(char* ipaddr)
 
 int XrdFfsMisc_get_all_urls_real(const char *oldurl, char **newurls, const int nnodes)
 {
-    XrdPosixAdmin adm(oldurl);
+    XrdOucECMsg   ecMsg;
+    XrdPosixAdmin adm(oldurl,ecMsg);
     XrdCl::URL *uVec;
     int i, rval = 0;
 
@@ -305,7 +308,7 @@ void XrdFfsMisc_xrd_init(const char *rdrurl, const char *urlcachelife, int start
 //    EnvPutInt(NAME_READAHEADSIZE,0);
 //    EnvPutInt(NAME_READCACHESIZE,0);
 //    EnvPutInt(NAME_REQUESTTIMEOUT, 30);
-    XrdPosixXrootd::setEnv("WorkerThreads", 50);
+    XrdPosixConfig::SetEnv("WorkerThreads", 50);
 
     if (getenv("XROOTDFS_SECMOD") != NULL && !strcmp(getenv("XROOTDFS_SECMOD"), "sss"))
         XrdFfsMisc_xrd_secsss_init();
@@ -410,6 +413,8 @@ void XrdFfsMisc_xrd_secsss_register(uid_t user_uid, gid_t user_gid, int *id)
 
         XrdFfsMiscUent.name = pw.pw_name;
         XrdFfsMiscUent.grps = gr.gr_name;
+        XrdFfsMiscUent.uid = user_uid;
+        XrdFfsMiscUent.gid = user_gid;
         XrdFfsMiscSssid->Register(user_num, &XrdFfsMiscUent, 0);
         free(pwbuf);
         free(grbuf);

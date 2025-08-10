@@ -29,7 +29,7 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <stdlib.h>
+#include <cstdlib>
 #include <sys/time.h>
 
 //-----------------------------------------------------------------------------
@@ -59,7 +59,7 @@ typedef void (*XrdSysLogPI_t)(struct timeval const &mtime,
 //! library identified by the "-l @library" command line option. This function
 //! is called only once during loging initialization.
 //!
-//! @param  cfgfn     -> Configuration filename (nil if none).
+//! @param  cfgn      -> Configuration filename (nil if none).
 //! @param  argv      -> command line arguments after "-+xrdlog".
 //! @param  argc         number of command line arguments in argv.
 //!
@@ -82,7 +82,7 @@ typedef XrdSysLogPI_t  (*XrdSysLogPInit_t)(const char  *cfgn,
 /*! Specify the compilation version.
 
     Additionally, you *should* declare the xrootd version you used to compile
-    your plug-in. The plugin manager automatically checks for compatability.
+    your plug-in. The plugin manager automatically checks for compatibility.
     Declare it as follows:
 
     #include "XrdVersion.hh"

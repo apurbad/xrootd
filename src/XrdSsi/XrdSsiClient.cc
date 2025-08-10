@@ -27,12 +27,12 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <errno.h>
+#include <cerrno>
 #include <fcntl.h>
-#include <stdio.h>
+#include <cstdio>
 #include <string>
-#include <string.h>
-#include <time.h>
+#include <cstring>
+#include <ctime>
 #include <unistd.h>
 #include <sys/types.h>
   
@@ -42,11 +42,13 @@
 #include "XrdCl/XrdClDefaultEnv.hh"
 
 #include "XrdNet/XrdNetAddr.hh"
+#include "XrdNet/XrdNetRegistry.hh"
 
 #include "XrdSsi/XrdSsiAtomics.hh"
 #include "XrdSsi/XrdSsiLogger.hh"
 #include "XrdSsi/XrdSsiProvider.hh"
 #include "XrdSsi/XrdSsiServReal.hh"
+#include "XrdSsi/XrdSsiScale.hh"
 #include "XrdSsi/XrdSsiTrace.hh"
 
 #include "XrdSys/XrdSysLogger.hh"
@@ -63,6 +65,7 @@ namespace XrdSsi
 {
 extern XrdSysError          Log;
 extern XrdSysLogger        *Logger;
+extern XrdSsiScale          sidScale;
 extern XrdSysTrace          Trace;
 extern XrdSsiLogger::MCB_t *msgCB;
 extern XrdSsiLogger::MCB_t *msgCBCl;
@@ -70,12 +73,21 @@ extern XrdSsiLogger::MCB_t *msgCBCl;
        XrdSysMutex   clMutex;
        XrdScheduler *schedP   = 0;
        XrdCl::Env   *clEnvP   = 0;
+       Atomic(int)   contactN(1);
        short         maxTCB   = 300;
        short         maxCLW   =  30;
+       short         maxPEL   =  10;
        Atomic(bool)  initDone(false);
        bool          dsTTLSet = false;
        bool          reqTOSet = false;
        bool          strTOSet = false;
+       bool          hiResTime= false;
+
+static const int rDispNone =  0;
+static const int rDispRand = -1;
+static const int rDispRR   =  1;
+
+       char          rDisp    = rDispRR;
 }
 
 using namespace XrdSsi;
@@ -107,6 +119,11 @@ virtual rStat  QueryResource(const char *rName,
 
 virtual void   SetCBThreads(int cbNum, int ntNum);
 
+virtual bool   SetConfig(XrdSsiErrInfo &eInfo,
+                         std::string   &optname, int optvalue);
+
+virtual void   SetSpread(short ssz);
+
 virtual void   SetTimeout(tmoType what, int tmoval);
 
                XrdSsiClientProvider() {}
@@ -127,9 +144,9 @@ XrdSsiService *XrdSsiClientProvider::GetService(XrdSsiErrInfo     &eInfo,
 {
    static const int maxTMO = 0x7fffffff;
    XrdNetAddr netAddr;
-   const char *eText;
+   std::string eMsg;
+   const char *eText = 0;
    char buff[512];
-   int  n;
 
 // Allocate a scheduler if we do not have one and set default env (1st call)
 //
@@ -141,6 +158,9 @@ XrdSsiService *XrdSsiClientProvider::GetService(XrdSsiErrInfo     &eInfo,
       if (!dsTTLSet) clEnvP->PutInt("DataServerTTL",  maxTMO);
       if (!reqTOSet) clEnvP->PutInt("RequestTimeout", maxTMO);
       if (!strTOSet) clEnvP->PutInt("StreamTimeout",  maxTMO);
+      clEnvP->PutInt("ParallelEvtLoop",maxPEL);
+      if (rDisp == rDispNone || rDisp == rDispRR)
+         clEnvP->PutInt("IPNoShuffle", 1);
       initDone = true;
       clMutex.UnLock();
      }
@@ -150,15 +170,31 @@ XrdSsiService *XrdSsiClientProvider::GetService(XrdSsiErrInfo     &eInfo,
    if (contact.empty())
       {eInfo.Set("Contact not specified.", EINVAL); return 0;}
 
-// Validate the given contact
+// If this is a single contact which is really a singleton, don't create
+// a registry entry for it as it's just not needed (we need one to rotate).
 //
-   if ((eText = netAddr.Set(contact.c_str())))
-      {eInfo.Set(eText, EINVAL); return 0;}
+   if (contact.find(',') != std::string::npos
+   ||  !XrdNetUtils::Singleton(contact.c_str()))
+      {int cNum = contactN++;
+       bool rotate = rDisp == rDispRR;
+       snprintf(buff,sizeof(buff),"%ccontact-%d:4901",XrdNetRegistry::pfx,cNum);
+       if (!XrdNetRegistry::Register(buff, contact.c_str(), &eMsg, rotate))
+          eText = (eMsg.size() ? eMsg.c_str() : "reason unknown");
 
-// Construct new binding
+      } else {
+
+       if (!(eText = netAddr.Set(contact.c_str()))
+       &&  !netAddr.Format(buff, sizeof(buff), XrdNetAddrInfo::fmtName))
+          eText = "formatting failed";
+      }
+
+// Check if validation or registration failed
 //
-   if (!(n = netAddr.Format(buff, sizeof(buff), XrdNetAddrInfo::fmtName)))
-      {eInfo.Set("Unable to validate contact.", EINVAL); return 0;}
+   if (eText)
+      {snprintf(buff, sizeof(buff), "Unable to validate contact; %s", eText);
+       eInfo.Set(buff, EINVAL);
+       return 0;
+      }
 
 // Allocate a service object and return it
 //
@@ -186,6 +222,52 @@ void XrdSsiClientProvider::SetCBThreads(int cbNum, int ntNum)
 }
  
 /******************************************************************************/
+/*       X r d S s i C l i e n t P r o v i d e r : : S e t C o n f i g        */
+/******************************************************************************/
+  
+bool XrdSsiClientProvider::SetConfig(XrdSsiErrInfo &eInfo,
+                                     std::string   &optname, int optvalue)
+{
+// Look for an option we recognize
+//
+        if (optname == "cbThreads")
+           {if (optvalue < 1)
+               {eInfo.Set("invalid cbThreads value.", EINVAL); return false;}
+            if (optvalue > 32767) optvalue = 32767;
+            clMutex.Lock();
+            maxTCB = static_cast<short>(optvalue);
+            clMutex.UnLock();
+           }
+   else if (optname == "hiResTime") hiResTime = true;
+   else if (optname == "netThreads")
+           {if (optvalue < 1)
+               {eInfo.Set("invalid netThreads value.", EINVAL); return false;}
+            if (optvalue > 32767) optvalue = 32767;
+            clMutex.Lock();
+            maxCLW = static_cast<short>(optvalue);
+            clMutex.UnLock();
+           }
+   else if (optname == "pollers")
+           {if (optvalue < 1)
+               {eInfo.Set("invalid pollers value.", EINVAL); return false;}
+            if (optvalue > 32767) optvalue = 32767;
+            clMutex.Lock();
+            maxPEL =  static_cast<short>(optvalue);
+            clMutex.UnLock();
+           }
+   else if (optname == "reqDispatch")
+           {clMutex.Lock();
+            if (optvalue < 0) rDisp = rDispRand;
+               else if (optvalue > 0) rDisp = rDispRR;
+                       else rDisp = rDispNone;
+            clMutex.UnLock();
+           }
+   else {eInfo.Set("invalid option name.", EINVAL); return false;}
+
+   return true;
+}
+
+/******************************************************************************/
 /*       X r d S s i C l i e n t P r o v i d e r : : S e t L o g g e r        */
 /******************************************************************************/
   
@@ -195,7 +277,7 @@ void XrdSsiClientProvider::SetLogger()
 
 // Get a file descriptor mirroring standard error
 //
-#if defined(__linux__) && defined(O_CLOEXEC)
+#if ( defined(__linux__) || defined(__GNU__) ) && defined(F_DUPFD_CLOEXEC)
    eFD = fcntl(STDERR_FILENO, F_DUPFD_CLOEXEC, 0);
 #else
    eFD = dup(STDERR_FILENO);
@@ -205,6 +287,7 @@ void XrdSsiClientProvider::SetLogger()
 // Now we need to get a logger object. We make this a real dumb one.
 //
    Logger = new XrdSysLogger(eFD, 0);
+   if (hiResTime || getenv("XRDSSI_HIRESLOG")) Logger->setHiRes();
    Log.logger(Logger);
    Trace.SetLogger(Logger);
    if (getenv("XRDSSIDEBUG") != 0) Trace.What = TRACESSI_Debug;
@@ -228,11 +311,10 @@ void XrdSsiClientProvider::SetLogger()
   
 void XrdSsiClientProvider::SetScheduler()
 {
-   static XrdOucTrace myTrc(&Log);
+   static XrdSysTrace myTrc("XrdSsi", Log.logger());
 
 // Now construct the proper trace object (note that we do not set tracing if
 // message forwarding is on because these messages will not be forwarded).
-// This must be fixed when xrootd starts using XrdSysTrace!!!
 //
    if (!msgCBCl && Trace.What & TRACESSI_Debug) myTrc.What = TRACE_SCHED;
 
@@ -254,6 +336,15 @@ void XrdSsiClientProvider::SetScheduler()
 // Start the scheduler
 //
    XrdSsi::schedP->Start();
+}
+
+/******************************************************************************/
+/*       X r d S s i C l i e n t P r o v i d e r : : S e t S p r e a d        */
+/******************************************************************************/
+
+void XrdSsiClientProvider::SetSpread(short ssz)
+{
+    sidScale.setSpread(ssz);
 }
 
 /******************************************************************************/

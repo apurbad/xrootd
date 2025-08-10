@@ -28,38 +28,38 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <stdio.h>
+#include <cstdio>
 #include <strings.h>
+#include <unistd.h>
+#include <sys/stat.h>
   
+#include "XrdNet/XrdNetIdentity.hh"
 #include "XrdOfs/XrdOfsTPC.hh"
+#include "XrdOfs/XrdOfsTPCConfig.hh"
 #include "XrdOfs/XrdOfsTPCJob.hh"
 #include "XrdOfs/XrdOfsTPCProg.hh"
 #include "XrdOfs/XrdOfsTrace.hh"
 #include "XrdOss/XrdOss.hh"
 #include "XrdOuc/XrdOucCallBack.hh"
 #include "XrdOuc/XrdOucProg.hh"
-#include "XrdOuc/XrdOucTrace.hh"
 #include "XrdSys/XrdSysError.hh"
 #include "XrdSys/XrdSysFD.hh"
 #include "XrdSys/XrdSysHeaders.hh"
+
+#include "XrdXrootd/XrdXrootdTpcMon.hh"
 
 /******************************************************************************/
 /*                        G l o b a l   O b j e c t s                         */
 /******************************************************************************/
   
 extern XrdSysError  OfsEroute;
-extern XrdOucTrace  OfsTrace;
+extern XrdSysTrace  OfsTrace;
 extern XrdOss      *XrdOfsOss;
 
 namespace XrdOfsTPCParms
 {
-extern char        *XfrProg;
-extern char        *cksType;
-extern int          xfrMax;
-extern int          errMon;
-extern bool         doEcho;
-extern bool         autoRM;
-};
+extern XrdOfsTPCConfig Cfg;
+}
 
 using namespace XrdOfsTPCParms;
 
@@ -170,14 +170,14 @@ int XrdOfsTPCProg::Init()
 
 // Allocate copy program objects
 //
-   for (n = 0; n < xfrMax; n++)
-       {pgmIdle = new XrdOfsTPCProg(pgmIdle, n, errMon);
-        if (pgmIdle->Prog.Setup(XfrProg, &OfsEroute)) return 0;
+   for (n = 0; n < Cfg.xfrMax; n++)
+       {pgmIdle = new XrdOfsTPCProg(pgmIdle, n, Cfg.errMon);
+        if (pgmIdle->Prog.Setup(Cfg.XfrProg, &OfsEroute)) return 0;
        }
 
 // All done
 //
-   doEcho = doEcho || GTRACE(debug);
+   Cfg.doEcho = Cfg.doEcho || GTRACE(debug);
    return 1;
 }
 
@@ -187,13 +187,54 @@ int XrdOfsTPCProg::Init()
 
 void XrdOfsTPCProg::Run()
 {
+   XrdXrootdTpcMon::TpcInfo monInfo;
+   struct stat Stat;
+   const char *clID, *at;
+   char *questSrc, *questLfn, *questDst;
    int rc;
+   bool isIPv4, doMon = Cfg.tpcMon != 0;
+   char clBuff[592];
 
 // Run the current job and indicate it's ending status and possibly getting a
 // another job to run. Note "Job" will always be valid.
 //
-do{rc = Xeq();
+do{if (doMon)
+      {monInfo.Init();
+       gettimeofday(&monInfo.begT, 0);
+      }
+
+   rc = Xeq(isIPv4);
+
+   if (doMon)
+      {gettimeofday(&monInfo.endT, 0);
+       if ((questSrc = index(Job->Info.Key, '?'))) *questSrc = 0;
+       monInfo.srcURL = Job->Info.Key;
+       if ((questLfn = index(Job->Info.Lfn, '?'))) *questLfn = 0;
+       monInfo.dstURL = Job->Info.Lfn;
+       monInfo.endRC  = rc;
+       if (Job->Info.Str) monInfo.strm = Job->Info.Str;
+       if (isIPv4) monInfo.opts |= XrdXrootdTpcMon::TpcInfo::isIPv4;
+
+       clID = Job->Info.Org;
+       if (clID && (at = index(clID, '@')) && !index(at+1, '.'))
+          {const char *dName = XrdNetIdentity::Domain();
+           if (dName)
+              {snprintf(clBuff, sizeof(clBuff), "%s%s", clID, dName);
+               clID = clBuff;
+              }
+          }
+       monInfo.clID = clID;
+
+       if ((questDst = index(Job->Info.Dst, '?'))) *questDst = 0;
+       if (!XrdOfsOss->Stat(Job->Info.Dst, &Stat)) monInfo.fSize = Stat.st_size;
+       if (questDst) *questDst = '?';
+       Cfg.tpcMon->Report(monInfo);
+       if (questLfn) *questLfn = '?';
+       if (questSrc) *questSrc = '?';
+      }
+
    Job = Job->Done(this, eRec, rc);
+
   } while(Job);
 
 // No more jobs to run. Place us on the idle queue. Upon return this thread
@@ -235,12 +276,12 @@ XrdOfsTPCProg *XrdOfsTPCProg::Start(XrdOfsTPCJob *jP, int &rc)
 /******************************************************************************/
 /*                                   X e q                                    */
 /******************************************************************************/
-  
-int XrdOfsTPCProg::Xeq()
+
+int XrdOfsTPCProg::Xeq(bool &isIPv4)
 {
    EPNAME("Xeq");
    credFile cFile(Job);
-   const char *Args[6], *eVec[5], **envArg;
+   const char *Args[6], *eVec[6], **envArg;
    char *lP, *Colon, *cksVal, sBuff[8], *tident = Job->Info.Org;
    char *Quest = index(Job->Info.Key, '?');
    int i, rc, aNum = 0;
@@ -254,7 +295,7 @@ int XrdOfsTPCProg::Xeq()
 
 // Echo out what we are doing if so desired
 //
-   if (doEcho)
+   if (Cfg.doEcho)
       {if (Quest) *Quest = 0;
        OfsEroute.Say(Pname,tident," copying ",Job->Info.Key," to ",Job->Info.Dst);
        if (Quest) *Quest = '?';
@@ -262,7 +303,7 @@ int XrdOfsTPCProg::Xeq()
 
 // Determine checksum option
 //
-   cksVal = (Job->Info.Cks ? Job->Info.Cks : XrdOfsTPCParms::cksType);
+   cksVal = (Job->Info.Cks ? Job->Info.Cks : Cfg.cksType);
    if (cksVal)
       {Args[aNum++] = "-C";
        Args[aNum++] = cksVal;
@@ -302,16 +343,20 @@ int XrdOfsTPCProg::Xeq()
    char tprBuff[128];
    if (Job->Info.Tpr)
       {snprintf(tprBuff, sizeof(tprBuff), "XRDTPC_TPROT=%s", Job->Info.Tpr);
-       eVec[i++] = sprBuff;
+       eVec[i++] = tprBuff;
       }
 
-// Determine if credentials are being passed, If so, we don't need any cgi but
-// we must set an envar to point to the file holding the credentials.
+// If we need to reproxy, export the path
 //
-   if (cFile.Path)
-      {eVec[i++] = cFile.pEnv;
-       if (Quest) *Quest = 0;
+   char rpxBuff[1024];
+   if (Job->Info.Rpx)
+      {snprintf(rpxBuff, sizeof(rpxBuff), "XRD_CPTARGET=%s", Job->Info.Rpx);
+       eVec[i++] = rpxBuff;
       }
+
+// Determine if credentials are being passed, If so, pass where it is.
+//
+   if (cFile.Path) eVec[i++] = cFile.pEnv;
    eVec[i] = 0;
 
 // Start the job.
@@ -326,12 +371,14 @@ int XrdOfsTPCProg::Xeq()
 // be printed as an error message should the copy fail.
 //
    *eRec = 0;
+   isIPv4 = false;
    while((lP = JobStream.GetLine()))
-        {if ((Colon = index(lP, ':')) && *(Colon+1) == ' ')
+        {if (!strcmp(lP, "!-!IPv4")) isIPv4 = true;
+         if ((Colon = index(lP, ':')) && *(Colon+1) == ' ')
             {strncpy(eRec, Colon+2, sizeof(eRec)-1); 
-	     eRec[sizeof(eRec)-1] = 0;
-	    }
-         if (doEcho && *lP) OfsEroute.Say(Pname, lP);
+             eRec[sizeof(eRec)-1] = 0;
+            }
+         if (Cfg.doEcho && *lP) OfsEroute.Say(Pname, lP);
         }
 
 // The job has completed. So, we must get the ending status.
@@ -348,7 +395,7 @@ int XrdOfsTPCProg::Xeq()
 //
    if (rc)
       {OfsEroute.Emsg("TPC", Job->Info.Org, Job->Info.Lfn, eRec);
-       if (autoRM) XrdOfsOss->Unlink(Job->Info.Lfn);
+       if (Cfg.autoRM) XrdOfsOss->Unlink(Job->Info.Lfn);
       } else Job->Info.Success();
 
 // All done

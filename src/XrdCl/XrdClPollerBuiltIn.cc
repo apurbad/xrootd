@@ -28,6 +28,7 @@
 #include "XrdCl/XrdClConstants.hh"
 #include "XrdCl/XrdClSocket.hh"
 #include "XrdCl/XrdClOptimizers.hh"
+#include "XrdSys/XrdSysE2T.hh"
 #include "XrdSys/XrdSysIOEvents.hh"
 
 namespace
@@ -111,7 +112,7 @@ namespace XrdCl
     for( it = pSocketMap.begin(); it != pSocketMap.end(); ++it )
     {
       PollerHelper *helper = (PollerHelper*)it->second;
-             helper->channel->Delete();
+      if( helper->channel ) helper->channel->Delete();
       delete helper->callBack;
       delete helper;
     }
@@ -141,8 +142,8 @@ namespace XrdCl
       XrdSys::IOEvents::Poller* poller = IOEvents::Poller::Create( errNum, &errMsg );
       if( !poller )
       {
-        log->Error( PollerMsg, "Unable to create the internal poller object: ",
-                               "%s (%s)", strerror( errno ), errMsg );
+        log->Error( PollerMsg, "Unable to create the internal poller object: "
+                               "%s (%s)", XrdSysE2T( errno ), errMsg );
         return false;
       }
       pPollerPool.push_back( poller );
@@ -169,8 +170,8 @@ namespace XrdCl
                                                helper->readTimeout, &errMsg );
         if( !status )
         {
-          log->Error( PollerMsg, "Unable to enable read notifications ",
-                      "while re-starting %s (%s)", strerror( errno ), errMsg );
+          log->Error( PollerMsg, "Unable to enable read notifications "
+                      "while re-starting %s (%s)", XrdSysE2T( errno ), errMsg );
 
           return false;
         }
@@ -182,8 +183,8 @@ namespace XrdCl
                                                helper->writeTimeout, &errMsg );
         if( !status )
         {
-          log->Error( PollerMsg, "Unable to enable write notifications ",
-                      "while re-starting %s (%s)", strerror( errno ), errMsg );
+          log->Error( PollerMsg, "Unable to enable write notifications "
+                      "while re-starting %s (%s)", XrdSysE2T( errno ), errMsg );
 
           return false;
         }
@@ -231,10 +232,11 @@ namespace XrdCl
     for( it = pSocketMap.begin(); it != pSocketMap.end(); ++it )
     {
       PollerHelper *helper = (PollerHelper*)it->second;
-      Socket       *socket = it->first;
+      if( !helper->channel ) continue;
       bool status = helper->channel->Disable( Channel::allEvents, &errMsg );
       if( !status )
       {
+        Socket *socket = it->first;
         log->Error( PollerMsg, "%s Unable to disable write notifications: %s",
                     socket->GetName().c_str(), errMsg );
       }
@@ -267,7 +269,7 @@ namespace XrdCl
       return false;
     }
 
-    log->Debug( PollerMsg, "Adding socket 0x%x to the poller", socket );
+    log->Debug( PollerMsg, "Adding socket %p to the poller", (void*)socket );
 
     //--------------------------------------------------------------------------
     // Check if the socket is already registered
@@ -326,6 +328,8 @@ namespace XrdCl
     // Remove the socket
     //--------------------------------------------------------------------------
     PollerHelper *helper = (PollerHelper*)it->second;
+    pSocketMap.erase( it );
+    scopedLock.UnLock();
 
     if( helper->channel )
     {
@@ -341,7 +345,6 @@ namespace XrdCl
     }
     delete helper->callBack;
     delete helper;
-    pSocketMap.erase( it );
     return true;
   }
 
@@ -544,34 +547,31 @@ namespace XrdCl
   //----------------------------------------------------------------------------
   XrdSys::IOEvents::Poller* PollerBuiltIn::RegisterAndGetPoller(const Socket * socket)
   {
-    PollerMap::iterator itr = pPollerMap.find( socket->GetChannelID() );
+    PollerMap::iterator itr = pPollerMap.find( socket->GetFD() );
+
     if( itr == pPollerMap.end() )
     {
       XrdSys::IOEvents::Poller* poller = GetNextPoller();
       if( poller )
-        pPollerMap[socket->GetChannelID()] = std::make_pair( poller, size_t( 1 ) );
+        pPollerMap[socket->GetFD()] = poller;
       return poller;
     }
 
-    ++( itr->second.second );
-    return itr->second.first;
+    return itr->second;
   }
 
   void PollerBuiltIn::UnregisterFromPoller( const Socket *socket )
   {
-    PollerMap::iterator itr = pPollerMap.find( socket->GetChannelID() );
+    PollerMap::iterator itr = pPollerMap.find( socket->GetFD() );
     if( itr == pPollerMap.end() ) return;
-    --itr->second.second;
-    if( itr->second.second == 0 )
-      pPollerMap.erase( itr );
-
+    pPollerMap.erase( itr );
   }
 
   XrdSys::IOEvents::Poller* PollerBuiltIn::GetPoller(const Socket * socket)
   {
-    PollerMap::iterator itr = pPollerMap.find( socket->GetChannelID() );
+    PollerMap::iterator itr = pPollerMap.find( socket->GetFD() );
     if( itr == pPollerMap.end() ) return 0;
-    return itr->second.first;
+    return itr->second;
   }
 
   //----------------------------------------------------------------------------

@@ -28,8 +28,8 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <stdio.h>
-#include <string.h>
+#include <cstdio>
+#include <cstring>
 #include <strings.h>
 #include <utime.h>
 #include <sys/param.h>
@@ -167,7 +167,7 @@ const char *XrdFrmMigrate::Eligible(XrdFrmFileset *sP, time_t &xTime)
 // File is inelegible if lockfile mtime is zero (i.e., an mstore placeholder)
 //
    mTimeLK = static_cast<time_t>(sP->cpyInfo.Attr.cpyTime);
-   if (!mTimeLK) return "migration defered";
+   if (!mTimeLK) return "migration deferred";
 
 // File is ineligible if it has not changed since last migration
 //
@@ -178,7 +178,7 @@ const char *XrdFrmMigrate::Eligible(XrdFrmFileset *sP, time_t &xTime)
 //
    if (failFile && (eTxt=XrdFrmTransfer::checkFF(sP->failPath()))) return eTxt;
 
-// Migration may need to be defered if the file has been modified too recently
+// Migration may need to be deferred if the file has been modified too recently
 // (caller will check)
 //
    xTime = static_cast<int>(nowTime - mTimeBF);
@@ -194,6 +194,7 @@ const char *XrdFrmMigrate::Eligible(XrdFrmFileset *sP, time_t &xTime)
   
 void *XrdMigrateStart(void *parg)
 {
+   (void)parg;
     XrdFrmMigrate::Migrate(0);
     return (void *)0;
 }

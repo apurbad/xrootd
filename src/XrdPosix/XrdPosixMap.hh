@@ -31,10 +31,16 @@
 /* Modified by Frank Winklmeier to add the full Posix file system definition. */
 /******************************************************************************/
 
-#include <stdint.h>
-
 #include "XrdCl/XrdClFileSystem.hh"
 #include "XrdCl/XrdClXRootDResponses.hh"
+
+#include <cstdint>
+#include <sys/types.h>
+
+// Forward declarations
+class XrdOucECMsg;
+
+struct stat;
 
 class XrdPosixMap
 {
@@ -42,10 +48,14 @@ public:
 
 static mode_t              Flags2Mode(dev_t *rdv, uint32_t flags);
 
+// Convert a directory entry from the XrdCl to the OS's stat.
+// Will return non-zero (EIO) if the directory entry does not include any StatInfo.
+static int                 Entry2Buf(const XrdCl::DirectoryList::ListEntry &dirEnt, struct stat &buf, XrdOucECMsg &ecMsg);
+
 static XrdCl::Access::Mode Mode2Access(mode_t mode);
 
 static int                 Result(const XrdCl::XRootDStatus &Status,
-                                  bool retneg1=false);
+                                  XrdOucECMsg& ecMsg, bool retneg1=false);
 
 static void                SetDebug(bool dbg) {Debug = dbg;}
 

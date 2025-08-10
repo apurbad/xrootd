@@ -31,7 +31,7 @@
 
 #include <sys/types.h>
 #include <signal.h>
-#include <stdlib.h>
+#include <cstdlib>
 #ifdef WIN32
 #include "XrdSys/XrdWin32.hh"
 #endif
@@ -40,6 +40,7 @@
 
 struct StreamInfo;
 class XrdOucEnv;
+class XrdOucString;
 class XrdOucTList;
 
 class XrdOucStream
@@ -84,6 +85,7 @@ int          Drain();
 // the GetxxxWord() methods),
 //
 void         Echo();
+void         Echo(bool capture);
 
 // Execute a command on a stream. Returns 0 upon success or -1 otherwise.
 // Use LastError() to get the actual error code. Subsequent Get() calls
@@ -206,8 +208,31 @@ void         Tabs(int x=1) {notabs = !x;}
 int          Wait4Data(int msMax=-1);
 
 /******************************************************************************/
+
+// The following methods are norally used only during initial configuration
+// to capture the actual configuration being used by each component.
+
+// Capture a message (typically informational before the start of file
+// processing); which is added as a comment. Pass a vector of string whose
+// last element is 0.
+//
+static void   Capture(const char** cVec=0, bool linefeed=true);
+
+// Set the capture string object. A value of nil turns off capturing. The
+// current capture string pointer is returned.
+//
+static
+XrdOucString *Capture(XrdOucString *cfObj);
+
+// Return the current capture string object.
+//
+static
+XrdOucString *Capture();
+
+/******************************************************************************/
   
 private:
+        void  add2CFG(const char *data, bool isCMT=false);
         char *add2llB(char *tok, int reset=0);
         bool  docont();
         bool  docont( const char *path, XrdOucTList *tlP);
@@ -216,6 +241,7 @@ private:
         char *doelse();
         char *doif();
         bool  Echo(int ec, const char *t1, const char *t2=0, const char *t3=0);
+        int   getValue(const char *path, char *vbuff, int  vbsz);
         int   isSet(char *var);
         char *vSubs(char *Var);
         int   xMsg(const char *txt1, const char *txt2=0, const char *txt3=0);
@@ -252,5 +278,7 @@ static const int llBsz   = 1024;
         char  sawif;
         char  skpel;
         char  llBok;
+static
+XrdOucString *theCFG;
 };
 #endif

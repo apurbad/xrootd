@@ -29,13 +29,53 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
+#include <cstdint>
 #include <sys/stat.h>
 #include <fcntl.h>
 
 //-----------------------------------------------------------------------------
-//! This include file defines certain falgs that can be used by various Sfs
-//! plug-ins to passthrough special attributes of regular files.
+//! This include file defines certain flags that can be used by various Sfs
+//! plug-ins to passthrough features and special attributes of regular files.
 //-----------------------------------------------------------------------------
+
+namespace XrdSfs
+{
+//! Feature: Authorization
+static const uint64_t hasAUTZ = 0x0000000000000001LL;
+
+//! Feature: Checkpointing
+static const uint64_t hasCHKP = 0x0000000000000002LL;
+
+//! Feature: gpFile
+static const uint64_t hasGPF  = 0x0000000000000004LL;
+
+//! Feature: gpFile anonymous
+static const uint64_t hasGPFA = 0x0000000000000008LL;
+
+//! Feature: pgRead and pgWrite
+static const uint64_t hasPGRW = 0x0000000000000010LL;
+
+//! Feature: Persist On Successful Close
+static const uint64_t hasPOSC = 0x0000000000000020LL;
+
+//! Feature: Prepare Handler Version 2 (different calling conventions)
+static const uint64_t hasPRP2 = 0x0000000000000040LL;
+
+//! Feature: Proxy Server
+static const uint64_t hasPRXY = 0x0000000000000080LL;
+
+//! Feature: Supports SfsXio
+static const uint64_t hasSXIO = 0x0000000000000100LL;
+
+//! Feature: Supports no sendfile
+static const uint64_t hasNOSF = 0x0000000000000200LL;
+
+//! Feature: Implements a data cache
+static const uint64_t hasCACH = 0x0000000000000400LL;
+
+//! Feature: Supports no async I/O
+static const uint64_t hasNAIO = 0x0000000000000800LL;
+}
 
 //-----------------------------------------------------------------------------
 //! The following flags define the mode bit that can be used to mark a file
@@ -53,7 +93,7 @@
 //! The following bits may be set in the st_rdev member of the stat() structure
 //! to indicate special attributes of a regular file. These bits are inspected
 //! only when the remaining bits identified by XRD_RDVMASK are set to zero.
-//! For backward compatability, offline status is also assumed when st_dev and
+//! For backward compatibility, offline status is also assumed when st_dev and
 //! st_ino are both set to zero.
 //-----------------------------------------------------------------------------
 

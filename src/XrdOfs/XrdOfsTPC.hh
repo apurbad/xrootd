@@ -30,8 +30,8 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <stdlib.h>
-#include <string.h>
+#include <cstdlib>
+#include <cstring>
   
 #include "XrdOfs/XrdOfsTPCInfo.hh"
 
@@ -78,27 +78,7 @@ const char   *credPath() {return cPath;}
 
 virtual void  Del() {}
 
-struct  iParm {char *Pgm;
-               char *Ckst;
-               char *cpath;
-               int   fCreds;
-               int   Dflttl;
-               int   Maxttl;
-               int   Logok;
-               int   Strm;
-               int   SMax;
-               int   Xmax;
-               signed char Grab;
-               signed char xEcho;
-               signed char autoRM;
-               signed char oidsOK;
-                     iParm() : Pgm(0), Ckst(0), cpath(0), fCreds(0),
-                               Dflttl(-1), Maxttl(-1),
-                               Logok(-1), Strm(-1), SMax(64), Xmax(-1), Grab(0),
-                               xEcho(-1), autoRM(-1), oidsOK(0) {}
-              };
-
-static  void  Init(iParm &Parms);
+static  void  Init();
 
 static  void  Init(XrdAccAuthorize *accP) {fsAuth = accP;}
 
@@ -145,8 +125,6 @@ static char              *cPath;
 
 static XrdOfsTPCAllow    *ALList;
 static XrdOucPListAnchor *RPList;
-static int                maxTTL;
-static int                dflTTL;
 
        char               Refs;      // Reference count
        char               inQ;       // Object in queue

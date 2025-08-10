@@ -28,11 +28,8 @@
 /******************************************************************************/
 
 #include <unistd.h>
-#if !defined(__APPLE__) && !defined(__FreeBSD__)
-#include <malloc.h>
-#endif
-#include <stdio.h>
-#include <stdlib.h>
+#include <cstdio>
+#include <cstdlib>
 #include <sys/types.h>
 
 #include "XrdOuc/XrdOucUtils.hh"
@@ -66,7 +63,8 @@ XrdBuffXL::XrdBuffXL() : bucket(0), totalo(0), pagsz(getpagesize()), slots(0),
 
 void XrdBuffXL::Init(int maxMSZ)
 {
-   int lg2, chunksz;
+   unsigned int lg2;
+   int chunksz;
 
 // If this is a duplicate call, delete the previous setup
 //
@@ -134,7 +132,7 @@ XrdBuffer *XrdBuffXL::Obtain(int sz)
 
 // Allocate a chunk of aligned memory
 //
-   if (!(memp = static_cast<char *>(memalign(pagsz, buffSz)))) return 0;
+   if (posix_memalign((void **)&memp, pagsz, buffSz)) return 0;
 
 // Wrap the memory with a buffer object
 //
@@ -200,7 +198,7 @@ void XrdBuffXL::Release(XrdBuffer *bp)
   
 int XrdBuffXL::Stats(char *buff, int blen, int do_sync)
 {
-    static char statfmt[] = "<xlreqs>%d</xlreqs>"
+    static const char statfmt[] = "<xlreqs>%d</xlreqs>"
                 "<xlmem>%lld</xlmem><xlbuffs>%d</xlbuffs>";
     int nlen;
 

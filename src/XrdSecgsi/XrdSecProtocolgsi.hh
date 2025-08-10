@@ -25,7 +25,8 @@
 /* specific prior written permission of the institution or contributor.       */
 /*                                                                            */
 /******************************************************************************/
-#include <time.h>
+#include <ctime>
+#include <memory>
 
 #include "XrdNet/XrdNetAddrInfo.hh"
 
@@ -63,7 +64,7 @@ typedef XrdCryptogsiX509Chain X509Chain;
   
 #define XrdSecPROTOIDENT    "gsi"
 #define XrdSecPROTOIDLEN    sizeof(XrdSecPROTOIDENT)
-#define XrdSecgsiVERSION    10400
+#define XrdSecgsiVERSION    10600
 #define XrdSecNOIPCHK       0x0001
 #define XrdSecDEBUG         0x1000
 #define XrdCryptoMax        10
@@ -73,11 +74,13 @@ typedef XrdCryptogsiX509Chain X509Chain;
 
 #define XrdSecgsiVersDHsigned  10400  // Version at which started signing
                                       // of server DH parameters 
+#define XrdSecgsiVersCertKey   10600  // Version at which started supporting
+                                      // authentication with cert/key only
 
 //
 // Message codes either returned by server or included in buffers
 enum kgsiStatus {
-   kgST_error    = -1,      // error occured
+   kgST_error    = -1,      // error occurred
    kgST_ok       =  0,      // ok
    kgST_more     =  1       // need more info
 };
@@ -108,7 +111,9 @@ enum kgsiHandshakeOpts {
    kOptsSrvReq     = 8,      // 0x0008: Server request for delegated proxy
    kOptsPxFile     = 16,     // 0x0010: Save delegated proxies in file
    kOptsDelChn     = 32,     // 0x0020: Delete chain
-   kOptsPxCred     = 64      // 0x0040: Save delegated proxies as credentials
+   kOptsPxCred     = 64,     // 0x0040: Save delegated proxies as credentials
+   kOptsCreatePxy  = 128,    // 0x0080: Request a client proxy
+   kOptsDelPxy     = 256     // 0x0100: Delete the proxy PxyChain
 };
 
 // Error codes
@@ -183,18 +188,20 @@ public:
    char  *proxy;  // [c] user proxy  [/tmp/x509up_u<uid>]
    char  *valid;  // [c] proxy validity  [12:00]
    int    deplen; // [c] depth of signature path for proxies [0] 
-   int    bits;   // [c] bits in PKI for proxies [512] 
+   int    bits;   // [c] bits in PKI for proxies [default: XrdCryptoDefRSABits]
    char  *gridmap;// [s] gridmap file [/etc/grid-security/gridmap]
    int    gmapto; // [s] validity in secs of grid-map cache entries [600 s]
    char  *gmapfun;// [s] file with the function to map DN to usernames [0]
    char  *gmapfunparms;// [s] parameters for the function to map DN to usernames [0]
    char  *authzfun;// [s] file with the function to fill entities [0]
    char  *authzfunparms;// [s] parameters for the function to fill entities [0]
+   int    authzcall; // [s] when to call authz function [1 -> always]
    int    authzto; // [s] validity in secs of authz cache entries [-1 => unlimited]
    int    ogmap;  // [s] gridmap file checking option
    int    dlgpxy; // [c] explicitely ask the creation of a delegated proxy; default 0
                   // [s] ask client for proxies; default: do not accept delegated proxies
    int    sigpxy; // [c] accept delegated proxy requests
+   int    createpxy; // [c] force client proxy authentications
    char  *srvnames;// [c] '|' separated list of allowed server names
    char  *exppxy; // [s] template for the exported file with proxies
    int    authzpxy; // [s] if 1 make proxy available in exported form in the 'endorsement'
@@ -206,16 +213,19 @@ public:
    int    hashcomp; // [cs] 1 send hash names with both algorithms; 0 send only the default [1]
 
    bool   trustdns; // [cs] 'true' if DNS is trusted [true]
+   bool   showDN;   // [cs] 'true' display the dn
 
    gsiOptions() { debug = -1; mode = 's'; clist = 0; 
                   certdir = 0; crldir = 0; crlext = 0; cert = 0; key = 0;
                   cipher = 0; md = 0; ca = 1 ; crl = 1; crlrefresh = 86400;
-                  proxy = 0; valid = 0; deplen = 0; bits = 512;
+                  proxy = 0; valid = 0; deplen = 0; bits = XrdCryptoDefRSABits;
                   gridmap = 0; gmapto = 600;
-                  gmapfun = 0; gmapfunparms = 0; authzfun = 0; authzfunparms = 0; authzto = -1;
+                  gmapfun = 0; gmapfunparms = 0; authzfun = 0; authzfunparms = 0;
+                  authzto = -1; authzcall = 1;
                   ogmap = 1; dlgpxy = 0; sigpxy = 1; srvnames = 0;
                   exppxy = 0; authzpxy = 0;
-                  vomsat = 1; vomsfun = 0; vomsfunparms = 0; moninfo = 0; hashcomp = 1; trustdns = true; }
+                  vomsat = 1; vomsfun = 0; vomsfunparms = 0; moninfo = 0;
+                  hashcomp = 1; trustdns = true; showDN = false; createpxy = 1;}
    virtual ~gsiOptions() { } // Cleanup inside XrdSecProtocolgsiInit
    void Print(XrdOucTrace *t); // Print summary of gsi option status
 };
@@ -239,20 +249,21 @@ typedef struct {
    const char *valid;
    int         deplen;
    int         bits;
+   bool        createpxy;
 } ProxyIn_t;
 
 template<class T>
 class GSIStack {
 public:
    void Add(T *t) {
-      char k[40]; snprintf(k, 40, "%p", t);
+      char k[40]; snprintf(k, 40, "%p", static_cast<void*>(t));
       mtx.Lock();
       if (!stack.Find(k)) stack.Add(k, t, 0, Hash_count); // We need an additional count
       stack.Add(k, t, 0, Hash_count);
       mtx.UnLock();
    }
    void Del(T *t) {
-      char k[40]; snprintf(k, 40, "%p", t);
+      char k[40]; snprintf(k, 40, "%p", static_cast<void*>(t));
       mtx.Lock();
       if (stack.Find(k)) stack.Del(k, Hash_count);
       mtx.UnLock();
@@ -342,6 +353,7 @@ private:
    static int              PxyReqOpts;
    static int              AuthzPxyWhat;
    static int              AuthzPxyWhere;
+   static int              AuthzAlways;
    static String           SrvAllowedNames;
    static int              VOMSAttrOpt; 
    static XrdSecgsiVOMS_t  VOMSFun;
@@ -349,6 +361,7 @@ private:
    static int              MonInfoOpt;
    static bool             HashCompatibility;
    static bool             TrustDNS;
+   static bool             ShowDN;
    //
    // Crypto related info
    static int              ncrypt;                  // Number of factories
@@ -369,7 +382,7 @@ private:
    //
    // CA and CRL stacks
    static GSIStack<XrdCryptoX509Chain>    stackCA; // Stack of CA in use
-   static GSIStack<XrdCryptoX509Crl>      stackCRL; // Stack of CRL in use
+   static std::unique_ptr<GSIStack<XrdCryptoX509Crl>> stackCRL; // Stack of CRL in use
    //
    // GMAP control vars
    static time_t           lastGMAPCheck; // time of last check on GMAP
@@ -397,6 +410,9 @@ private:
    bool             srvMode;       // TRUE if server mode
    char            *expectedHost;  // Expected hostname if TrustDNS is enabled.
    bool             useIV;         // Use a non-zeroed unique IV in cipher enc/dec operations
+   String           urlUsrProxy;   // Proxy file location if given to client in url
+   String           urlUsrCert;    // Proxy cert location if given to client in url
+   String           urlUsrKey;     // Proxy key location if given to client in url
 
    // Temporary Handshake local info
    gsiHSVars     *hs;
@@ -483,9 +499,6 @@ private:
    // Entity handling
    void CopyEntity(XrdSecEntity *in, XrdSecEntity *out, int *lout = 0);
    void FreeEntity(XrdSecEntity *in);
-
-   // VOMS parsing
-   int ExtractVOMS(X509Chain *c, XrdSecEntity &ent);
 };
 
 class gsiHSVars {
@@ -522,15 +535,23 @@ public:
                      if (Chain) Chain->Cleanup(1);
                      SafeDelete(Chain);
                   }
-                  if (Crl) {
+                  // Make sure XrdSecProtocolgsi::stackCRL exists, it could happen
+                  // that it has been deallocated due to static deinitialization
+                  // order fiasco
+                  if (Crl && bool( XrdSecProtocolgsi::stackCRL ) ) {
                      // This decreases the counter and actually deletes the object only
                      // when no instance is using it
-                     XrdSecProtocolgsi::stackCRL.Del(Crl);
+                     XrdSecProtocolgsi::stackCRL->Del(Crl);
                      Crl = 0;
                   }
-                  // The proxy chain is owned by the proxy cache; invalid proxies are
-                  // detected (and eventually removed) by QueryProxy
-                  PxyChain = 0;
+                  if (Options & kOptsDelPxy) {
+                     if (PxyChain) PxyChain->Cleanup();
+                     SafeDelete(PxyChain);
+                  } else {
+                     // The proxy chain is owned by the proxy cache; invalid proxies
+                     // are detected (and eventually removed) by QueryProxy
+                     PxyChain = 0;
+                  }
                   SafeDelete(Parms); }
    void Dump(XrdSecProtocolgsi *p = 0);
 };

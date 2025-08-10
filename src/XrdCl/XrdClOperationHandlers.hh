@@ -27,56 +27,22 @@
 #define __XRD_CL_OPERATION_HANDLERS_HH__
 
 #include "XrdCl/XrdClFile.hh"
+#include "XrdCl/XrdClCtx.hh"
+
+#include<functional>
+#include<future>
+#include <memory>
 
 namespace XrdCl
 {
   //----------------------------------------------------------------------------
-  //! Helper class for checking if a given Handler is derived
-  //! from ForwardingHandler
-  //!
-  //! @arg Hdlr : type of given handler
+  //! Helper class for unpacking single XAttrStatus from bulk response
   //----------------------------------------------------------------------------
-  template<typename Hdlr>
-  struct IsResponseHandler
-  {
-      //------------------------------------------------------------------------
-      //! true if the Hdlr type has been derived from ForwardingHandler,
-      //! false otherwise
-      //------------------------------------------------------------------------
-      static constexpr bool value = std::is_base_of<XrdCl::ResponseHandler, Hdlr>::value;
-  };
-
-  //----------------------------------------------------------------------------
-  //! Helper class for checking if a given Handler is derived
-  //! from ForwardingHandler (overloaded for pointers)
-  //!
-  //! @arg Hdlr : type of given handler
-  //----------------------------------------------------------------------------
-  template<typename Hdlr>
-  struct IsResponseHandler<Hdlr*>
-  {
-      //------------------------------------------------------------------------
-      //! true if the Hdlr type has been derived from ForwardingHandler,
-      //! false otherwise
-      //------------------------------------------------------------------------
-      static constexpr bool value = std::is_base_of<XrdCl::ResponseHandler, Hdlr>::value;
-  };
-
-  //----------------------------------------------------------------------------
-  //! Lambda wrapper
-  //----------------------------------------------------------------------------
-  class SimpleFunctionWrapper: public ResponseHandler
+  class UnpackXAttrStatus : public ResponseHandler
   {
     public:
 
-      //------------------------------------------------------------------------
-      //! Constructor.
-      //
-      //! @param func : function, functor or lambda
-      //------------------------------------------------------------------------
-      SimpleFunctionWrapper(
-          std::function<void( XRootDStatus& )> handleFunction ) :
-          fun( handleFunction )
+      UnpackXAttrStatus( ResponseHandler *handler ) : handler( handler )
       {
       }
 
@@ -85,25 +51,116 @@ namespace XrdCl
       //------------------------------------------------------------------------
       void HandleResponse( XRootDStatus *status, AnyObject *response )
       {
-        fun( *status );
-        delete status;
+        // status maybe error for old servers not supporting xattrs
+        if( !status->IsOK() )
+        {
+          handler->HandleResponse( status, nullptr );
+          return;
+        }
+
+        std::vector<XAttrStatus> *bulk = nullptr;
+        response->Get( bulk );
+        if (status && bulk && !bulk->empty()) {
+          *status = bulk->front().status;
+        }
+        handler->HandleResponse( status, nullptr );
         delete response;
-        delete this;
       }
 
     private:
-      //------------------------------------------------------------------------
-      //! user defined function, functor or lambda
-      //------------------------------------------------------------------------
-      std::function<void( XRootDStatus& )> fun;
+
+      ResponseHandler *handler;
   };
+
+  //----------------------------------------------------------------------------
+  //! Helper class for unpacking single XAttr from bulk response
+  //----------------------------------------------------------------------------
+  class UnpackXAttr : public ResponseHandler
+  {
+    public:
+
+      UnpackXAttr( ResponseHandler *handler ) : handler( handler )
+      {
+      }
+
+      //------------------------------------------------------------------------
+      //! Callback method.
+      //------------------------------------------------------------------------
+      void HandleResponse( XRootDStatus *status, AnyObject *response )
+      {
+        // status is always OK for bulk response
+
+        std::vector<XAttr> *bulk = nullptr;
+        response->Get( bulk );
+
+        if (bulk && !bulk->empty()) {
+          if (status)
+            *status = bulk->front().status;
+
+          std::string *rsp = new std::string(std::move(bulk->front().value));
+          response->Set( rsp );
+        }
+
+        delete bulk;
+        handler->HandleResponse( status, response );
+      }
+
+    private:
+
+      ResponseHandler *handler;
+  };
+
+  //----------------------------------------------------------------------------
+  // Helper class for creating null references for particular types
+  //
+  // @arg Response : type for which we need a null reference
+  //----------------------------------------------------------------------------
+  template<typename Response>
+  struct NullRef
+  {
+      static Response value;
+  };
+
+  //----------------------------------------------------------------------------
+  // Initialize the 'null-reference'
+  //----------------------------------------------------------------------------
+  template<typename Response>
+  Response NullRef<Response>::value;
+
+  //----------------------------------------------------------------------------
+  //! Unpack response
+  //!
+  //! @param rsp : AnyObject holding response
+  //! @return    : the response
+  //----------------------------------------------------------------------------
+  template<typename Response>
+  inline Response* GetResponse( AnyObject *rsp )
+  {
+    Response *ret = nullptr;
+    rsp->Get( ret );
+    return ret;
+  }
+
+  //----------------------------------------------------------------------------
+  //! Unpack response
+  //!
+  //! @param rsp    : AnyObject holding response
+  //! @param status :
+  //! @return       : the response
+  //----------------------------------------------------------------------------
+  template<typename Response>
+  inline Response* GetResponse( XRootDStatus *status, AnyObject *rsp )
+  {
+    if( !status->IsOK() ) return &NullRef<Response>::value;
+    return GetResponse<Response>( rsp );
+  }
 
   //----------------------------------------------------------------------------
   //! Lambda wrapper
   //!
   //! @arg ResponseType : type of response returned by the server
   //----------------------------------------------------------------------------
-  template<typename ResponseType>
+  template<typename Response>
   class FunctionWrapper: public ResponseHandler
   {
     public:
@@ -111,10 +168,21 @@ namespace XrdCl
       //------------------------------------------------------------------------
       //! Constructor.
       //
-      //! @param func : function, functor or lambda
+      //! @param func : function, functor or lambda (2 arguments)
       //------------------------------------------------------------------------
       FunctionWrapper(
-          std::function<void( XRootDStatus&, ResponseType& )> handleFunction ) :
+          std::function<void( XRootDStatus&, Response& )> handleFunction ) :
+          fun( [handleFunction]( XRootDStatus &s, Response &r, HostList& ){ handleFunction( s, r ); } )
+      {
+      }
+
+      //------------------------------------------------------------------------
+      //! Constructor.
+      //
+      //! @param func : function, functor or lambda (3 arguments)
+      //------------------------------------------------------------------------
+      FunctionWrapper(
+          std::function<void( XRootDStatus&, Response&, HostList& )> handleFunction ) :
           fun( handleFunction )
       {
       }
@@ -122,37 +190,71 @@ namespace XrdCl
       //------------------------------------------------------------------------
       //! Callback method.
       //------------------------------------------------------------------------
-      void HandleResponse( XRootDStatus *status, AnyObject *response )
+      void HandleResponseWithHosts( XRootDStatus *status, AnyObject *response, HostList *hostList )
       {
-        ResponseType *res = nullptr;
-        if( status->IsOK() )
-          response->Get( res );
-        else
-          res = &nullref;
-        fun( *status, *res );
-        delete status;
-        delete response;
-        delete this;
+        std::unique_ptr<XRootDStatus> delst( status );
+        std::unique_ptr<AnyObject> delrsp( response );
+        std::unique_ptr<HostList> delhl( hostList );
+        Response *res = GetResponse<Response>( status, response );
+        fun( *status, *res, *hostList );
       }
 
     private:
       //------------------------------------------------------------------------
       //! user defined function, functor or lambda
       //------------------------------------------------------------------------
-      std::function<void( XRootDStatus&, ResponseType& )> fun;
-
-      //------------------------------------------------------------------------
-      //! Null reference to the response (not really but acts as one)
-      //------------------------------------------------------------------------
-      static ResponseType nullref;
+      std::function<void( XRootDStatus&, Response&, HostList& )> fun;
   };
 
   //----------------------------------------------------------------------------
-  // Initialize the 'null-reference'
+  //! Lambda wrapper
+  //!
+  //! Template specialization for responses that return no value (void)
   //----------------------------------------------------------------------------
-  template<typename ResponseType>
-  ResponseType FunctionWrapper<ResponseType>::nullref;
+  template<>
+  class FunctionWrapper<void> : public ResponseHandler
+  {
+    public:
 
+      //------------------------------------------------------------------------
+      //! Constructor.
+      //
+      //! @param func : function, functor or lambda (1 argument)
+      //------------------------------------------------------------------------
+      FunctionWrapper(
+          std::function<void( XRootDStatus& )> handleFunction ) :
+          fun( [handleFunction]( XRootDStatus& s, HostList& ){ handleFunction( s ); } )
+      {
+      }
+
+      //------------------------------------------------------------------------
+      //! Constructor.
+      //
+      //! @param func : function, functor or lambda (2 arguments)
+      //------------------------------------------------------------------------
+      FunctionWrapper(
+          std::function<void( XRootDStatus&, HostList& )> handleFunction ) :
+          fun( handleFunction )
+      {
+      }
+
+      //------------------------------------------------------------------------
+      //! Callback method.
+      //------------------------------------------------------------------------
+      void HandleResponseWithHosts( XRootDStatus *status, AnyObject *response, HostList *hostList )
+      {
+        std::unique_ptr<XRootDStatus> delst( status );
+        std::unique_ptr<AnyObject> delrsp( response );
+        std::unique_ptr<HostList> delhl( hostList );
+        fun( *status, *hostList );
+      }
+
+    private:
+      //------------------------------------------------------------------------
+      //! user defined function, functor or lambda
+      //------------------------------------------------------------------------
+      std::function<void( XRootDStatus&, HostList& )> fun;
+  };
 
   //----------------------------------------------------------------------------
   //! Packaged Task wrapper
@@ -180,15 +282,10 @@ namespace XrdCl
       //------------------------------------------------------------------------
       void HandleResponse( XRootDStatus *status, AnyObject *response )
       {
-        Response *resp = nullptr;
-        if( status->IsOK() )
-          response->Get( resp );
-        else
-          resp = &nullref;
+        std::unique_ptr<XRootDStatus> delst( status );
+        std::unique_ptr<AnyObject> delrsp( response );
+        Response *resp = GetResponse<Response>( status, response );
         task( *status, *resp );
-        delete status;
-        delete response;
-        delete this;
       }
 
     private:
@@ -197,18 +294,7 @@ namespace XrdCl
       //! user defined task
       //------------------------------------------------------------------------
       std::packaged_task<Return( XRootDStatus&, Response& )> task;
-
-      //------------------------------------------------------------------------
-      //! Null reference to the response (not really but acts as one)
-      //------------------------------------------------------------------------
-      static Response nullref;
   };
-
-  //----------------------------------------------------------------------------
-  // Initialize the 'null-reference'
-  //----------------------------------------------------------------------------
-  template<typename Response, typename Return>
-  Response TaskWrapper<Response, Return>::nullref;
 
   //----------------------------------------------------------------------------
   //! Packaged Task wrapper, specialization for requests that have no response
@@ -218,7 +304,7 @@ namespace XrdCl
   //! @arg Return   : type of the value returned by the task
   //----------------------------------------------------------------------------
   template<typename Return>
-  class TaskWrapper<void, Return>
+  class TaskWrapper<void, Return>: public ResponseHandler
   {
     public:
 
@@ -237,10 +323,9 @@ namespace XrdCl
       //------------------------------------------------------------------------
       void HandleResponse( XRootDStatus *status, AnyObject *response )
       {
+        std::unique_ptr<XRootDStatus> delst( status );
+        std::unique_ptr<AnyObject> delrsp( response );
         task( *status );
-        delete status;
-        delete response;
-        delete this;
       }
 
     private:
@@ -262,10 +347,21 @@ namespace XrdCl
       //------------------------------------------------------------------------
       //! Constructor.
       //
-      //! @param func : function, functor or lambda
+      //! @param func : function, functor or lambda (2 arguments)
       //------------------------------------------------------------------------
-      ExOpenFuncWrapper( File &f,
+      ExOpenFuncWrapper( const Ctx<File> &f,
           std::function<void( XRootDStatus&, StatInfo& )> handleFunction ) :
+          f( f ), fun( [handleFunction]( XRootDStatus &s, StatInfo &i, HostList& ){ handleFunction( s, i ); } )
+      {
+      }
+
+      //------------------------------------------------------------------------
+      //! Constructor.
+      //
+      //! @param func : function, functor or lambda (3 arguments)
+      //------------------------------------------------------------------------
+      ExOpenFuncWrapper( const Ctx<File> &f,
+          std::function<void( XRootDStatus&, StatInfo&, HostList& )> handleFunction ) :
           f( f ), fun( handleFunction )
       {
       }
@@ -273,37 +369,30 @@ namespace XrdCl
       //------------------------------------------------------------------------
       //! Callback method.
       //------------------------------------------------------------------------
-      void HandleResponse( XRootDStatus *status, AnyObject *response )
+      void HandleResponseWithHosts( XRootDStatus *status, AnyObject *response, HostList *hostList )
       {
+        delete response;
+        std::unique_ptr<XRootDStatus> delst( status );
+        std::unique_ptr<StatInfo> delrsp;
+        std::unique_ptr<HostList> delhl;
         StatInfo *info = nullptr;
         if( status->IsOK() )
-          XRootDStatus st = f.Stat( false, info );
+        {
+          XRootDStatus st = f->Stat( false, info );
+          delrsp.reset( info );
+        }
         else
-          info = &nullref;
-        fun( *status, *info );
-        if( info != &nullref ) delete info;
-        delete status;
-        delete response;
-        delete this;
+          info = &NullRef<StatInfo>::value;
+        fun( *status, *info, *hostList );
       }
 
     private:
-      File &f;
+      Ctx<File> f;
       //------------------------------------------------------------------------
       //! user defined function, functor or lambda
       //------------------------------------------------------------------------
-      std::function<void( XRootDStatus&, StatInfo& )> fun;
-
-      //------------------------------------------------------------------------
-      //! Null reference to the response (not really but acts as one)
-      //------------------------------------------------------------------------
-      static StatInfo nullref;
+      std::function<void( XRootDStatus&, StatInfo&, HostList& )> fun;
   };
-
-  //----------------------------------------------------------------------------
-  // Initialize the 'null-reference'
-  //----------------------------------------------------------------------------
-  StatInfo ExOpenFuncWrapper::nullref;
 
   //----------------------------------------------------------------------------
   //! Pipeline exception, wrapps an XRootDStatus
@@ -315,7 +404,7 @@ namespace XrdCl
       //------------------------------------------------------------------------
       //! Constructor from XRootDStatus
       //------------------------------------------------------------------------
-      PipelineException( const XRootDStatus &error ) : error( error )
+      PipelineException( const XRootDStatus &error ) : error( error ), strerr( error.ToString() )
       {
 
       }
@@ -323,7 +412,7 @@ namespace XrdCl
       //------------------------------------------------------------------------
       //! Copy constructor.
       //------------------------------------------------------------------------
-      PipelineException( const PipelineException &ex ) : error( ex.error )
+      PipelineException( const PipelineException &ex ) : error( ex.error ), strerr( ex.error.ToString() )
       {
 
       }
@@ -333,7 +422,8 @@ namespace XrdCl
       //------------------------------------------------------------------------
       PipelineException& operator=( const PipelineException &ex )
       {
-        error = ex.error;
+        error  = ex.error;
+        strerr = ex.strerr;
         return *this;
       }
 
@@ -342,7 +432,7 @@ namespace XrdCl
       //------------------------------------------------------------------------
       const char* what() const noexcept
       {
-        return error.ToString().c_str();
+        return strerr.c_str();
       }
 
       //------------------------------------------------------------------------
@@ -359,6 +449,7 @@ namespace XrdCl
       //! the XRootDStatus associated with this exception
       //------------------------------------------------------------------------
       XRootDStatus error;
+      std::string  strerr;
   };
 
   //----------------------------------------------------------------------------
@@ -377,20 +468,17 @@ namespace XrdCl
       //!
       //! @param ftr : the future to be linked with this handler
       //------------------------------------------------------------------------
-      FutureWrapperBase( std::future<Response> &ftr ) : called( false )
+      FutureWrapperBase( std::future<Response> &ftr ) : fulfilled( false )
       {
         ftr = prms.get_future();
       }
 
       //------------------------------------------------------------------------
       //! Destructor
-      //!
-      //! If the handler was not called sets an exception in the promise
       //------------------------------------------------------------------------
-      ~FutureWrapperBase()
+      virtual ~FutureWrapperBase()
       {
-        if( !called )
-          this->SetException( XRootDStatus( stError, errPipelineFailed ) );
+        if( !fulfilled ) SetException( XRootDStatus( stError, errPipelineFailed ) );
       }
 
     protected:
@@ -400,22 +488,18 @@ namespace XrdCl
       //!
       //! @param err : the error
       //------------------------------------------------------------------------
-      void SetException( const XRootDStatus &err )
+      inline void SetException( const XRootDStatus &err )
       {
         std::exception_ptr ex = std::make_exception_ptr( PipelineException( err ) );
         prms.set_exception( ex );
+        fulfilled = true;
       }
 
       //------------------------------------------------------------------------
       //! promise that corresponds to the future
       //------------------------------------------------------------------------
       std::promise<Response> prms;
-
-      //------------------------------------------------------------------------
-      //! true if the handler has been called, false otherwise
-      //------------------------------------------------------------------------
-      bool called;
-
+      bool                   fulfilled;
   };
 
   //----------------------------------------------------------------------------
@@ -435,7 +519,6 @@ namespace XrdCl
       //------------------------------------------------------------------------
       FutureWrapper( std::future<Response> &ftr ) : FutureWrapperBase<Response>( ftr )
       {
-
       }
 
       //------------------------------------------------------------------------
@@ -443,20 +526,21 @@ namespace XrdCl
       //------------------------------------------------------------------------
       void HandleResponse( XRootDStatus *status, AnyObject *response )
       {
-        this->called = true;
-
+        std::unique_ptr<XRootDStatus> delst( status );
+        std::unique_ptr<AnyObject> delrsp( response );
         if( status->IsOK() )
         {
-          Response *resp = 0;
-          response->Get( resp );
-          this->prms.set_value( std::move( *resp ) );
+          Response *resp = GetResponse<Response>( response );
+          if( resp == &NullRef<Response>::value )
+            this->SetException( XRootDStatus( stError, errInternal ) );
+          else
+          {
+            this->prms.set_value( std::move( *resp ) );
+            this->fulfilled = true;
+          }
         }
         else
           this->SetException( *status );
-
-        delete status;
-        delete response;
-        delete this;
       }
   };
 
@@ -475,7 +559,6 @@ namespace XrdCl
       //------------------------------------------------------------------------
       FutureWrapper( std::future<void> &ftr ) : FutureWrapperBase<void>( ftr )
       {
-
       }
 
       //------------------------------------------------------------------------
@@ -483,20 +566,53 @@ namespace XrdCl
       //------------------------------------------------------------------------
       void HandleResponse( XRootDStatus *status, AnyObject *response )
       {
-        this->called = true;
-
-
+        std::unique_ptr<XRootDStatus> delst( status );
+        std::unique_ptr<AnyObject> delrsp( response );
         if( status->IsOK() )
         {
           prms.set_value();
+          fulfilled = true;
         }
         else
           SetException( *status );
-
-        delete status;
-        delete response;
-        delete this;
       }
+  };
+
+
+  //----------------------------------------------------------------------------
+  //! Wrapper class for raw response handler (ResponseHandler).
+  //----------------------------------------------------------------------------
+  class RawWrapper : public ResponseHandler
+  {
+    public:
+
+      //------------------------------------------------------------------------
+      //! Constructor
+      //!
+      //! @param handler : the actual operation handler
+      //------------------------------------------------------------------------
+      RawWrapper( ResponseHandler *handler ) : handler( handler )
+      {
+      }
+
+      //------------------------------------------------------------------------
+      //! Callback method (@see ResponseHandler)
+      //!
+      //! Note: does not delete itself because it is assumed that it is owned
+      //!       by the PipelineHandler (@see PipelineHandler)
+      //------------------------------------------------------------------------
+      virtual void HandleResponseWithHosts( XRootDStatus *status,
+                                            AnyObject    *response,
+                                            HostList     *hostList )
+      {
+        handler->HandleResponseWithHosts( status, response, hostList );
+      }
+
+    private:
+      //------------------------------------------------------------------------
+      //! The actual operation handler (we don't own the pointer)
+      //------------------------------------------------------------------------
+      ResponseHandler *handler;
   };
 
 
@@ -512,23 +628,23 @@ namespace XrdCl
       //------------------------------------------------------------------------
       //!  A factory method, simply forwards the given handler
       //!
-      //! @param h : the ResponseHandler that should be wrapped
-      //! @return  : a ForwardingHandler instance
+      //! @param hdlr : the ResponseHandler that should be wrapped
+      //! @return     : a ForwardingHandler instance
       //------------------------------------------------------------------------
       inline static ResponseHandler* Create( ResponseHandler *hdlr )
       {
-        return hdlr;
+        return new RawWrapper( hdlr );
       }
 
       //------------------------------------------------------------------------
       //!  A factory method, simply forwards the given handler
       //!
-      //! @param h : the ResponseHandler that should be wrapped
-      //! @return  : a ForwardingHandler instance
+      //! @param hdlr : the ResponseHandler that should be wrapped
+      //! @return     : a ForwardingHandler instance
       //------------------------------------------------------------------------
       inline static ResponseHandler* Create( ResponseHandler &hdlr )
       {
-        return &hdlr;
+        return new RawWrapper( &hdlr );
       }
 
       //------------------------------------------------------------------------
@@ -567,7 +683,19 @@ namespace XrdCl
       //------------------------------------------------------------------------
       //! A factory method
       //!
-      //! @param func : the task that should be wrapped
+      //! @param func : the function/functor/lambda that should be wrapped
+      //! @return     : FunctionWrapper instance
+      //------------------------------------------------------------------------
+      inline static ResponseHandler* Create( std::function<void( XRootDStatus&,
+          Response&, HostList& )> func )
+      {
+        return new FunctionWrapper<Response>( func );
+      }
+
+      //------------------------------------------------------------------------
+      //! A factory method
+      //!
+      //! @param task : the task that should be wrapped
       //! @return     : TaskWrapper instance
       //------------------------------------------------------------------------
       template<typename Return>
@@ -599,13 +727,24 @@ namespace XrdCl
       //------------------------------------------------------------------------
       inline static ResponseHandler* Create( std::function<void( XRootDStatus& )> func )
       {
-        return new SimpleFunctionWrapper( func );
+        return new FunctionWrapper<void>( func );
       }
 
       //------------------------------------------------------------------------
       //! A factory method
       //!
-      //! @param func : the task that should be wrapped
+      //! @param func : the function/functor/lambda that should be wrapped
+      //! @return     : SimpleFunctionWrapper instance
+      //------------------------------------------------------------------------
+      inline static ResponseHandler* Create( std::function<void( XRootDStatus&, HostList& )> func )
+      {
+        return new FunctionWrapper<void>( func );
+      }
+
+      //------------------------------------------------------------------------
+      //! A factory method
+      //!
+      //! @param task : the task that should be wrapped
       //! @return     : TaskWrapper instance
       //------------------------------------------------------------------------
       template<typename Return>

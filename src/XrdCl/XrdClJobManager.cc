@@ -20,6 +20,7 @@
 #include "XrdCl/XrdClLog.hh"
 #include "XrdCl/XrdClDefaultEnv.hh"
 #include "XrdCl/XrdClConstants.hh"
+#include "XrdSys/XrdSysE2T.hh"
 
 //------------------------------------------------------------------------------
 // The thread
@@ -75,14 +76,14 @@ namespace XrdCl
       if( ret != 0 )
       {
         log->Error( JobMgrMsg, "Unable to spawn a job worker thread: %s",
-                    strerror( errno ) );
+                    XrdSysE2T( errno ) );
         if( i > 0 )
-          StopWorkers( i-1 );
+          StopWorkers( i );
         return false;
       }
     }
     pRunning = true;
-    log->Debug( JobMgrMsg, "Job manager started, %d workers", pWorkers.size() );
+    log->Debug( JobMgrMsg, "Job manager started, %zu workers", pWorkers.size() );
     return true;
   }
 
@@ -100,7 +101,7 @@ namespace XrdCl
       return false;
     }
 
-    StopWorkers( pWorkers.size()-1 );
+    StopWorkers( pWorkers.size() );
 
     pRunning = false;
     log->Debug( JobMgrMsg, "Job manager stopped" );
@@ -113,21 +114,25 @@ namespace XrdCl
   void JobManager::StopWorkers( uint32_t n )
   {
     Log *log = DefaultEnv::GetLog();
-    for( uint32_t i = 0; i <= n; ++i )
+    for( uint32_t i = 0; i < n; ++i )
     {
       void *threadRet;
       log->Dump( JobMgrMsg, "Stopping worker #%d...", i );
-      if( pthread_cancel( pWorkers[i] ) != 0 )
+      int rc = pthread_cancel( pWorkers[i] );
+      if( rc != 0 )
       {
         log->Error( TaskMgrMsg, "Unable to cancel worker #%d: %s", i,
-                    strerror( errno ) );
+                    XrdSysE2T( errno ) );
+        if( rc == ESRCH ) continue;
         abort();
       }
       
-      if( pthread_join( pWorkers[i], (void**)&threadRet ) != 0 )
+      rc = pthread_join( pWorkers[i], (void**)&threadRet );
+      if( rc != 0 )
       {
         log->Error( TaskMgrMsg, "Unable to join worker #%d: %s", i,
-                    strerror( errno ) );
+                    XrdSysE2T( errno ) );
+        if( rc == ESRCH ) continue;
         abort();
       }
 

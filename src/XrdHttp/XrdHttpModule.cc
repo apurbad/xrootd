@@ -23,7 +23,7 @@ extern "C" {
 
     // Put up the banner
     //
-    pi->eDest->Say("Copr. 2012 CERN IT, an HTTP implementation for the XROOTD framework.");
+    pi->eDest->Say("Copr. 2012 CERN IT, an HTTP implementation for the XRootD framework.");
     pi->eDest->Say("++++++ HTTP protocol initialization started.");
 
     // Return the protocol object to be used if static init succeeds
@@ -44,7 +44,7 @@ extern "C" {
 /******************************************************************************/
 
 // This function is called early on to determine the port we need to use. The
-// default is ostensibly 1094 but can be overidden; which we allow.
+// default is ostensibly 1094 but can be overridden; which we allow.
 //
 XrdVERSIONINFO(XrdgetProtocolPort, xrdhttp);
 

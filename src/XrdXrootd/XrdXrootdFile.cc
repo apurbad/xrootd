@@ -27,9 +27,9 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <inttypes.h>
-#include <stdlib.h>
-#include <string.h>
+#include <cinttypes>
+#include <cstdlib>
+#include <cstring>
 #include <unistd.h>
 #include <netinet/in.h>
 #include <sys/types.h>
@@ -38,10 +38,12 @@
 #include "XrdSys/XrdSysError.hh"
 #include "XrdSys/XrdSysPthread.hh"
 #include "XrdSfs/XrdSfsInterface.hh"
+#include "XrdXrootd/XrdXrootdAioFob.hh"
 #include "XrdXrootd/XrdXrootdFile.hh"
 #include "XrdXrootd/XrdXrootdFileLock.hh"
 #include "XrdXrootd/XrdXrootdMonFile.hh"
 #include "XrdXrootd/XrdXrootdMonitor.hh"
+#include "XrdXrootd/XrdXrootdPgwFob.hh"
 #define  TRACELINK this
 #include "XrdXrootd/XrdXrootdTrace.hh"
  
@@ -50,7 +52,7 @@
 /******************************************************************************/
 
 #ifndef NODEBUG  
-extern XrdOucTrace      *XrdXrootdTrace;
+extern XrdSysTrace       XrdXrootdTrace;
 #endif
 
        XrdXrootdFileLock *XrdXrootdFile::Locker;
@@ -60,13 +62,13 @@ extern XrdOucTrace      *XrdXrootdTrace;
        const char      *XrdXrootdFileTable::TraceID = "FileTable";
        const char      *XrdXrootdFileTable::ID      = "";
 
+       XrdXrootdFile   *XrdXrootdFileTable::heldSpotP = (XrdXrootdFile *)1;
+
 namespace
 {
              XrdSysError   *eDest;
 
 static const unsigned long  heldSpotV = 1UL;;
-
-static       XrdXrootdFile *heldSpotP = (XrdXrootdFile *)1;
 
 static const unsigned long  heldMask = ~1UL;
 }
@@ -79,32 +81,34 @@ static const unsigned long  heldMask = ~1UL;
 /******************************************************************************/
   
 XrdXrootdFile::XrdXrootdFile(const char *id, const char *path, XrdSfsFile *fp,
-                             char mode, bool async, int sfok, struct stat *sP)
+                             char mode, bool async, struct stat *sP)
+                            : XrdSfsp(fp), mmAddr(0), FileKey(strdup(path)),
+                              FileMode(mode), AsyncMode(async),
+                              aioFob(0), pgwFob(0), fhProc(0),
+                              ID(id), refCount(0), syncWait(0)
 {
     static XrdSysMutex seqMutex;
     struct stat buf;
     off_t mmSize;
 
-    XrdSfsp  = fp;
-    FileKey  = strdup(path);
-    mmAddr   = 0;
-    FileMode = mode;
-    AsyncMode= (async ? 1 : 0);
-    fhProc   = 0;
-    ID       = id;
-
+// Initialize statistical counters
+//
     Stats.Init();
 
-// Get the file descriptor number (none if not a regular file)
+// Get the file descriptor number for sendfile() processing
 //
-   if (fp->fctl(SFS_FCTL_GETFD, 0, fp->error) != SFS_OK) fdNum = -1;
-      else fdNum = fp->error.getErrInfo();
-   sfEnabled = (sfOK && sfok && (fdNum >= 0||fdNum==(int)SFS_SFIO_FDVAL) ? 1:0);
+   if (!sfOK || fp->fctl(SFS_FCTL_GETFD, 0, fp->error) != SFS_OK)
+      {fdNum = -1;
+       sfEnabled = false;
+      } else {
+       fdNum = fp->error.getErrInfo();
+       sfEnabled = (fdNum >= 0 || fdNum == (int)SFS_SFIO_FDVAL);
+      }
 
 // Determine if file is memory mapped
 //
-   if (fp->getMmap((void **)&mmAddr, mmSize) != SFS_OK) isMMapped = 0;
-      else {isMMapped = (mmSize ? 1 : 0);
+   if (fp->getMmap((void **)&mmAddr, mmSize) != SFS_OK) isMMapped = false;
+      else {isMMapped = (mmSize ? true : false);
             Stats.fSize = static_cast<long long>(mmSize);
            }
 
@@ -118,11 +122,10 @@ XrdXrootdFile::XrdXrootdFile(const char *id, const char *path, XrdSfsFile *fp,
 }
   
 /******************************************************************************/
-/*                                                                            */
 /*                                  I n i t                                   */
 /******************************************************************************/
   
-void XrdXrootdFile::Init(XrdXrootdFileLock *lp, XrdSysError *erP, int sfok)
+void XrdXrootdFile::Init(XrdXrootdFileLock *lp, XrdSysError *erP, bool sfok)
 {
    Locker = lp;
    eDest  = erP;
@@ -135,6 +138,9 @@ void XrdXrootdFile::Init(XrdXrootdFileLock *lp, XrdSysError *erP, int sfok)
   
 XrdXrootdFile::~XrdXrootdFile()
 {
+   if (aioFob) aioFob->Reset();
+
+   Serialize(); // Make sure there are no outstanding references
 
    if (XrdSfsp)
       {TRACEI(FS, "closing " <<FileMode <<' ' <<FileKey);
@@ -145,9 +151,51 @@ XrdXrootdFile::~XrdXrootdFile()
 
    if (fhProc) fhProc->Avail(fHandle);
 
-   if (FileKey) free(FileKey);
+   if (aioFob) delete aioFob;
+
+   if (pgwFob) delete pgwFob;
+
+   if (FileKey) free(FileKey); // Must be the last thing deleted!
 }
 
+/******************************************************************************/
+/*                                   R e f                                    */
+/******************************************************************************/
+  
+void XrdXrootdFile::Ref(int num)
+{
+
+// Change the reference counter and check if anyone is waiting
+//
+   fileMutex.Lock();
+   refCount += num;
+   TRACEI(FSAIO,"File::Ref="<<refCount<<" after +"<<num<<' '<<FileKey);
+   if (num < 0 && syncWait && refCount <= 0)
+      {syncWait->Post();
+       syncWait = nullptr;
+      }
+   fileMutex.UnLock();
+}
+
+/******************************************************************************/
+/*                             S e r i a l i z e                              */
+/******************************************************************************/
+  
+void XrdXrootdFile::Serialize()
+{
+
+// Wait until the reference count reaches zero
+//
+   fileMutex.Lock();
+   TRACEI(FSAIO, "serializing access "<<FileMode<<" Ref="<<refCount<<' '<<FileKey);
+   if (refCount > 0)
+      {XrdSysSemaphore mySem(0);
+       syncWait = &mySem;
+       fileMutex.UnLock();
+       mySem.Wait();
+      } else fileMutex.UnLock();
+}
+  
 /******************************************************************************/
 /*                   x r d _ F i l e T a b l e   C l a s s                    */
 /******************************************************************************/
@@ -170,6 +218,7 @@ int XrdXrootdFileTable::Add(XrdXrootdFile *fp)
           else {i -= XRD_FTABSIZE;
                 if (XTab && i < XTnum) fP = &XTab[i];
                    else fP = 0;
+                i += XRD_FTABSIZE;
                }
        if (fP && *fP == heldSpotP)
           {*fP = fp;
@@ -250,6 +299,13 @@ XrdXrootdFile *XrdXrootdFileTable::Del(XrdXrootdMonitor *monP, int fnum,
 
    if (fp)
       {XrdXrootdFileStats &Stats = fp->Stats;
+   //!!! For now we add pgreads to normal reads and pgwrite to normal writes
+   //!!! Once we figure out how to report them separately, we need to do this.
+
+       Stats.xfr.read  += Stats.prw.rBytes;
+       Stats.xfr.write += Stats.prw.wBytes;
+       Stats.ops.read  += Stats.prw.rCount;
+       Stats.ops.write += Stats.prw.wCount; // Doesn't include retries!!!
 
        if (monP) monP->Close(Stats.FileID,
                              Stats.xfr.read + Stats.xfr.readv,
@@ -326,7 +382,7 @@ if (XTab)
   
 int XrdXrootdFile::bin2hex(char *outbuff, char *inbuff, int inlen)
 {
-    static char hv[] = "0123456789abcdef";
+    static const char hv[] = "0123456789abcdef";
     int i, j = 0;
 
 // Skip leading zeroes

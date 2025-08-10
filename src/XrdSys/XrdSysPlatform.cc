@@ -27,8 +27,9 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <stdio.h>
-#include <string.h>
+#include <climits>
+#include <cstdio>
+#include <cstring>
 #ifndef WIN32
 #include <unistd.h>
 #include <netinet/in.h>
@@ -69,3 +70,23 @@ size_t strlcpy(char *dst, const char *src, size_t sz)
 }
 }
 #endif
+
+
+namespace XrdSys {
+
+int getIovMax()
+{
+#ifndef IOV_MAX
+#ifdef _SC_IOV_MAX
+    static int IOV_MAX = []() {
+        int sc_iov_max = sysconf(_SC_IOV_MAX);
+        return sc_iov_max > 0 ? sc_iov_max : 1024;
+    }();
+#else
+#define IOV_MAX 1024
+#endif
+#endif
+    return IOV_MAX;
+}
+
+}

@@ -29,29 +29,32 @@
 
 #ifndef WIN32
 #include <netdb.h>
-#include <stdlib.h>
+#include <cstdlib>
 #include <strings.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #else
-#include <stdlib.h>
+#include <cstdlib>
 #include <sys/types.h>
 #include <Winsock2.h>
 #include <io.h>
-int innetgr(const char *netgroup, const char *host, const char *user,
-             const char *domain)
-{
-   return 0;
-}
 #include "XrdSys/XrdWin32.hh"
 #endif
 
 #include "XrdNet/XrdNetAddr.hh"
 #include "XrdNet/XrdNetSecurity.hh"
 #include "XrdNet/XrdNetUtils.hh"
-#include "XrdOuc/XrdOucTrace.hh"
+#include "XrdSys/XrdSysTrace.hh"
+
+#if defined(MUSL) || defined(WIN32)
+int innetgr(const char *netgroup, const char *host, const char *user,
+             const char *domain)
+{
+   return 0;
+}
+#endif
 
 /******************************************************************************/
 /*                         L o c a l   C l a s s e s                          */
@@ -72,7 +75,7 @@ char           *text;
 /*                               D e f i n e s                                */
 /******************************************************************************/
   
-#define DEBUG(x) if (eTrace) {eTrace->Beg(TraceID); cerr <<x; eTrace->End();}
+#define DEBUG(x) if (eTrace) {SYSTRACE(eTrace->, 0, TraceID, 0, x)}
 
 /******************************************************************************/
 /*                               G l o b a l s                                */

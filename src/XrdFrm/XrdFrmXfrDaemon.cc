@@ -28,9 +28,9 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <strings.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -137,6 +137,7 @@ int XrdFrmXfrDaemon::Init()
   
 void *XrdFrmXfrDaemonPong(void *parg)
 {
+    (void)parg;
     XrdFrmXfrDaemon::Pong();
     return (void *)0;
 }

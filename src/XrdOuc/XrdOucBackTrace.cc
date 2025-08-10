@@ -28,13 +28,13 @@
 /******************************************************************************/
 
 #include <iostream>
-#include <stdio.h>
-#include <stdlib.h>
+#include <cstdio>
+#include <cstdlib>
 #include <unistd.h>
 #include <vector>
 #include <sys/syscall.h>
 
-#ifdef __GNUC__
+#ifndef MUSL /* glibc, uclibc, and macOS all have execinfo.h */
 #include <execinfo.h>
 #include <cxxabi.h>
 #endif
@@ -44,6 +44,13 @@
 #if defined(__linux__) || defined(__APPLE__)
 #define TidType long long
 #define TidFmt  "%lld"
+#elif defined(__GNU__)
+#define TidType pthread_t // int (ix86), long (x86_64)
+#ifdef __x86_64__
+#define TidFmt  "%ld"
+#else
+#define TidFmt  "%d"
+#endif
 #else
 #define TidType pthread_t
 #define TidFmt  "%p"
@@ -89,14 +96,14 @@ XrdInfo *CvtReq(const char *name, int rnum)
                               {"chmod",    kXR_chmod,   1<< 2},
                               {"close",    kXR_close,   1<< 3},
                               {"dirlist",  kXR_dirlist, 1<< 4},
-                              {"getfile",  kXR_getfile, 1<< 5},
+                              {"gpfile",   kXR_gpfile,  1<< 5},
                               {"protocol", kXR_protocol,1<< 6},
                               {"login",    kXR_login,   1<< 7},
                               {"mkdir",    kXR_mkdir,   1<< 8},
                               {"mv",       kXR_mv,      1<< 9},
                               {"open",     kXR_open,    1<<10},
                               {"ping",     kXR_ping,    1<<11},
-                              {"putfile",  kXR_putfile, 1<<12},
+                              {"chkpoint", kXR_chkpoint,1<<12},
                               {"read",     kXR_read,    1<<13},
                               {"rm",       kXR_rm,      1<<14},
                               {"rmdir",    kXR_rmdir,   1<<15},
@@ -104,13 +111,13 @@ XrdInfo *CvtReq(const char *name, int rnum)
                               {"stat",     kXR_stat,    1<<17},
                               {"set",      kXR_set,     1<<18},
                               {"write",    kXR_write,   1<<19},
-                              {"admin",    kXR_admin,   1<<20},
+                              {"fattr",    kXR_fattr,   1<<20},
                               {"prepare",  kXR_prepare, 1<<21},
                               {"statx",    kXR_statx,   1<<22},
                               {"endess",   kXR_endsess, 1<<23},
                               {"bind",     kXR_bind,    1<<24},
                               {"readv",    kXR_readv,   1<<25},
-                              {"verifyw",  kXR_verifyw, 1<<26},
+                              {"pgwrite",  kXR_pgwrite, 1<<26},
                               {"locate",   kXR_locate,  1<<27},
                               {"truncate", kXR_truncate,1<<28}
                              };
@@ -173,13 +180,11 @@ XrdInfo *CvtRsp(const char *name, int snum)
 /*                              D e m a n g l e                               */
 /******************************************************************************/
   
+#ifndef MUSL
 namespace
 {
 int Demangle(char *cSym, char *buff, int blen)
 {
-#ifndef __GNUC__
-   return -1;
-#else
    int   status;
    char *plus = index(cSym, '+');
    char *brak = (plus ? index(plus, '[') : 0);
@@ -198,7 +203,6 @@ int Demangle(char *cSym, char *buff, int blen)
    status = snprintf(buff, blen, "%s %s+%s\n", brak, realname, plus+1);
    free(realname);
    return status;
-#endif
 }
 }
 
@@ -218,6 +222,7 @@ int DumpDepth()
    return (depth <= maxDepth ? depth : maxDepth);
 }
 }
+#endif
 
 /******************************************************************************/
 /*                             D u m p S t a c k                              */
@@ -227,8 +232,8 @@ namespace
 {
 void DumpStack(char *bP, int bL, TidType tid)
 {
-#ifndef __GNUC__
-   snprintf(bP, bL, "TBT " TidFmt " No stack information available, not gnuc.", tid);
+#ifdef MUSL
+   snprintf(bP, bL, "TBT " TidFmt " No stack information available with musl libc.", tid);
    return;
 #else
    static int btDepth = DumpDepth(); // One time MT-safe call

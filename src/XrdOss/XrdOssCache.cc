@@ -29,20 +29,28 @@
 /******************************************************************************/
 
 #include <unistd.h>
-#include <errno.h>
+#include <dirent.h>
+#include <cerrno>
 #include <fcntl.h>
-#include <stdio.h>
+#include <map>
+#include <cstdio>
+#include <string>
 #include <strings.h>
-#include <time.h>
+#include <ctime>
 #include <sys/param.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+
+#ifdef __linux__
+#include <sys/sysmacros.h>
+#endif
 
 #include "XrdOss/XrdOssCache.hh"
 #include "XrdOss/XrdOssOpaque.hh"
 #include "XrdOss/XrdOssPath.hh"
 #include "XrdOss/XrdOssSpace.hh"
 #include "XrdOss/XrdOssTrace.hh"
+#include "XrdOuc/XrdOucStream.hh"
 #include "XrdSys/XrdSysHeaders.hh"
 #include "XrdSys/XrdSysPlatform.hh"
   
@@ -52,9 +60,10 @@
 
 extern XrdSysError  OssEroute;
 
-extern XrdOucTrace  OssTrace;
+extern XrdSysTrace  OssTrace;
 
 XrdOssCache_Group  *XrdOssCache_Group::fsgroups = 0;
+XrdOssCache_Group  *XrdOssCache_Group::PubGroup = 0;
 
 long long           XrdOssCache_Group::PubQuota = -1;
 
@@ -74,6 +83,21 @@ int                 XrdOssCache::ovhAlloc= 0;
 int                 XrdOssCache::Quotas  = 0;
 int                 XrdOssCache::Usage   = 0;
 
+namespace XrdOssCacheDevs
+{
+struct devID
+      {int  bdevID;
+       int  partID;
+       char nDev[16];
+      };
+
+std::map<dev_t, devID> dev2ID;
+
+int devNMax = 1;
+int prtNMax = 1;
+}
+using namespace XrdOssCacheDevs;
+
 /******************************************************************************/
 /*            X r d O s s C a c h e _ F S D a t a   M e t h o d s             */
 /******************************************************************************/
@@ -82,8 +106,8 @@ XrdOssCache_FSData::XrdOssCache_FSData(const char *fsp,
                                        STATFS_t   &fsbuff,
                                        dev_t       fsID)
 {
-
      path = strdup(fsp);
+     if (!(pact= realpath(fsp,0))) pact = path;
      size = static_cast<long long>(fsbuff.f_blocks)
           * static_cast<long long>(fsbuff.FS_BLKSZ);
      frsz = static_cast<long long>(fsbuff.f_bavail)
@@ -97,7 +121,20 @@ XrdOssCache_FSData::XrdOssCache_FSData(const char *fsp,
      updt = time(0);
      next = 0;
      stat = 0;
-     seen = 0;
+
+// This is created only for new partitions!
+//
+     std::map<dev_t, devID>::iterator it = dev2ID.find(fsID);
+     if (it != dev2ID.end())
+        {bdevID = static_cast<unsigned short>(it->second.bdevID);
+         if (it->second.partID == 0) it->second.partID = prtNMax++;
+         partID = static_cast<unsigned short>(it->second.partID);
+         devN = it->second.nDev;
+        } else {
+         bdevID = 0;
+         partID = static_cast<unsigned short>(prtNMax++);
+         devN = "dev";
+        }
 }
   
 /******************************************************************************/
@@ -111,11 +148,12 @@ XrdOssCache_FS::XrdOssCache_FS(int &retc,
                                const char *fsPath,
                                FSOpts      fsOpts)
 {
-   static const mode_t theMode = S_IRWXU | S_IRWXG;
+   static const mode_t theMode = S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH;
    STATFS_t fsbuff;
    struct stat sfbuff;
    XrdOssCache_FSData *fdp;
    XrdOssCache_FS     *fsp;
+   int n;
 
 // Prefill in case of failure
 //
@@ -180,6 +218,26 @@ XrdOssCache_FS::XrdOssCache_FS(int &retc,
       {fsgroup->next = XrdOssCache_Group::fsgroups; 
        XrdOssCache_Group::fsgroups=fsgroup;
       }
+
+// Add a filesystem to this group but only if it is a new one
+//
+   XrdOssCache_FSAP *fsAP;
+   for (n = 0; n < fsgroup->fsNum && fdp != fsgroup->fsVec[n].fsP; n++);
+   if (n >= fsgroup->fsNum)
+      {n= (fsgroup->fsNum + 1) * sizeof(XrdOssCache_FSAP);
+       fsgroup->fsVec = (XrdOssCache_FSAP *)realloc((void *)fsgroup->fsVec,n);
+       fsAP = &(fsgroup->fsVec[fsgroup->fsNum++]);
+       fsAP->fsP   = fdp;
+       fsAP->apVec = 0;
+       fsAP->apNum = 0;
+      } else fsAP = &(fsgroup->fsVec[n]);
+
+// Add the allocation path to this partition
+//
+   n = (fsAP->apNum + 2) * sizeof(char *);
+   fsAP->apVec = (const char **)realloc((void *)fsAP->apVec, n);
+   fsAP->apVec[fsAP->apNum++] = path;
+   fsAP->apVec[fsAP->apNum]   = 0;
 }
 
 /******************************************************************************/
@@ -266,7 +324,8 @@ long long XrdOssCache_FS::freeSpace(XrdOssCache_Space &Space, const char *path)
 /*                              g e t S p a c e                               */
 /******************************************************************************/
   
-int XrdOssCache_FS::getSpace(XrdOssCache_Space &Space, const char *sname)
+int XrdOssCache_FS::getSpace(XrdOssCache_Space &Space, const char *sname,
+                             XrdOssVSPart **vsPart)
 {
    XrdOssCache_Group  *fsg = XrdOssCache_Group::fsgroups;
 
@@ -275,45 +334,60 @@ int XrdOssCache_FS::getSpace(XrdOssCache_Space &Space, const char *sname)
    while(fsg && strcmp(sname, fsg->group)) fsg = fsg->next;
    if (!fsg) return 0;
 
-// Return the space
+// Return the accumulated result
 //
-   return getSpace(Space, fsg);
+   return getSpace(Space, fsg, vsPart);
 }
 
 /******************************************************************************/
-  
-int XrdOssCache_FS::getSpace(XrdOssCache_Space &Space, XrdOssCache_Group *fsg)
+
+int  XrdOssCache_FS::getSpace(XrdOssCache_Space &Space, XrdOssCache_Group *fsg,
+                              XrdOssVSPart **vsPart)
 {
-   static unsigned int seenVal = 0;
-   XrdOssCache_FS     *fsp;
+   XrdOssVSPart       *pVec;
    XrdOssCache_FSData *fsd;
-   int pnum = 0;
 
-// Initialize some fields
+// If there is no partition table then we really have no space to report
 //
-   Space.Total = 0;
-   Space.Free  = 0;
+   if (fsg->fsNum < 1 || !fsg->fsVec) return 0;
 
-// Prepare to accumulate the stats. Note that a file system may appear in
-// multiple cache groups. The code below only counts those once.
+// If partion information is wanted, allocate a partition table
+//
+   if (vsPart) *vsPart = pVec = new XrdOssVSPart[fsg->fsNum];
+      else pVec = 0;
+
+// Prevent any changes
 //
    XrdOssCache::Mutex.Lock();
-   seenVal++;
-   Space.Usage = fsg->Usage; Space.Quota = fsg->Quota;
-   if ((fsp = XrdOssCache::fsfirst)) do
-      {if (fsp->fsgroup == fsg && fsp->fsdata->seen != seenVal)
-          {fsd = fsp->fsdata; pnum++; fsd->seen = seenVal;
-           Space.Total += fsd->size;      Space.Free   += fsd->frsz;
-           if (fsd->frsz > Space.Maxfree) Space.Maxfree = fsd->frsz;
-           if (fsd->size > Space.Largest) Space.Largest = fsd->size;
-          }
-       fsp = fsp->next;
-      } while(fsp != XrdOssCache::fsfirst);
+
+// Get overall values
+//
+   Space.Quota = fsg->Quota;
+   Space.Usage = fsg->Usage;
+
+// Accumulate the stats.
+//
+   for (int i = 0; i < fsg->fsNum; i++)
+       {fsd = fsg->fsVec[i].fsP;
+        Space.Total +=  fsd->size;
+        Space.Free  +=  fsd->frsz;
+        if (fsd->frsz > Space.Maxfree) Space.Maxfree = fsd->frsz;
+        if (fsd->size > Space.Largest) Space.Largest = fsd->size;
+
+        if (pVec)
+           {pVec[i].pPath = fsd->path;
+            pVec[i].aPath = fsg->fsVec[i].apVec;
+            pVec[i].Total = fsd->size;
+            pVec[i].Free  = fsd->frsz;
+            pVec[i].bdevID= fsd->bdevID;
+            pVec[i].partID= fsd->partID;
+           }
+       }
    XrdOssCache::Mutex.UnLock();
 
 // All done
 //
-   return pnum;
+   return fsg->fsNum;
 }
 
 /******************************************************************************/
@@ -324,31 +398,36 @@ void  XrdOssCache::Adjust(dev_t devid, off_t size)
 {
    EPNAME("Adjust")
    XrdOssCache_FSData *fsdp;
-   XrdOssCache_Group  *fsgp;
 
 // Search for matching filesystem
 //
    fsdp = XrdOssCache::fsdata;
    while(fsdp && fsdp->fsid != devid) fsdp = fsdp->next;
-   if (!fsdp) {DEBUG("dev " <<devid <<" not found."); return;}
 
-// Find the public cache group (it might not exist)
+// Adjust file system free space
 //
-   fsgp = XrdOssCache_Group::fsgroups;
-   while(fsgp && strcmp("public", fsgp->group)) fsgp = fsgp->next;
-
-// Process the result
-//
+   Mutex.Lock();
    if (fsdp) 
       {DEBUG("free=" <<fsdp->frsz <<'-' <<size <<" path=" <<fsdp->path);
-       Mutex.Lock();
-       if (        (fsdp->frsz  -= size) < 0) fsdp->frsz = 0;
+       if ((fsdp->frsz  -= size) < 0) fsdp->frsz = 0;
        fsdp->stat |= XrdOssFSData_ADJUSTED;
-       if (fsgp && (fsgp->Usage += size) < 0) fsgp->Usage = 0;
-       Mutex.UnLock();
       } else {
        DEBUG("dev " <<devid <<" not found.");
       }
+
+// Adjust group usage
+//
+   if (XrdOssCache_Group::PubGroup)
+      {DEBUG("usage=" <<XrdOssCache_Group::PubGroup->Usage <<'+' <<size 
+             <<" space=" <<XrdOssCache_Group::PubGroup->group);
+       if ((XrdOssCache_Group::PubGroup->Usage += size) < 0)
+          XrdOssCache_Group::PubGroup->Usage = 0;
+       if (Usage) XrdOssSpace::Adjust(XrdOssCache_Group::PubGroup->GRPid, size);
+      }
+
+// All done
+//
+   Mutex.UnLock();
 }
 
 /******************************************************************************/
@@ -381,7 +460,7 @@ void XrdOssCache::Adjust(const char *Path, off_t size, struct stat *buf)
 // Process the result
 //
    if (fsp) Adjust(fsp, size);
-      else {DEBUG("cahe path " <<Path <<" not found.");}
+      else {DEBUG("cache path " <<Path <<" not found.");}
 }
 
 /******************************************************************************/
@@ -413,7 +492,7 @@ void XrdOssCache::Adjust(XrdOssCache_FS *fsp, off_t size)
 int XrdOssCache::Alloc(XrdOssCache::allocInfo &aInfo)
 {
    EPNAME("Alloc");
-   static const mode_t theMode = S_IRWXU | S_IRWXG;
+   static const mode_t theMode = S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH;
    XrdSysMutexHelper myMutex(&Mutex);
    double diffree;
    XrdOssPath::fnInfo Info;
@@ -484,7 +563,7 @@ int XrdOssCache::Alloc(XrdOssCache::allocInfo &aInfo)
            *Info.Slash='\0'; rc=mkdir(aInfo.cgPFbf,theMode); *Info.Slash='/';
            madeDir = 1;
           } while(!rc);
-       if (datfd < 0) return (errno ? -errno : -ENOSYS);
+       if (datfd < 0) return (errno ? -errno : -EFAULT);
       }
 
 // All done (temporarily adjust down the free space)x
@@ -495,6 +574,34 @@ int XrdOssCache::Alloc(XrdOssCache::allocInfo &aInfo)
    fsp_sel->fsdata->stat |= XrdOssFSData_REFRESH;
    aInfo.cgFSp  = fsp_sel;
    return datfd;
+}
+  
+/******************************************************************************/
+/*                               D e v I n f o                                */
+/******************************************************************************/
+
+void XrdOssCache::DevInfo(struct stat &buf, bool limits)
+{
+
+// Check if only the maximum values ae to be returned
+//
+   if (limits)
+      {memset(&buf, 0, sizeof(struct stat));
+       buf.st_dev  = static_cast<dev_t>(XrdOssCacheDevs::prtNMax);
+       buf.st_rdev = static_cast<dev_t>(XrdOssCacheDevs::devNMax);
+       return;
+      }
+
+// Look up the device info
+//
+   std::map<dev_t, devID>::iterator it = dev2ID.find(buf.st_dev);
+   if (it != dev2ID.end())
+      {buf.st_rdev = static_cast<dev_t>(it->second.bdevID);
+       buf.st_dev  = static_cast<dev_t>(it->second.partID);
+      } else {
+       buf.st_rdev = 0;
+       buf.st_dev  = 0;
+      }
 }
   
 /******************************************************************************/
@@ -534,7 +641,7 @@ XrdOssCache_FS *XrdOssCache::Find(const char *Path, int lnklen)
 
 // Init() is only called during configuration and no locks are needed.
   
-int XrdOssCache::Init(const char *UPath, const char *Qfile, int isSOL)
+int XrdOssCache::Init(const char *UPath, const char *Qfile, int isSOL, int us)
 {
      XrdOssCache_Group *cgp;
      long long bytesUsed;
@@ -542,7 +649,7 @@ int XrdOssCache::Init(const char *UPath, const char *Qfile, int isSOL)
 // If usage directory or quota file was passed then we initialize space handling
 // We need to create a space object to track usage across failures.
 //
-   if ((UPath || Qfile) && !XrdOssSpace::Init(UPath, Qfile, isSOL)) return 1;
+   if ((UPath || Qfile) && !XrdOssSpace::Init(UPath,Qfile,isSOL,us)) return 1;
    if (Qfile) Quotas = !isSOL;
    if (UPath) Usage  = 1;
 
@@ -575,7 +682,7 @@ int XrdOssCache::Init(long long aMin, int ovhd, int aFuzz)
 void XrdOssCache::List(const char *lname, XrdSysError &Eroute)
 {
      XrdOssCache_FS *fsp;
-     const char *theCmd;
+     const char *theCmd, *rpath;
      char *pP, buff[4096];
 
      if ((fsp = fsfirst)) do
@@ -584,12 +691,120 @@ void XrdOssCache::List(const char *lname, XrdSysError &Eroute)
              do {pP--;} while(*pP != '/');
              *pP = '\0';   theCmd = "space";
             } else {pP=0;  theCmd = "cache";}
-         snprintf(buff, sizeof(buff), "%s%s %s %s", lname, theCmd,
-                        fsp->group, fsp->path);
+         rpath = (strcmp(fsp->fsdata->path, fsp->fsdata->pact)
+               ? fsp->fsdata->pact : "");
+         snprintf(buff, sizeof(buff), "%s%s %s %s -> %s[%d:%d] %s",
+                  lname, theCmd, fsp->group, fsp->path, fsp->fsdata->devN,
+                  fsp->fsdata->bdevID, fsp->fsdata->partID, rpath);
          if (pP) *pP = '/';
          Eroute.Say(buff);
          fsp = fsp->next;
         } while(fsp != fsfirst);
+}
+  
+/******************************************************************************/
+/*                               M a p D e v s                                */
+/******************************************************************************/
+
+void XrdOssCache::MapDevs(bool dBug)
+{
+#ifdef __linux__
+   const char *pPart = "/proc/partitions";
+   std::map<std::string, int> dn2id;
+   XrdOucStream strm;
+   std::string  sOrg;
+   char *line, *sMaj, *sMin, *sBlk, *sDev, sAlt[16], sDN[sizeof(devID::nDev)];
+   dev_t dNode;
+   int dNum, n, fd, vMaj, vMin;
+
+// Our first step is to find all of the block devices on this machine and
+// map them to device numbers (our own as well as the st_dev values).
+//
+   if ((fd = open(pPart, O_RDONLY)) < 0) return;
+   strm.Attach(fd);
+
+// Read through the table until the end getting information we need
+//
+   while((line = strm.GetLine()))
+        {if (!(sMaj = strm.GetToken()) || !isdigit(*sMaj)) continue;
+         if (!(vMaj = atoi(sMaj))) continue;
+         if (!(sMin = strm.GetToken()) || !isdigit(*sMin)) continue;
+         vMin = atoi(sMin);
+         if (!(sBlk = strm.GetToken()) || !isdigit(*sBlk)) continue;
+         if (!(sDev = strm.GetToken())) continue;
+
+      // Preprocess LVM devices
+      //
+         if (!strncmp(sDev, "dm-", 3))
+            {if (!MapDM(sDev, sAlt, sizeof(sAlt)))
+                {if (dBug) std::cerr <<"Config " <<sDev <<'[' <<vMaj <<':'
+                           <<vMin <<"] -> dev[0]" <<std::endl;
+                 continue;
+                }
+             sOrg = sDev;
+             sDev = sAlt;
+            } else sOrg = sDev;
+
+      // We are only concerned about normal block devices
+      //
+         if (sDev[1] != 'd' || (*sDev != 's' && *sDev != 'h')) continue;
+         strlcpy(sDN, sDev, sizeof(sDN));
+         sDN[sizeof(sDN)-1] = 0;
+
+      // Trim off any numbers from the id
+      //
+         n = strlen(sDev)-1;
+         while(isdigit(sDev[n])) sDev[n--] = 0;
+
+      // Generate the device number (existing or new)
+      //
+         std::map<std::string,int>::iterator it = dn2id.find(std::string(sDev));
+         if (it != dn2id.end()) dNum = it->second;
+            else {dNum = devNMax++;
+                  dn2id[std::string(sDev)] = dNum;
+                 }
+
+      // Add the device to out map
+      //
+         dNode = makedev(vMaj, vMin);
+         devID theID = {dNum, 0, {0}};
+         strcpy(theID.nDev, sDN);
+         dev2ID[dNode] = theID;
+
+      // Print result if so wanted
+      //
+         if (dBug) std::cerr <<"Config " <<sOrg <<'[' <<vMaj <<':' <<vMin
+                             <<"] -> " <<sDev <<'[' <<dNum <<']' <<std::endl;
+        }
+#endif
+}
+
+/******************************************************************************/
+/* Private:                        M a p D M                                  */
+/******************************************************************************/
+  
+bool XrdOssCache::MapDM(const char *ldm, char *buff, int blen)
+{
+   const char *dmInfo1 = "/sys/devices/virtual/block/", *dmInfo2 = "/slaves";
+   struct dirent *dP;
+   bool aOK = false;
+
+   std::string dmPath = dmInfo1;
+   dmPath += ldm;
+   dmPath += dmInfo2;
+
+   DIR *slaves = opendir(dmPath.c_str());
+   if (!slaves) return 0;
+   while((dP = readdir(slaves)))
+        {if (dP->d_type == DT_LNK && dP->d_name[1] == 'd'
+         && (dP->d_name[0] == 's' || dP->d_name[0] == 'h'))
+            {if ((int)strlen(dP->d_name) < blen)
+                {strcpy(buff, dP->d_name); aOK = true; break;}
+            }
+        }
+
+   closedir(slaves);
+   return aOK;
 }
  
 /******************************************************************************/

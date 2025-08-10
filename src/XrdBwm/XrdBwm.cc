@@ -28,10 +28,10 @@
 /******************************************************************************/
 
 #include <unistd.h>
-#include <errno.h>
-#include <string.h>
-#include <stdio.h>
-#include <stdlib.h>
+#include <cerrno>
+#include <cstring>
+#include <cstdio>
+#include <cstdlib>
 #include <sys/param.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -270,7 +270,7 @@ int XrdBwmFile::open(const char          *path,      // In
 {
    EPNAME("open");
    XrdBwmHandle *hP;
-   int incomming;
+   int incoming;
    const char *miss, *theUsr, *theSrc, *theDst=0, *theLfn=0, *lclNode, *rmtNode;
    XrdOucEnv Open_Env(info);
 
@@ -313,14 +313,14 @@ int XrdBwmFile::open(const char          *path,      // In
 // Determine the direction of flow
 //
         if (XrdOucUtils::endsWith(theSrc,XrdBwmFS.myDomain,XrdBwmFS.myDomLen))
-           {incomming = 0; lclNode = theSrc; rmtNode = theDst;}
+           {incoming = 0; lclNode = theSrc; rmtNode = theDst;}
    else if (XrdOucUtils::endsWith(theDst,XrdBwmFS.myDomain,XrdBwmFS.myDomLen))
-           {incomming = 1; lclNode = theDst; rmtNode = theSrc;}
+           {incoming = 1; lclNode = theDst; rmtNode = theSrc;}
    else return XrdBwmFS.Emsg("open", error, EREMOTE, "open", path);
 
 // Get a handle for this file.
 //
-   if (!(hP = XrdBwmHandle::Alloc(theUsr,theLfn,lclNode,rmtNode,incomming)))
+   if (!(hP = XrdBwmHandle::Alloc(theUsr,theLfn,lclNode,rmtNode,incoming)))
       return XrdBwmFS.Stall(error, 13, path);
 
 // All done
@@ -964,13 +964,13 @@ int XrdBwm::Emsg(const char    *pfx,    // Message prefix value
                  const char    *op,     // Operation being performed
                  const char    *target) // The target (e.g., fname)
 {
-   char *etext, buffer[MAXPATHLEN+80], unkbuff[64];
+   const char *etext;
+   char buffer[MAXPATHLEN+80];
 
 // Get the reason for the error
 //
    if (ecode < 0) ecode = -ecode;
-   if (!(etext = BwmEroute.ec2text(ecode))) 
-      {sprintf(unkbuff, "reason unknown (%d)", ecode); etext = unkbuff;}
+   etext = BwmEroute.ec2text(ecode);
 
 // Format the error message
 //

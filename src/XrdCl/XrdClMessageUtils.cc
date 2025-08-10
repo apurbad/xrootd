@@ -33,46 +33,37 @@
 #include "XrdCl/XrdClXRootDMsgHandler.hh"
 #include "XrdClRedirectorRegistry.hh"
 
+#include "XProtocol/XProtocol.hh"
+
 namespace XrdCl
 {
   //----------------------------------------------------------------------------
   // Send a message
   //----------------------------------------------------------------------------
-  Status MessageUtils::SendMessage( const URL               &url,
-                                    Message                 *msg,
-                                    ResponseHandler         *handler,
-                                    const MessageSendParams &sendParams,
-                                    LocalFileHandler        *lFileHandler )
+  XRootDStatus MessageUtils::SendMessage( const URL         &url,
+                                          Message           *msg,
+                                          ResponseHandler   *handler,
+                                          MessageSendParams &sendParams,
+                                          LocalFileHandler  *lFileHandler )
   {
     //--------------------------------------------------------------------------
     // Get the stuff needed to send the message
     //--------------------------------------------------------------------------
     Log        *log        = DefaultEnv::GetLog();
     PostMaster *postMaster = DefaultEnv::GetPostMaster();
-    Status      st;
+    XRootDStatus      st;
 
     if( !postMaster )
-      return Status( stError, errUninitialized );
+      return XRootDStatus( stError, errUninitialized );
 
     log->Dump( XRootDMsg, "[%s] Sending message %s",
-               url.GetHostId().c_str(), msg->GetDescription().c_str() );
+               url.GetHostId().c_str(), msg->GetObfuscatedDescription().c_str() );
 
-
-    AnyObject   sidMgrObj;
-    SIDManager *sidMgr    = 0;
-    st = postMaster->QueryTransport( url, XRootDQuery::SIDManager,
-                                     sidMgrObj );
-
-    if( !st.IsOK() )
-    {
-      log->Error( XRootDMsg, "[%s] Unable to get stream id manager",
-                             url.GetHostId().c_str() );
-      return st;
-    }
-    sidMgrObj.Get( sidMgr );
-
+    //--------------------------------------------------------------------------
+    // Get an instance of SID manager object
+    //--------------------------------------------------------------------------
+    std::shared_ptr<SIDManager> sidMgr( SIDMgrPool::Instance().GetSIDMgr( url ) );
     ClientRequestHdr *req = (ClientRequestHdr*)msg->GetBuffer();
-
 
     //--------------------------------------------------------------------------
     // Allocate the SID and marshall the message
@@ -83,6 +74,21 @@ namespace XrdCl
       log->Error( XRootDMsg, "[%s] Unable to allocate stream id",
                              url.GetHostId().c_str() );
       return st;
+    }
+
+    //--------------------------------------------------------------------------
+    // Make sure that in case of checkpoint xeq request the embedded request
+    // SID is matching
+    //--------------------------------------------------------------------------
+    if( req->requestid == kXR_chkpoint )
+    {
+      ClientRequest *r = (ClientRequest*)req;
+      if( r->chkpoint.opcode == kXR_ckpXeq )
+      {
+        ClientRequest *xeq = (ClientRequest*) msg->GetBuffer( sizeof( ClientChkPointRequest ) );
+        xeq->header.streamid[0] = req->streamid[0];
+        xeq->header.streamid[1] = req->streamid[1];
+      }
     }
 
     XRootDTransport::MarshallRequest( msg );
@@ -96,14 +102,22 @@ namespace XrdCl
     msgHandler->SetRedirectAsAnswer( !sendParams.followRedirects );
     msgHandler->SetOksofarAsAnswer( sendParams.chunkedResponse );
     msgHandler->SetChunkList( sendParams.chunkList );
+    msgHandler->SetKernelBuffer( sendParams.kbuff );
     msgHandler->SetRedirectCounter( sendParams.redirectLimit );
     msgHandler->SetStateful( sendParams.stateful );
+    msgHandler->SetCrc32cDigests( std::move( sendParams.crc32cDigests ) );
 
     if( sendParams.loadBalancer.url.IsValid() )
       msgHandler->SetLoadBalancer( sendParams.loadBalancer );
 
     HostList *list = 0;
-    list = new HostList();
+    if( sendParams.hostList )
+    {
+      list = sendParams.hostList;
+      sendParams.hostList = nullptr;
+    }
+    else
+      list = new HostList();
     list->push_back( url );
     msgHandler->SetHostList( list );
 
@@ -116,7 +130,7 @@ namespace XrdCl
     {
       XRootDTransport::UnMarshallRequest( msg );
       log->Error( XRootDMsg, "[%s] Unable to send the message %s: %s",
-                  url.GetHostId().c_str(), msg->GetDescription().c_str(),
+                  url.GetHostId().c_str(), msg->GetObfuscatedDescription().c_str(),
                   st.ToString().c_str() );
 
       // we need to reassign req as its current value might have been
@@ -125,10 +139,9 @@ namespace XrdCl
       // Release the SID as the request was never send
       sidMgr->ReleaseSID( req->streamid );
       delete msgHandler;
-      delete list;
       return st;
     }
-    return Status();
+    return XRootDStatus();
   }
 
   //----------------------------------------------------------------------------
@@ -158,7 +171,7 @@ namespace XrdCl
       return Status( stError, errUninitialized );
 
     log->Dump( XRootDMsg, "[%s] Redirecting message %s",
-               url.GetHostId().c_str(), msg->GetDescription().c_str() );
+               url.GetHostId().c_str(), msg->GetObfuscatedDescription().c_str() );
 
     XRootDTransport::MarshallRequest( msg );
 
@@ -166,7 +179,7 @@ namespace XrdCl
     // Create and set up the message handler
     //--------------------------------------------------------------------------
     XRootDMsgHandler *msgHandler;
-    msgHandler = new XRootDMsgHandler( msg, handler, &url, 0, lFileHandler );
+    msgHandler = new XRootDMsgHandler( msg, handler, &url, std::shared_ptr<SIDManager>(), lFileHandler );
     msgHandler->SetExpiration( sendParams.expires );
     msgHandler->SetRedirectAsAnswer( !sendParams.followRedirects );
     msgHandler->SetOksofarAsAnswer( sendParams.chunkedResponse );
@@ -175,7 +188,7 @@ namespace XrdCl
     msgHandler->SetFollowMetalink( true );
 
     HostInfo info( url, true );
-    info.flags = kXR_isManager | kXR_attrMeta;
+    info.flags = kXR_isManager | kXR_attrMeta | kXR_attrVirtRdr;
     sendParams.loadBalancer = info;
     msgHandler->SetLoadBalancer( info );
 
@@ -192,7 +205,7 @@ namespace XrdCl
     {
       XRootDTransport::UnMarshallRequest( msg );
       log->Error( XRootDMsg, "[%s] Unable to send the message %s: %s",
-                  url.GetHostId().c_str(), msg->GetDescription().c_str(),
+                  url.GetHostId().c_str(), msg->GetObfuscatedDescription().c_str(),
                   st.ToString().c_str() );
       delete msgHandler;
       delete list;
@@ -281,7 +294,7 @@ namespace XrdCl
         currentPath.SetParams( currentCgi );
         if( !newPath.empty() )
           currentPath.SetPath( newPath );
-        std::string newPathWitParams = currentPath.GetPathWithParams();
+        std::string newPathWitParams = currentPath.GetPathWithFilteredParams();
 
         //----------------------------------------------------------------------
         // Write the path with the new cgi appended to the message
@@ -342,7 +355,7 @@ namespace XrdCl
         URL::ParamsMap currentCgi = currentPath.GetParams();
         MergeCGI( currentCgi, triedCgi, replace );
         currentPath.SetParams( currentCgi );
-        std::string pathWitParams = currentPath.GetPathWithParams();
+        std::string pathWitParams = currentPath.GetPathWithFilteredParams();
 
         //----------------------------------------------------------------------
         // Write the path with the new cgi appended to the message
@@ -383,5 +396,94 @@ namespace XrdCl
         }
       }
     }
+  }
+
+  //------------------------------------------------------------------------
+  //! Create xattr vector
+  //------------------------------------------------------------------------
+  Status MessageUtils::CreateXAttrVec( const std::vector<xattr_t> &attrs,
+                                             std::vector<char>    &avec )
+  {
+    if( attrs.empty() )
+      return Status();
+
+    if( attrs.size() > xfaLimits::kXR_faMaxVars )
+      return Status( stError, errInvalidArgs );
+
+    //----------------------------------------------------------------------
+    // Calculate the name and value vector lengths
+    //----------------------------------------------------------------------
+
+    // 2 bytes for rc + 1 byte for null character at the end
+    static const int name_overhead  = 3;
+    // 4 bytes for value length
+    static const int value_overhead = 4;
+
+    size_t nlen = 0, vlen = 0;
+    for( auto itr = attrs.begin(); itr != attrs.end(); ++itr )
+    {
+      nlen += std::get<xattr_name>( *itr ).size() + name_overhead;
+      vlen += std::get<xattr_value>( *itr ).size() + value_overhead;
+    }
+
+    if( nlen > xfaLimits::kXR_faMaxNlen )
+      return Status( stError, errInvalidArgs );
+
+    if( vlen > xfaLimits::kXR_faMaxVlen )
+      return Status( stError, errInvalidArgs );
+
+    //----------------------------------------------------------------------
+    // Create name and value vectors
+    //----------------------------------------------------------------------
+    avec.resize( nlen + vlen, 0 );
+    char *nvec = avec.data(), *vvec = avec.data() + nlen;
+
+    for( auto itr = attrs.begin(); itr != attrs.end(); ++itr )
+    {
+      const std::string &name = std::get<xattr_name>( *itr );
+      nvec = ClientFattrRequest::NVecInsert( name.c_str(), nvec );
+      const std::string &value = std::get<xattr_value>( *itr );
+      vvec = ClientFattrRequest::VVecInsert( value.c_str(), vvec );
+    }
+
+    return Status();
+  }
+
+  //------------------------------------------------------------------------
+  // Create xattr name vector vector
+  //------------------------------------------------------------------------
+  Status MessageUtils::CreateXAttrVec( const std::vector<std::string> &attrs,
+                                       std::vector<char>              &nvec )
+  {
+    if( attrs.empty() )
+      return Status();
+
+    if( attrs.size() > xfaLimits::kXR_faMaxVars )
+      return Status( stError, errInvalidArgs );
+
+    //----------------------------------------------------------------------
+    // Calculate the name and value vector lengths
+    //----------------------------------------------------------------------
+
+    // 2 bytes for rc + 1 byte for null character at the end
+    static const int name_overhead  = 3;
+
+    size_t nlen = 0;
+    for( auto itr = attrs.begin(); itr != attrs.end(); ++itr )
+      nlen += itr->size() + name_overhead;
+
+    if( nlen > xfaLimits::kXR_faMaxNlen )
+      return Status( stError, errInvalidArgs );
+
+    //----------------------------------------------------------------------
+    // Create name vector
+    //----------------------------------------------------------------------
+    nvec.resize( nlen, 0 );
+    char *nptr = nvec.data();
+
+    for( auto itr = attrs.begin(); itr != attrs.end(); ++itr )
+      nptr = ClientFattrRequest::NVecInsert( itr->c_str(), nptr );
+
+    return Status();
   }
 }

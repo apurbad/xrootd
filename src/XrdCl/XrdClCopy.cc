@@ -31,9 +31,12 @@
 #include "XrdCl/XrdClFileSystem.hh"
 #include "XrdCl/XrdClUtils.hh"
 #include "XrdCl/XrdClDlgEnv.hh"
+#include "XrdCl/XrdClOptimizers.hh"
+#include "XrdSys/XrdSysE2T.hh"
 #include "XrdSys/XrdSysPthread.hh"
+#include "XrdOuc/XrdOucPrivateUtils.hh"
 
-#include <stdio.h>
+#include <cstdio>
 #include <iostream>
 #include <iomanip>
 #include <limits>
@@ -48,7 +51,8 @@ class ProgressDisplay: public XrdCl::CopyProgressHandler
     //! Constructor
     //--------------------------------------------------------------------------
     ProgressDisplay(): pPrevious(0), pPrintProgressBar(true),
-      pPrintSourceCheckSum(false), pPrintTargetCheckSum(false)
+      pPrintSourceCheckSum(false), pPrintTargetCheckSum(false),
+      pPrintAdditionalCheckSum(false)
     {}
 
     //--------------------------------------------------------------------------
@@ -125,6 +129,14 @@ class ProgressDisplay: public XrdCl::CopyProgressHandler
       {
         results->Get( "targetCheckSum", checkSum );
         PrintCheckSum( d.target, checkSum, size );
+      }
+
+      if( pPrintAdditionalCheckSum )
+      {
+        std::vector<std::string> addcksums;
+        results->Get( "additionalCkeckSum", addcksums );
+        for( auto &cks : addcksums )
+          PrintCheckSum( d.source, cks, size );
       }
 
       pOngoingJobs.erase(it);
@@ -269,6 +281,7 @@ class ProgressDisplay: public XrdCl::CopyProgressHandler
     void PrintProgressBar( bool print )    { pPrintProgressBar    = print; }
     void PrintSourceCheckSum( bool print ) { pPrintSourceCheckSum = print; }
     void PrintTargetCheckSum( bool print ) { pPrintTargetCheckSum = print; }
+    void PrintAdditionalCheckSum( bool print ) { pPrintAdditionalCheckSum = print; }
 
   private:
     struct JobData
@@ -286,6 +299,7 @@ class ProgressDisplay: public XrdCl::CopyProgressHandler
     bool                        pPrintProgressBar;
     bool                        pPrintSourceCheckSum;
     bool                        pPrintTargetCheckSum;
+    bool                        pPrintAdditionalCheckSum;
     std::map<uint16_t, JobData> pOngoingJobs;
     XrdSysRecMutex              pMutex;
 };
@@ -298,12 +312,6 @@ bool AllOptionsSupported( XrdCpConfig *config )
   if( config->pHost )
   {
     std::cerr << "SOCKS Proxies are not yet supported" << std::endl;
-    return false;
-  }
-
-  if( config->xRate )
-  {
-    std::cerr << "Limiting transfer rate is not yet supported" << std::endl;
     return false;
   }
 
@@ -362,6 +370,7 @@ const char *FileType2String( XrdCpFile::PType type )
     case XrdCpFile::isDir:   return "directory";
     case XrdCpFile::isFile:  return "local file";
     case XrdCpFile::isXroot: return "xroot";
+    case XrdCpFile::isXroots: return "xroots";
     case XrdCpFile::isHttp:  return "http";
     case XrdCpFile::isHttps: return "https";
     case XrdCpFile::isStdIO: return "stdio";
@@ -402,7 +411,7 @@ void AdjustFileInfo( XrdCpFile *file )
 //------------------------------------------------------------------------------
 XrdCpFile *IndexRemote( XrdCl::FileSystem *fs,
                         std::string        basePath,
-                        uint16_t           dirOffset )
+                        long               dirOffset )
 {
   using namespace XrdCl;
 
@@ -432,8 +441,8 @@ XrdCpFile *IndexRemote( XrdCl::FileSystem *fs,
     current = new XrdCpFile( path.c_str(), badUrl );
     if( badUrl )
     {
-      delete current;
       log->Error( AppMsg, "Bad URL: %s", current->Path );
+      delete current;
       return 0;
     }
 
@@ -486,22 +495,30 @@ int main( int argc, char **argv )
   }
 
   ProgressDisplay progress;
-  if( config.Want(XrdCpConfig::DoNoPbar) )
+  if( config.Want(XrdCpConfig::DoNoPbar) || !isatty( fileno( stdout ) ) )
     progress.PrintProgressBar( false );
 
-  bool         posc      = false;
-  bool         force     = false;
-  bool         coerce    = false;
-  bool         makedir   = false;
-  bool         dynSrc    = false;
-  bool         delegate  = false;
+  bool         posc          = false;
+  bool         force         = false;
+  bool         coerce        = false;
+  bool         makedir       = false;
+  bool         dynSrc        = false;
+  bool         delegate      = false;
+  bool         preserveXAttr = false;
+  bool         rmOnBadCksum  = false;
+  bool         continue_     = false;
+  bool         recurse       = false;
+  bool         zipappend     = false;
+  bool         doserver      = false;
   std::string thirdParty = "none";
 
-  if( config.Want( XrdCpConfig::DoPosc ) )     posc       = true;
-  if( config.Want( XrdCpConfig::DoForce ) )    force      = true;
-  if( config.Want( XrdCpConfig::DoCoerce ) )   coerce     = true;
-  if( config.Want( XrdCpConfig::DoTpc ) )      thirdParty = "first";
-  if( config.Want( XrdCpConfig::DoTpcOnly ) )  thirdParty = "only";
+  if( config.Want( XrdCpConfig::DoPosc ) )      posc       = true;
+  if( config.Want( XrdCpConfig::DoForce ) )     force      = true;
+  if( config.Want( XrdCpConfig::DoCoerce ) )    coerce     = true;
+  if( config.Want( XrdCpConfig::DoTpc ) )       thirdParty = "first";
+  if( config.Want( XrdCpConfig::DoTpcOnly ) )   thirdParty = "only";
+  if( config.Want( XrdCpConfig::DoZipAppend ) ) zipappend  = true;
+  if( config.Want( XrdCpConfig::DoServer ) )    doserver   = true;
   if( config.Want( XrdCpConfig::DoTpcDlgt ) )
   {
     // the env var is being set already here (we are issuing a stat
@@ -514,9 +531,22 @@ int main( int argc, char **argv )
   else
     DlgEnv::Instance().Disable();
 
-  if( config.Want( XrdCpConfig::DoRecurse ) )  makedir    = true;
-  if( config.Want( XrdCpConfig::DoPath    ) )  makedir    = true;
-  if( config.Want( XrdCpConfig::DoDynaSrc ) )  dynSrc     = true;
+  if( config.Want( XrdCpConfig::DoRecurse ) )
+  {
+    makedir = true;
+    recurse = true;
+  }
+  if( config.Want( XrdCpConfig::DoPath    ) )      makedir       = true;
+  if( config.Want( XrdCpConfig::DoDynaSrc ) )      dynSrc        = true;
+  if( config.Want( XrdCpConfig::DoXAttr ) )        preserveXAttr = true;
+  if( config.Want( XrdCpConfig::DoRmOnBadCksum ) ) rmOnBadCksum  = true;
+  if( config.Want( XrdCpConfig::DoContinue ) )     continue_     = true;
+
+  if( force && continue_ )
+  {
+    std::cerr << "Invalid argument combination: continue + force." << std::endl;
+    return 50;
+  }
 
   //----------------------------------------------------------------------------
   // Checksums
@@ -560,6 +590,9 @@ int main( int argc, char **argv )
     }
   }
 
+  if( !config.AddCksVal.empty() )
+    progress.PrintAdditionalCheckSum( true );
+
   //----------------------------------------------------------------------------
   // ZIP archive
   //----------------------------------------------------------------------------
@@ -586,8 +619,32 @@ int main( int argc, char **argv )
   // Environment settings
   //----------------------------------------------------------------------------
   XrdCl::Env *env = XrdCl::DefaultEnv::GetEnv();
-  if( config.nStrm != 1 )
-    env->PutInt( "SubStreamsPerChannel", config.nStrm );
+
+  /* Stop PostMaster when exiting main() to ensure proper shutdown */
+  struct scope_exit {
+    ~scope_exit() { XrdCl::DefaultEnv::GetPostMaster()->Stop(); }
+  } stopPostMaster;
+
+  if( config.nStrm != 0 )
+    env->PutInt( "SubStreamsPerChannel", config.nStrm + 1 /*stands for the control stream*/ );
+
+  if( config.Retry != -1 )
+  {
+    env->PutInt( "CpRetry", config.Retry );
+    env->PutString( "CpRetryPolicy", config.RetryPolicy );
+  }
+
+  if( config.Want( XrdCpConfig::DoNoTlsOK ) )
+    env->PutInt( "NoTlsOK", 1 );
+
+  if( config.Want( XrdCpConfig::DoTlsNoData ) )
+    env->PutInt( "TlsNoData", 1 );
+
+  if( config.Want( XrdCpConfig::DoTlsMLF ) )
+    env->PutInt( "TlsMetalink", 1 );
+
+  if( config.Want( XrdCpConfig::DoZipMtlnCksum ) )
+    env->PutInt( "ZipMtlnCksum", 1 );
 
   int chunkSize = DefaultCPChunkSize;
   env->GetInt( "CPChunkSize", chunkSize );
@@ -607,8 +664,15 @@ int main( int argc, char **argv )
     return 50; // generic error
   }
 
+  if( !preserveXAttr )
+  {
+    int val = DefaultPreserveXAttrs;
+    env->GetInt( "PreserveXAttrs", val );
+    if( val ) preserveXAttr = true;
+  }
+
   log->Dump( AppMsg, "Chunk size: %d, parallel chunks %d, streams: %d",
-             chunkSize, parallelChunks, config.nStrm );
+             chunkSize, parallelChunks, config.nStrm + 1 );
 
   //----------------------------------------------------------------------------
   // Build the URLs
@@ -628,7 +692,7 @@ int main( int argc, char **argv )
       char *cwd = getcwd( buf, FILENAME_MAX );
       if( !cwd )
       {
-        XRootDStatus st( stError, XProtocol::mapError( errno ), errno, strerror( errno ) );
+        XRootDStatus st( stError, XProtocol::mapError( errno ), errno );
         std::cerr <<  st.GetErrorMessage() << std::endl;
         return st.GetShellCode();
       }
@@ -645,23 +709,46 @@ int main( int argc, char **argv )
   //    * we can accept multiple sources
   //    * we need to append the source name
   //----------------------------------------------------------------------------
-  bool targetIsDir = false;
+  bool targetIsDir  = false;
+  bool targetExists = false;
   if( config.dstFile->Protocol == XrdCpFile::isDir )
     targetIsDir = true;
-  else if( config.dstFile->Protocol == XrdCpFile::isXroot )
+  else if( config.dstFile->Protocol == XrdCpFile::isXroot ||
+           config.dstFile->Protocol == XrdCpFile::isXroots )
   {
     URL target( dest );
     FileSystem fs( target );
     StatInfo *statInfo = 0;
-    XRootDStatus st = fs.Stat( target.GetPath(), statInfo );
+    XRootDStatus st = fs.Stat( target.GetPathWithParams(), statInfo );
     if( st.IsOK() )
-      {if (statInfo->TestFlags( StatInfo::IsDir ) ) targetIsDir = true;}
-      else if (st.errNo == kXR_NotFound && config.Want( XrdCpConfig::DoPath ))
-              {int n = strlen(config.dstFile->Path);
-               if (config.dstFile->Path[n-1] == '/') targetIsDir = true;
-              }
+    {
+      if( statInfo->TestFlags( StatInfo::IsDir ) )
+        targetIsDir = true;
+      targetExists = true;
+    }
+    else if( st.errNo == kXR_NotFound && makedir )
+    {
+      int n = strlen(config.dstFile->Path);
+      if( config.dstFile->Path[n-1] == '/' )
+        targetIsDir = true;
+    }
+    else if( st.errNo == kXR_NotAuthorized )
+    {
+      log->Error( AppMsg, "%s (destination)", st.ToString().c_str() );
+      std::cerr << st.ToStr() << std::endl;
+      return st.GetShellCode();
+    }
 
     delete statInfo;
+  }
+
+  if( !targetIsDir && targetExists && !force && !recurse && !zipappend )
+  {
+    XRootDStatus st( stError, errInvalidOp, EEXIST );
+    // Unable to create /tmp/test.txt; file exists
+    log->Error( AppMsg, "%s (destination)", st.ToString().c_str() );
+    std::cerr << "Run: " << st.ToStr() << std::endl;
+    return st.GetShellCode();
   }
 
   //----------------------------------------------------------------------------
@@ -680,8 +767,10 @@ int main( int argc, char **argv )
   // If we're doing remote recursive copy, chain all the files (if it's a
   // directory)
   //----------------------------------------------------------------------------
+  bool remoteSrcIsDir = false;
   if( config.Want( XrdCpConfig::DoRecurse ) &&
-      config.srcFile->Protocol == XrdCpFile::isXroot )
+      (config.srcFile->Protocol == XrdCpFile::isXroot ||
+       config.srcFile->Protocol == XrdCpFile::isXroots) )
   {
     URL          source( config.srcFile->Path );
     FileSystem  *fs       = new FileSystem( source );
@@ -690,6 +779,7 @@ int main( int argc, char **argv )
     XRootDStatus st = fs->Stat( source.GetPath(), statInfo );
     if( st.IsOK() && statInfo->TestFlags( StatInfo::IsDir ) )
     {
+      remoteSrcIsDir = true;
       //------------------------------------------------------------------------
       // Recursively index the remote directory
       //------------------------------------------------------------------------
@@ -732,7 +822,7 @@ int main( int argc, char **argv )
         char *cwd = getcwd( buf, FILENAME_MAX );
         if( !cwd )
         {
-          XRootDStatus st( stError, XProtocol::mapError( errno ), errno, strerror( errno ) );
+          XRootDStatus st( stError, XProtocol::mapError( errno ), errno );
           std::cerr <<  st.GetErrorMessage() << std::endl;
           return st.GetShellCode();
         }
@@ -742,16 +832,31 @@ int main( int argc, char **argv )
 
     AppendCGI( source, config.srcOpq );
 
-    log->Dump( AppMsg, "Processing source entry: %s, type %s, target file: %s",
-               sourceFile->Path, FileType2String( sourceFile->Protocol ),
-               dest.c_str() );
+    std::string sourcePathObf = sourceFile->Path;
+    std::string destPathObf = dest;
+    if( unlikely(log->GetLevel() >= Log::DumpMsg) ) {
+      sourcePathObf = obfuscateAuth(sourcePathObf);
+      destPathObf = obfuscateAuth(destPathObf);
+    }
+    log->Dump( AppMsg, "Processing source entry: %s, type %s, target file: %s, logLevel = %d",
+               sourcePathObf.c_str(), FileType2String( sourceFile->Protocol ),
+               destPathObf.c_str(), log->GetLevel() );
 
     //--------------------------------------------------------------------------
     // Set up the job
     //--------------------------------------------------------------------------
     std::string target = dest;
+
+
+    bool srcIsDir = false;
+    // if this is local file, for a directory Dlen + Doff will overlap with path size
+    if( strncmp( sourceFile->ProtName, "file", 4 ) == 0 )
+      srcIsDir = std::string( sourceFile->Path ).size() == size_t( sourceFile->Doff + sourceFile->Dlen );
+    // otherwise we are handling a remote file
+    else
+      srcIsDir = remoteSrcIsDir;
     // if this is a recursive copy make sure we preserve the directory structure
-    if( config.Want( XrdCpConfig::DoRecurse ) )
+    if( config.Want( XrdCpConfig::DoRecurse ) && srcIsDir )
     {
       // get the source directory
       std::string srcDir( sourceFile->Path, sourceFile->Doff );
@@ -768,30 +873,38 @@ int main( int argc, char **argv )
     }
     AppendCGI( target, config.dstOpq );
 
-    properties.Set( "source",         source         );
-    properties.Set( "target",         target         );
-    properties.Set( "force",          force          );
-    properties.Set( "posc",           posc           );
-    properties.Set( "coerce",         coerce         );
-    properties.Set( "makeDir",        makedir        );
-    properties.Set( "dynamicSource",  dynSrc         );
-    properties.Set( "thirdParty",     thirdParty     );
-    properties.Set( "checkSumMode",   checkSumMode   );
-    properties.Set( "checkSumType",   checkSumType   );
-    properties.Set( "checkSumPreset", checkSumPreset );
-    properties.Set( "chunkSize",      chunkSize      );
-    properties.Set( "parallelChunks", parallelChunks );
-    properties.Set( "zipArchive",     zip            );
-    properties.Set( "xcp",            xcp            );
-    properties.Set( "xcpBlockSize",   blockSize      );
-    properties.Set( "delegate",       delegate       );
-    properties.Set( "targetIsDir",    targetIsDir    );
+    properties.Set( "source",          source                 );
+    properties.Set( "target",          target                 );
+    properties.Set( "force",           force                  );
+    properties.Set( "posc",            posc                   );
+    properties.Set( "coerce",          coerce                 );
+    properties.Set( "makeDir",         makedir                );
+    properties.Set( "dynamicSource",   dynSrc                 );
+    properties.Set( "thirdParty",      thirdParty             );
+    properties.Set( "checkSumMode",    checkSumMode           );
+    properties.Set( "checkSumType",    checkSumType           );
+    properties.Set( "checkSumPreset",  checkSumPreset         );
+    properties.Set( "chunkSize",       chunkSize              );
+    properties.Set( "parallelChunks",  parallelChunks         );
+    properties.Set( "zipArchive",      zip                    );
+    properties.Set( "xcp",             xcp                    );
+    properties.Set( "xcpBlockSize",    blockSize              );
+    properties.Set( "delegate",        delegate               );
+    properties.Set( "targetIsDir",     targetIsDir            );
+    properties.Set( "preserveXAttr",   preserveXAttr          );
+    properties.Set( "xrate",           config.xRate           );
+    properties.Set( "xrateThreshold",  config.xRateThreshold  );
+    properties.Set( "rmOnBadCksum",    rmOnBadCksum           );
+    properties.Set( "continue",        continue_              );
+    properties.Set( "zipAppend",       zipappend              );
+    properties.Set( "addcksums",       config.AddCksVal       );
+    properties.Set( "doServer",        doserver               );
 
     if( zip )
-      properties.Set( "zipSource",    zipFile        );
+      properties.Set( "zipSource",     zipFile                );
 
     if( xcp )
-      properties.Set( "nbXcpSources", nbSources      );
+      properties.Set( "nbXcpSources",  nbSources              );
 
 
     XRootDStatus st = process.AddJob( properties, results );
@@ -855,7 +968,6 @@ int main( int argc, char **argv )
     return st.GetShellCode();
   }
   CleanUpResults( resultVect );
-
   return 0;
 }
 

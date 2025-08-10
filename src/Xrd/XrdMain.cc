@@ -59,13 +59,14 @@ Where:
 /******************************************************************************/
   
 #include <unistd.h>
-#include <ctype.h>
-#include <errno.h>
+#include <cctype>
+#include <cerrno>
+#include <cstdint>
 #include <signal.h>
-#include <stdlib.h>
-#include <string.h>
+#include <cstdlib>
+#include <cstring>
 #include <strings.h>
-#include <stdio.h>
+#include <cstdio>
 #include <sys/param.h>
 
 #include "Xrd/XrdConfig.hh"
@@ -95,9 +96,7 @@ static XrdConfig  Config;
 
 void              DoIt() {XrdLink *newlink;
                           if ((newlink = theNet->Accept(0, -1, theSem)))
-                             {newlink->setProtocol(theProt);
-                              newlink->DoIt();
-                             }
+                             newlink->setProtocol(theProt, true);
                          }
 
            XrdMain() : XrdJob("main accept"), theSem(0), theProt(0),
@@ -149,6 +148,7 @@ void *mainAdmin(void *parg)
 //
    while(1) if ((newlink = NetADM->Accept()))
                {newlink->setProtocol((XrdProtocol *)&ProtAdmin);
+                newlink->setProtName("xrdadmin");
                 Parms->Config.ProtInfo.Sched->Schedule((XrdJob *)newlink);
                }
    return (void *)0;
@@ -165,14 +165,26 @@ int main(int argc, char *argv[])
    char      buff[128];
    int       i, retc;
 
+// Set TZ environment variable to read the system timezone from /etc/localtime
+// if it is not already set, to avoid race conditions between localtime_r() and
+// mktime() during the multi-threaded phase of the initialization.
+
+   if (access("/etc/localtime", R_OK) == 0)
+       setenv("TZ", ":/etc/localtime", /* overwrite */ false);
+
+// Call tzset() early to ensure thread-safety of localtime_r() and mktime().
+   tzset();
+
 // Turn off sigpipe and host a variety of others before we start any threads
 //
    XrdSysUtils::SigBlock();
 
-// Set the default stack size here
+// Set the default stack size here. Note that on modern Linux the default
+// stack size is set at about 8MB. We force a lower limit to not have a huge
+// virtual address space mostly for core file debugging purposes.
 //
-   if (sizeof(long) > 4) XrdSysThread::setStackSize((size_t)1048576);
-      else               XrdSysThread::setStackSize((size_t)786432);
+   if (sizeof(long) > 4) XrdSysThread::setStackSize((size_t)2097152, true);
+      else               XrdSysThread::setStackSize((size_t)1048576, true);
 
 // Process configuration file
 //
@@ -191,12 +203,12 @@ int main(int argc, char *argv[])
 // thread for each network except the first. The main thread will handle
 // that network as some implementations require a main active thread.
 //
-   for (i = 1; i <= XrdProtLoad::ProtoMax; i++)
+   for (i = 1; i < (int)Main.Config.NetTCP.size(); i++)
        if (Main.Config.NetTCP[i])
           {XrdMain *Parms = new XrdMain(Main.Config.NetTCP[i]);
            sprintf(buff, "Port %d handler", Parms->thePort);
-           if (Parms->theNet == Main.Config.NetTCP[XrdProtLoad::ProtoMax])
-               Parms->thePort = -(Parms->thePort);
+//???      if (Parms->theNet == Main.Config.NetTCP[XrdProtLoad::ProtoMax])
+//             Parms->thePort = -(Parms->thePort);
            if ((retc = XrdSysThread::Run(&tid, mainAccept, (void *)Parms,
                                          XRDSYSTHREAD_BIND, strdup(buff))))
               {Main.Config.ProtInfo.eDest->Emsg("main", retc, "create", buff);

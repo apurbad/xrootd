@@ -28,12 +28,12 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <string.h>
+#include <cstring>
 #include <strings.h>
-#include <stdio.h>
+#include <cstdio>
 #include <fcntl.h>
 #include <unistd.h>
-#include <errno.h>
+#include <cerrno>
 #include <sys/param.h>
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -189,7 +189,7 @@ int XrdFrcCID::Init(const char *aPath)
             NoGo |= Init(cidFile);
            }
 
-// Now check if any errors occured during file i/o
+// Now check if any errors occurred during file i/o
 //
    if (NoGo) Say.Emsg("Init", "Errors processing chkpnt file", cidFN);
       else if ((n = cidFile.LastError()))

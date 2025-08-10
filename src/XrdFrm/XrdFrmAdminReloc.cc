@@ -28,11 +28,11 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <errno.h>
+#include <cerrno>
 #include <fcntl.h>
-#include <string.h>
-#include <time.h>
-#include <stdio.h>
+#include <cstring>
+#include <ctime>
+#include <cstdio>
 #include <unistd.h>
 #include <utime.h>
 #include <sys/mman.h>
@@ -83,7 +83,7 @@ int XrdFrmAdmin::Reloc(char *srcLfn, char *Space)
    strcpy(trgSpace, Space);
    if (fsTarget) *(fsTarget-1) = ':';
 
-// Get the pfn for the incomming path
+// Get the pfn for the incoming path
 //
    if (!Config.LocalPath(srcLfn, srcPfn, sizeof(srcPfn)-8))
       {finalRC = 4; return 0;}

@@ -19,9 +19,10 @@
 #ifndef __XRD_CL_POST_CHANNEL_HH__
 #define __XRD_CL_POST_CHANNEL_HH__
 
-#include <stdint.h>
+#include <cstdint>
 #include <vector>
 #include <ctime>
+#include <functional>
 
 #include "XrdCl/XrdClStatus.hh"
 #include "XrdCl/XrdClURL.hh"
@@ -39,6 +40,7 @@ namespace XrdCl
   class JobManager;
   class VirtualRedirector;
   class TickGeneratorTask;
+  class Job;
 
   //----------------------------------------------------------------------------
   //! A communication channel between the client and the server
@@ -59,7 +61,8 @@ namespace XrdCl
                Poller           *poller,
                TransportHandler *transport,
                TaskManager      *taskManager,
-               JobManager       *jobManager );
+               JobManager       *jobManager,
+               const URL        &prefurl = URL() );
 
       //------------------------------------------------------------------------
       //! Destructor
@@ -75,59 +78,22 @@ namespace XrdCl
       }
 
       //------------------------------------------------------------------------
-      //! Send a message synchronously - synchronously means that
-      //! it will block until the message is written to a socket
-      //!
-      //! @param msg     message to be sent
-      //! @param expires expiration timestamp after which a failure should be
-      //!                reported if sending was unsuccessful
-      //! @param stateful physical stream disconnection causes an error
-      //! @return        success if the message has been pushed through the wire,
-      //!                failure otherwise
-      //------------------------------------------------------------------------
-      Status Send( Message *msg, bool stateful, time_t expires );
-
-      //------------------------------------------------------------------------
       //! Send the message asynchronously - the message is inserted into the
       //! send queue and a listener is called when the message is successfully
       //! pushed through the wire or when the timeout elapses
       //!
       //! @param msg     message to be sent
-      //! @apram stateful physical stream disconnection causes an error
+      //! @param handler handler to be notified about the status
+      //! @param stateful physical stream disconnection causes an error
       //! @param expires unix timestamp after which a failure is reported
       //!                to the listener
-      //! @param handler handler to be notified about the status
-      //! @param redirector virtual redirector to be used
       //! @return        success if the message was successfully inserted
       //!                into the send queues, failure otherwise
       //------------------------------------------------------------------------
-      Status Send( Message              *msg,
-                   OutgoingMsgHandler   *handler,
-                   bool                  stateful,
-                   time_t                expires );
-
-      //------------------------------------------------------------------------
-      //! Synchronously receive a message - blocks until a message matching
-      //! a filter is found in the incoming queue or the timeout passes
-      //!
-      //! @param msg     reference to a message pointer, the pointer will
-      //!                point to the received message
-      //! @param filter  filter object defining what to look for
-      //! @param expires expiration timestamp
-      //! @return        success when the message has been received
-      //!                successfully, failure otherwise
-      //------------------------------------------------------------------------
-      Status Receive( Message *&msg, MessageFilter *filter, time_t expires );
-
-      //------------------------------------------------------------------------
-      //! Listen to incoming messages, the listener is notified when a new
-      //! message arrives and when the timeout passes
-      //!
-      //! @param handler handler to be notified about new messages
-      //! @param expires expiration timestamp
-      //! @return        success when the handler has been registered correctly
-      //------------------------------------------------------------------------
-      Status Receive( IncomingMsgHandler *handler, time_t expires );
+      XRootDStatus Send( Message              *msg,
+                         MsgHandler           *handler,
+                         bool                  stateful,
+                         time_t                expires );
 
       //------------------------------------------------------------------------
       //! Query the transport handler
@@ -159,13 +125,44 @@ namespace XrdCl
       //------------------------------------------------------------------------
       Status ForceDisconnect();
 
+      //------------------------------------------------------------------------
+      //! Force disconnect of all streams
+      //------------------------------------------------------------------------
+      Status ForceDisconnect( bool hush );
+
+      //------------------------------------------------------------------------
+      //! Force reconnect
+      //------------------------------------------------------------------------
+      Status ForceReconnect();
+
+      //------------------------------------------------------------------------
+      //! Get the number of connected data streams
+      //------------------------------------------------------------------------
+      uint16_t NbConnectedStrm();
+
+      //------------------------------------------------------------------------
+      //! Set the on-connect handler for data streams
+      //------------------------------------------------------------------------
+      void SetOnDataConnectHandler( std::shared_ptr<Job> &onConnJob );
+
+      //------------------------------------------------------------------------
+      //! @return : true if this channel can be collapsed using this URL, false
+      //!           otherwise
+      //------------------------------------------------------------------------
+      bool CanCollapse( const URL &url );
+
+      //------------------------------------------------------------------------
+      //! Decrement file object instance count bound to this channel
+      //------------------------------------------------------------------------
+      void DecFileInstCnt();
+
     private:
 
       URL                    pUrl;
       Poller                *pPoller;
       TransportHandler      *pTransport;
       TaskManager           *pTaskManager;
-      std::vector<Stream *>  pStreams;
+      Stream                *pStream;
       XrdSysMutex            pMutex;
       AnyObject              pChannelData;
       InQueue                pIncoming;

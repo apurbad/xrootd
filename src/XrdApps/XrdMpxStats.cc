@@ -28,7 +28,7 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <stdio.h>
+#include <cstdio>
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/uio.h>
@@ -198,7 +198,7 @@ void *mainOutput(void *parg)
   
 void Usage(int rc)
 {
-   cerr <<"\nUsage: mpxstats [-f {cgi|flat|xml}] -p <port> [-s]" <<endl;
+   std::cerr <<"\nUsage: mpxstats [-f {cgi|flat|xml}] -p <port> [-s]" <<std::endl;
    exit(rc);
 }
 

@@ -29,9 +29,9 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <stdint.h>
-#include <stdlib.h>
-#include <string.h>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
 
 #include "XrdSsi/XrdSsiAtomics.hh"
 #include "XrdSsi/XrdSsiErrInfo.hh"
@@ -192,23 +192,11 @@ virtual bool    ProcessResponse(const XrdSsiErrInfo  &eInfo,
 //! @param  buff  Pointer to the buffer given to XrdSsiStream::SetBuff().
 //! @param  blen  The number of bytes in buff or an error indication if blen < 0.
 //! @param  last  true  This is the last stream segment, no more data remains.
-//! @param        false More data may remain in the stream.
-//! @return       One of the enum PRD_Xeq:
-//!               PRD_Normal  - Processing completed normally, continue.
-//!               PRD_Hold    - Processing could not be done now, place request
-//!                             in the global FIFO hold queue and resume when
-//!                             RestartDataResponse() is called.
-//!               PRD_HoldLcl - Processing could not be done now, place request
-//!                             in the request ID FIFO local queue and resume
-//!                             when RestartDataResponse() is called with the ID
-//!                             that was passed to the this request object
-//!                             constructor.
+//!               false More data may remain in the stream.
 //-----------------------------------------------------------------------------
 
-enum PRD_Xeq {PRD_Normal = 0, PRD_Hold = 1, PRD_HoldLcl = 2};
-
-virtual PRD_Xeq ProcessResponseData(const XrdSsiErrInfo  &eInfo, char *buff,
-                                    int blen, bool last) {return PRD_Normal;}
+virtual void ProcessResponseData(const XrdSsiErrInfo  &eInfo, char *buff,
+                                 int blen, bool last) {}
 
 //-----------------------------------------------------------------------------
 //! Release the request buffer of the request bound to this object. This method
@@ -217,51 +205,6 @@ virtual PRD_Xeq ProcessResponseData(const XrdSsiErrInfo  &eInfo, char *buff,
 //-----------------------------------------------------------------------------
 
         void   ReleaseRequestBuffer();
-
-//-----------------------------------------------------------------------------
-//! Restart a ProcessResponseData() call for a request that was previously held
-//! (see return enums on ProcessResponseData method). This is a client-side
-//! only call and is ignored server-side. When a data response is restarted,
-//! ProcessResponseData() is called again when the same parameters as existed
-//! when the call resulted in a hold action.
-//!
-//! @param rhow  An enum (see below) that specifies the action to be taken.
-//!              RDR_All   - runs all queued responses and then deletes the
-//!                          queue identified by reqid, unless it is nil.
-//!              RDR_Hold  - sets the allowed restart count to zero and does
-//!                          not restart any queued responses.
-//!              RDR_Immed - restarts one response if it is queued. The allowed
-//!                          count is left unchanged.
-//!              RDR_Query - returns information about the queue but otherwise
-//!                          does not restart any queued responses.
-//!              RDR_One   - Sets the allowed restart count to one. If a
-//!                          response is queued, it is restarted and the count
-//!                          is set to zero.
-//!              RDR_Post  - Adds one to the allowed restart count. If a
-//!                          response is queued, it is restarted and one is
-//!                          subtracted from the allowed restart count.
-//!
-//! @param reqid Points to the requestID associated with a hold queue. When not
-//!              specified, then the global queue is used to restart responses.
-//!              Note that the memory associated with the named queue may be
-//!              lost if the queue is left with an allowed value > 0.To avoid
-//!              this issue the call with RDR_All to clean it up when it is no
-//!              longer needed (this will avoid having hung responses).
-//!
-//! @return      Information about the queue (see struct RDR_Info).
-//-----------------------------------------------------------------------------
-
-enum   RDR_How {RDR_All=0, RDR_Hold, RDR_Immed, RDR_Query, RDR_One, RDR_Post};
-
-struct RDR_Info{int rCount; //!< Number restarted
-                int qCount; //!< Number of queued request remaining
-                int iAllow; //!< Initial value of the allowed restart count
-                int fAllow; //!< Final   value of the allowed restart count
-
-                RDR_Info() : rCount(0), qCount(0), iAllow(0), fAllow(0) {}
-               };
-
-static RDR_Info RestartDataResponse(RDR_How rhow, const char *reqid=0);
 
 //-----------------------------------------------------------------------------
 //! Constructor
@@ -320,10 +263,20 @@ virtual void    RelRequestBuffer() {}
 //! to XrdSsiService::ProcessRequest(). Once the request is started, a request
 //! handle is returned which can be passed to XrdSsiService::Attach().
 //!
-//! @param  detttl The detach time to live value.
+//! @param  dttl The detach time to live value.
 //-----------------------------------------------------------------------------
 
 inline void     SetDetachTTL(uint32_t dttl) {detTTL = dttl;}
+
+//-----------------------------------------------------------------------------
+//! Set request retry notification. If a non-default value is desired, it must
+//! be set prior to calling XrdSsiService::ProcessRequest(). This is a one-time
+//! request and retry mode is turned off in the request object afterwards.
+//!
+//! @param onoff   True to turn retry on and false to turn it off.
+//-----------------------------------------------------------------------------
+
+       void     SetRetry(bool onoff);
 
 //-----------------------------------------------------------------------------
 //! Set timeout for initiating the request. If a non-default value is desired,
@@ -359,6 +312,7 @@ const char      *epNode;
 uint32_t         detTTL;
 uint16_t         tOut;
 bool             onClient;
-char             rsvd2;
+char             flags;
+static const int isaRetry = 1;
 };
 #endif

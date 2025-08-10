@@ -29,7 +29,7 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <errno.h>
+#include <cerrno>
 #ifdef WIN32
 #define HAVE_STRUCT_TIMESPEC 1
 #endif
@@ -115,7 +115,6 @@ const char     *condID;
 };
 
 
-
 /******************************************************************************/
 /*                     X r d S y s C o n d V a r H e l p e r                  */
 /******************************************************************************/
@@ -165,6 +164,7 @@ XrdSysCondVar *cnd;
 class XrdSysMutex
 {
 public:
+friend class XrdSysCondVar2;
 
 inline int CondLock()
        {if (pthread_mutex_trylock( &cs )) return 0;
@@ -175,9 +175,10 @@ inline int TimedLock( int wait_ms )
 {
   struct timespec wait, cur, dur;
   get_apple_realtime(wait);
-  wait.tv_nsec += wait_ms * 100000;
-  wait.tv_sec += (wait.tv_nsec / 100000000);
-  wait.tv_nsec = wait.tv_nsec % 100000000;
+  wait.tv_sec += (wait_ms / 1000);
+  wait.tv_nsec += (wait_ms % 1000) * 1000000;
+  wait.tv_sec += (wait.tv_nsec / 1000000000);
+  wait.tv_nsec = wait.tv_nsec % 1000000000;
 
   int rc;
   while( ( rc = pthread_mutex_trylock( &cs ) ) == EBUSY )
@@ -210,9 +211,10 @@ inline int TimedLock( int wait_ms )
 inline int TimedLock(int wait_ms)
        {struct timespec wait;
         clock_gettime(CLOCK_REALTIME, &wait);
-        wait.tv_nsec += wait_ms * 100000;
-        wait.tv_sec += (wait.tv_nsec / 100000000);
-        wait.tv_nsec = wait.tv_nsec % 100000000;
+        wait.tv_sec += (wait_ms / 1000);
+        wait.tv_nsec += (wait_ms % 1000) * 1000000;
+        wait.tv_sec += (wait.tv_nsec / 1000000000);
+        wait.tv_nsec = wait.tv_nsec % 1000000000;
         return !pthread_mutex_timedlock(&cs, &wait);
        }
 #endif
@@ -284,6 +286,38 @@ inline void UnLock() {if (mtx) {mtx->UnLock(); mtx = 0;}}
 private:
 XrdSysMutex *mtx;
 };
+  
+/******************************************************************************/
+/*                        X r d S y s C o n d V a r 2                         */
+/******************************************************************************/
+  
+// XrdSysCondVar2 implements the standard POSIX-compliant condition variable but
+//                unlike XrdSysCondVar requires the caller to supply a working
+//                mutex and does not handle any locking other than what is
+//                defined by POSIX.
+
+class XrdSysCondVar2
+{
+public:
+
+inline void  Signal()         {pthread_cond_signal(&cvar);}
+
+inline void  Broadcast()      {pthread_cond_broadcast(&cvar);}
+
+inline int   Wait()           {return pthread_cond_wait(&cvar, mtxP);}
+       bool  Wait(int sec)    {return WaitMS(sec*1000);}
+       bool  WaitMS(int msec);
+
+       XrdSysCondVar2(XrdSysMutex &mtx) : mtxP(&mtx.cs)
+                     {pthread_cond_init(&cvar, NULL);}
+
+      ~XrdSysCondVar2() {pthread_cond_destroy(&cvar);}
+
+protected:
+
+pthread_cond_t   cvar;
+pthread_mutex_t *mtxP;
+};
 
 /******************************************************************************/
 /*                           X r d S y s R W L o c k                          */
@@ -313,8 +347,35 @@ inline void WriteLock( int &status ) {status = pthread_rwlock_wrlock(&lock);}
 
 inline void UnLock() {pthread_rwlock_unlock(&lock);}
 
+enum PrefType {prefWR=1};
+
+        XrdSysRWLock(PrefType /* ptype */)
+                    {
+#if defined(__linux__) && (defined(__GLIBC__) || defined(__UCLIBC__))
+                     pthread_rwlockattr_t attr;
+                     pthread_rwlockattr_setkind_np(&attr,
+                             PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP);
+                     pthread_rwlock_init(&lock, &attr);
+#else
+                     pthread_rwlock_init(&lock, NULL);
+#endif
+                    }
+
         XrdSysRWLock() {pthread_rwlock_init(&lock, NULL);}
        ~XrdSysRWLock() {pthread_rwlock_destroy(&lock);}
+
+inline void ReInitialize(PrefType /* ptype */)
+{
+  pthread_rwlock_destroy(&lock);
+#if defined(__linux__) && (defined(__GLIBC__) || defined(__UCLIBC__))
+  pthread_rwlockattr_t attr;
+  pthread_rwlockattr_setkind_np(&attr,
+                     PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP);
+  pthread_rwlock_init(&lock, &attr);
+#else
+  pthread_rwlock_init(&lock, NULL);
+#endif
+}
 
 inline void ReInitialize()
 {
@@ -366,6 +427,35 @@ XrdSysRWLock *lck;
 };
 
 /******************************************************************************/
+/*                      X r d S y s F u s e d M u t e x                       */
+/******************************************************************************/
+
+class XrdSysFusedMutex
+{
+public:
+
+inline void  Lock()      {isRW ? rwLok->WriteLock() : mutex->Lock();}
+
+inline void  ReadLock()  {isRW ? rwLok->ReadLock()  : mutex->Lock();}
+
+inline void  WriteLock() {isRW ? rwLok->WriteLock() : mutex->Lock();}
+
+inline void  UnLock()    {isRW ? rwLok->UnLock()    : mutex->UnLock();}
+
+             XrdSysFusedMutex(XrdSysRWLock &mtx)
+                             : rwLok(&mtx), isRW(true) {}
+
+             XrdSysFusedMutex(XrdSysMutex  &mtx)
+                             : mutex(&mtx), isRW(false) {}
+
+            ~XrdSysFusedMutex() {}
+private:
+
+union {XrdSysRWLock *rwLok; XrdSysMutex *mutex;};
+bool  isRW;
+};
+  
+/******************************************************************************/
 /*                       X r d S y s S e m a p h o r e                        */
 /******************************************************************************/
 
@@ -374,7 +464,7 @@ XrdSysRWLock *lck;
 //                 semaphores need to be implemented based on condition
 //                 variables since no native implementation is available.
   
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(__GNU__)
 class XrdSysSemaphore
 {
 public:
@@ -505,7 +595,7 @@ static int          Same(pthread_t t1, pthread_t t2)
 
 static void         setDebug(XrdSysError *erp) {eDest = erp;}
 
-static void         setStackSize(size_t stsz) {stackSize = stsz;}
+static void         setStackSize(size_t stsz, bool force=false);
 
 static int          Signal(pthread_t tid, int snum)
                        {return pthread_kill(tid, snum);}

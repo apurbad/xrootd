@@ -25,8 +25,8 @@
 /* specific prior written permission of the institution or contributor.       */
 /*                                                                            */
 /******************************************************************************/
-#include <time.h>
-#include <string.h>
+#include <ctime>
+#include <cstring>
 
 #include "XrdCrypto/XrdCryptoX509Chain.hh"
 #include "XrdCrypto/XrdCryptoTrace.hh"
@@ -40,11 +40,11 @@
 // ---------------------------------------------------------------------------//
 
 // For test dumps, to avoid interfering with the trace mutex
-#define LOCDUMP(y)    { cerr << epname << ":" << y << endl; }
+#define LOCDUMP(y)    { std::cerr << epname << ":" << y << std::endl; }
 
 // Description of errors
 static const char *X509ChainErrStr[] = {
-   "no error condition occured",         // 0
+   "no error condition occurred",        // 0
    "chain is inconsistent",              // 1
    "size exceeds max allowed depth",     // 2
    "invalid or missing CA",              // 3
@@ -308,6 +308,8 @@ void XrdCryptoX509Chain::PushBack(XrdCryptoX509 *c)
          end->SetNext(nc);
       end = nc;
       size++;
+   } else if (c) {
+      delete c;
    }
 
    // Search for the effective CA (the last one, in case of subCAs)

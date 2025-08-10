@@ -26,8 +26,8 @@
 /*     All Rights Reserved. See XrdInfo.cc for complete License Terms         */
 /******************************************************************************/
 
-#include <stdio.h>
-#include <string.h>
+#include <cstdio>
+#include <cstring>
 #include <climits>
 
 #include "XrdOuc/XrdOucString.hh"
@@ -737,7 +737,7 @@ int XrdOucString::replace(const char *s1, const char *s2, int from, int to)
    // Return signed size of length modification (in bytes)
 
    // We must have something to replace
-   if (!str || len <= 0)
+   if (!str || len <= 0 || !s1 || !s2)
       return 0;
    
    // The string to replace must be defined and not empty
@@ -808,16 +808,17 @@ int XrdOucString::replace(const char *s1, const char *s2, int from, int to)
                memcpy(pc-l2,s2,l2);
             nc--;
             atn = at;
-            at = rfind(s1,at-l1);
+            if( at - l1 < 0 ) at = -1;
+            else at = rfind(s1,at-l1);
          }
          dl = nr*dd;
       }
+      // Variation of string length
+      len += dl;
+      // Ensure null-termination
+      str[len] = '\0';
    }
 
-   // Variation of string length
-   len += dl;
-   // Insure null-termination
-   str[len] = 0;
    // We are done
    return dl;
 }
@@ -951,12 +952,10 @@ void XrdOucString::upper(int start, int size)
 void XrdOucString::hardreset()
 {
    // Reset string making sure to erase completely the information.
+   if (str)
+     while (len > 0)
+       str[--len] = '\0';
 
-   if (str) {
-      volatile char *buf = 0;
-      for (buf = (volatile char *)str; len; buf[--len] = 0) {}
-      len = 0;
-   }
    len = 0;
 }
 
@@ -968,12 +967,12 @@ void XrdOucString::reset(const char c, int j, int k)
    j = (j >= 0 && j < siz) ? j : 0;
    k = (k >= j && k < siz) ? k : siz-1;
 
-   if (str) {
-      volatile char *buf = (volatile char *)str;
-      int i = j;
-      for (; i <= k; i++)
-         buf[i] = c;
-   }
+   if (!str)
+      return;
+
+   for (int i = j; i <= k; i++)
+      str[i] = c;
+
    while (str[len-1] == 0)
       --len; 
 }
@@ -1162,7 +1161,7 @@ int XrdOucString::operator==(const int i)
 }
 
 //______________________________________________________________________________
-ostream &operator<< (ostream &os, const XrdOucString s)
+std::ostream &operator<< (std::ostream &os, const XrdOucString s)
 {
    // Operator << is useful to print a string into a stream
 

@@ -29,8 +29,8 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <stdlib.h>
-#include <string.h>
+#include <cstdlib>
+#include <cstring>
 
 //-----------------------------------------------------------------------------
 //! This class defines an abstract interface to a generic shared memory table
@@ -223,7 +223,7 @@ virtual bool Enumerate(void *&jar) = 0;
 //!
 //! @return >=0   - The variable's value or the length of the text information.
 //! @return < 0   - The variable's value could not be returned; errno has the
-//!                 error code describing the reason, typically ENOSYS.
+//!                 error code describing the reason, typically ENOTSUP.
 //-----------------------------------------------------------------------------
 
 virtual int  Info(const char *vname, char *buff=0, int blen=0) = 0;

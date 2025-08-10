@@ -27,24 +27,24 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <ctype.h>
+#include <cctype>
 #ifndef WIN32
 #include <unistd.h>
-#include <errno.h>
-#include <stdlib.h>
-#include <stdio.h>
-#include <string.h>
+#include <cstdlib>
+#include <cstdio>
+#include <cstring>
 #include <strings.h>
 #include <sys/types.h>
 #include <sys/uio.h>
 #else
-#include <stdlib.h>
-#include <stdio.h>
-#include <string.h>
+#include <cstdlib>
+#include <cstdio>
+#include <cstring>
 #include <sys/types.h>
 #include "XrdSys/XrdWin32.hh"
 #endif
 
+#include "XrdSys/XrdSysE2T.hh"
 #include "XrdSys/XrdSysError.hh"
 #include "XrdSys/XrdSysHeaders.hh"
 #include "XrdSys/XrdSysLogger.hh"
@@ -76,15 +76,15 @@ int XrdSysError::baseFD() {return Logger->originalFD();}
 /*                               e c 2 t e x t                                */
 /******************************************************************************/
 
-char *XrdSysError::ec2text(int ecode)
+const char *XrdSysError::ec2text(int ecode)
 {
     int xcode;
-    char *etxt = 0;
+    const char *etxt = 0;
     XrdSysError_Table *etp = etab;
 
     xcode = (ecode < 0 ? -ecode : ecode);
     while((etp != 0) && !(etxt = etp->Lookup(xcode))) etp = etp->next;
-    if (!etxt) etxt = strerror(xcode);
+    if (!etxt) etxt = XrdSysE2T(xcode);
     return etxt;
 }
   
@@ -97,16 +97,7 @@ int XrdSysError::Emsg(const char *esfx, int ecode, const char *txt1,
 {
     struct iovec iov[16];
     int iovpnt = 0;
-    char ebuff[32], etbuff[80], *etxt = 0;
-
-    if (!(etxt = ec2text(ecode)))
-       {snprintf(ebuff, sizeof(ebuff), "reason unknown (%d)", ecode); 
-        etxt = ebuff;
-       } else if (isupper(static_cast<int>(*etxt)))
-                 {strlcpy(etbuff, etxt, sizeof(etbuff));
-                  *etbuff = static_cast<char>(tolower(static_cast<int>(*etxt)));
-                  etxt = etbuff;
-                 }
+    const char *etxt = ec2text(ecode);
 
                          Set_IOV_Item(0,0);                          //  0
     if (epfx && epfxlen) Set_IOV_Item(epfx, epfxlen);                //  1
@@ -169,14 +160,14 @@ void XrdSysError::Say(const char *txt1, const char *txt2, const char *txt3,
   
 void XrdSysError::TBeg(const char *txt1, const char *txt2, const char *txt3)
 {
- cerr <<Logger->traceBeg();
- if (txt1) cerr <<txt1 <<' ';
- if (txt2) cerr <<epfx <<txt2 <<": ";
- if (txt3) cerr <<txt3;
+ std::cerr <<Logger->traceBeg();
+ if (txt1) std::cerr <<txt1 <<' ';
+ if (txt2) std::cerr <<epfx <<txt2 <<": ";
+ if (txt3) std::cerr <<txt3;
 }
 
 /******************************************************************************/
 /*                                  T E n d                                   */
 /******************************************************************************/
   
-void XrdSysError::TEnd() {cerr <<endl; Logger->traceEnd();}
+void XrdSysError::TEnd() {std::cerr <<std::endl; Logger->traceEnd();}

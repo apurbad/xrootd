@@ -28,8 +28,8 @@
 /******************************************************************************/
 
 #include <fcntl.h>
-#include <stdio.h>
-#include <stdarg.h>
+#include <cstdio>
+#include <cstdarg>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/time.h>
@@ -215,6 +215,6 @@ const char *XrdSsiLogger::TBeg() {return Logger->traceBeg();}
   
 void XrdSsiLogger::TEnd()
 {
-   cerr <<endl;
+   std::cerr <<std::endl;
    Logger->traceEnd();
 }

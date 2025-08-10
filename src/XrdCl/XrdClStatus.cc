@@ -17,6 +17,7 @@
 //------------------------------------------------------------------------------
 
 #include "XrdCl/XrdClStatus.hh"
+#include "XrdSys/XrdSysE2T.hh"
 #include "XProtocol/XProtocol.hh"
 #include <cstring>
 
@@ -45,6 +46,7 @@ namespace
     { errDataError,            "Received corrupted data" },
     { errNotImplemented,       "Operation is not implemented" },
     { errNoMoreReplicas,       "No more replicas to try" },
+    { errPipelineFailed,       "Pipeline failed" },
     { errInvalidAddr,          "Invalid address"      },
     { errSocketError,          "Socket error"         },
     { errSocketTimeout,        "Socket timeout"       },
@@ -54,6 +56,7 @@ namespace
     { errStreamDisconnect,     "Stream disconnect"    },
     { errConnectionError,      "Connection error"     },
     { errInvalidSession,       "Invalid session"      },
+    { errTlsError,             "TLS error"            },
     { errInvalidMessage,       "Invalid message"      },
     { errNotFound,             "Resource not found"   },
     { errCheckSumError,        "CheckSum error"       },
@@ -64,11 +67,13 @@ namespace
     { errQueryNotSupported,    "Query not supported"  },
     { errOperationExpired,     "Operation expired"    },
     { errOperationInterrupted, "Operation interrupted" },
+    { errThresholdExceeded,    "Threshold exceeded"   },
     { errNoMoreFreeSIDs,       "No more free SIDs"    },
     { errInvalidRedirectURL,   "Invalid redirect URL" },
     { errInvalidResponse,      "Invalid response"     },
     { errRedirect,             "Unhandled redirect"   },
     { errErrorResponse,        "Error response"       },
+    { errLocalError,           "Local error"          },
     { errResponseNegative,     "Query response negative" },
     { 0, 0 } };
 
@@ -124,9 +129,9 @@ namespace XrdCl
     if( errNo >= kXR_ArgInvalid ) // kXR_ArgInvalid is the first (lowest) xrootd error code
       // it is used in an inconsistent way sometimes it is
       // xrootd error code and sometimes it is a plain errno
-      o << ": " << strerror( XProtocol::toErrno( errNo ) );
+      o << ": " << XrdSysE2T( XProtocol::toErrno( errNo ) );
     else if ( errNo )
-      o << ": " << strerror( errNo );
+      o << ": " << XrdSysE2T( errNo );
 
     return o.str();
   }

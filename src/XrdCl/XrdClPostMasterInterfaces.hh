@@ -25,8 +25,11 @@
 #ifndef __XRD_CL_POST_MASTER_INTERFACES_HH__
 #define __XRD_CL_POST_MASTER_INTERFACES_HH__
 
-#include <stdint.h>
+#include "XrdCl/XrdClXRootDResponses.hh"
+
+#include <cstdint>
 #include <ctime>
+#include <memory>
 
 #include "XrdCl/XrdClStatus.hh"
 #include "XrdCl/XrdClAnyObject.hh"
@@ -39,33 +42,12 @@ namespace XrdCl
   class Channel;
   class Message;
   class URL;
-
-  //----------------------------------------------------------------------------
-  //! Message filter
-  //----------------------------------------------------------------------------
-  class MessageFilter
-  {
-    public:
-      virtual ~MessageFilter() {}
-
-      //------------------------------------------------------------------------
-      //! Examine the message and return true if the message should be picked
-      //! up (usually removed from the queue and to the caller)
-      //------------------------------------------------------------------------
-      virtual bool Filter( const Message *msg ) = 0;
-
-      //------------------------------------------------------------------------
-      //! Get sid of the filter
-      //!
-      //! @return filter sid if exists, otherwise 0
-      //------------------------------------------------------------------------
-      virtual uint16_t GetSid() const = 0;
-  };
+  class Socket;
 
   //----------------------------------------------------------------------------
   //! Message handler
   //----------------------------------------------------------------------------
-  class IncomingMsgHandler
+  class MsgHandler
   {
     public:
       //------------------------------------------------------------------------
@@ -73,16 +55,21 @@ namespace XrdCl
       //------------------------------------------------------------------------
       enum Action
       {
-        Take          = 0x0001,    //!< Take ownership over the message
+        None          = 0x0000,
+        Nop           = 0x0001,    //!< A place holder
         Ignore        = 0x0002,    //!< Ignore the message
         RemoveHandler = 0x0004,    //!< Remove the handler from the notification
                                    //!< list
         Raw           = 0x0008,    //!< the handler is interested in reading
                                    //!< the message body directly from the
                                    //!< socket
-        NoProcess     = 0x0010     //!< don't call the processing callback
+        NoProcess     = 0x0010,    //!< don't call the processing callback
                                    //!< even if the message belongs to this
                                    //!< handler
+        Corrupted     = 0x0020,    //!< the handler discovered that the message
+                                   //!< header is corrupted, we will have to
+                                   //!< tear down the socket
+        More          = 0x0040     //!< there are more (non-raw) data to be read
       };
 
       //------------------------------------------------------------------------
@@ -100,7 +87,7 @@ namespace XrdCl
       //! Event types that the message handler may receive
       //------------------------------------------------------------------------
 
-      virtual ~IncomingMsgHandler() {}
+      virtual ~MsgHandler() {}
 
       //------------------------------------------------------------------------
       //! Examine an incoming message, and decide on the action to be taken
@@ -109,7 +96,19 @@ namespace XrdCl
       //! @return       action type that needs to be take wrt the message and
       //!               the handler
       //------------------------------------------------------------------------
-      virtual uint16_t Examine( Message *msg ) = 0;
+      virtual uint16_t Examine( std::shared_ptr<Message> &msg ) = 0;
+
+      //------------------------------------------------------------------------
+      //! Reexamine the incoming message, and decide on the action to be taken
+      //!
+      //! In case of kXR_status the message can be only fully examined after
+      //! reading the whole body (without raw data).
+      //!
+      //! @param msg    the message, may be zero if receive failed
+      //! @return       action type that needs to be take wrt the message and
+      //!               the handler
+      //------------------------------------------------------------------------
+      virtual uint16_t InspectStatusRsp() = 0;
 
       //------------------------------------------------------------------------
       //! Get handler sid
@@ -123,7 +122,7 @@ namespace XrdCl
       //!
       //! @param msg the message to be processed
       //------------------------------------------------------------------------
-      virtual void Process( Message *msg ) { (void)msg; };
+      virtual void Process() {};
 
       //------------------------------------------------------------------------
       //! Read message body directly from a socket - called if Examine returns
@@ -136,9 +135,9 @@ namespace XrdCl
       //!                  stOK & suRetry if more data is needed
       //!                  stError on failure
       //------------------------------------------------------------------------
-      virtual Status ReadMessageBody( Message  *msg,
-                                      int       socket,
-                                      uint32_t &bytesRead )
+      virtual XRootDStatus ReadMessageBody( Message  *msg,
+                                            Socket   *socket,
+                                            uint32_t &bytesRead )
       {
         (void)msg; (void)socket; (void)bytesRead;
         return Status( stOK, suDone );
@@ -148,32 +147,21 @@ namespace XrdCl
       //! Handle an event other that a message arrival
       //!
       //! @param event     type of the event
-      //! @param streamNum stream concerned
       //! @param status    status info
       //! @return          Action::RemoveHandler or 0
       //------------------------------------------------------------------------
-      virtual uint8_t OnStreamEvent( StreamEvent event,
-                                     uint16_t    streamNum,
-                                     Status      status )
+      virtual uint8_t OnStreamEvent( StreamEvent   event,
+                                     XRootDStatus  status )
       {
-        (void)event; (void)streamNum; (void)status;
+        (void)event; (void)status;
         return 0;
       };
-  };
-
-  //----------------------------------------------------------------------------
-  //! Message status handler
-  //----------------------------------------------------------------------------
-  class OutgoingMsgHandler
-  {
-    public:
-      virtual ~OutgoingMsgHandler() {}
 
       //------------------------------------------------------------------------
       //! The requested action has been performed and the status is available
       //------------------------------------------------------------------------
       virtual void OnStatusReady( const Message *message,
-                                  Status         status ) = 0;
+                                  XRootDStatus   status ) = 0;
 
       //------------------------------------------------------------------------
       //! Called just before the message is going to be sent through
@@ -182,11 +170,10 @@ namespace XrdCl
       //! dependent adjustments)
       //!
       //! @param msg       message concerned
-      //! @param streamNum number of the stream the message will go through
       //------------------------------------------------------------------------
-      virtual void OnReadyToSend( Message *msg, uint16_t streamNum )
+      virtual void OnReadyToSend( Message *msg )
       {
-        (void)msg; (void)streamNum;
+        (void)msg;
       };
 
       //------------------------------------------------------------------------
@@ -201,17 +188,19 @@ namespace XrdCl
       //! true - only socket related errors may be returned here
       //!
       //! @param socket    the socket to read from
-      //! @param bytesRead number of bytes read by the method
+      //! @param bytesWritten number of bytes written by the method
       //! @return          stOK & suDone if the whole body has been processed
       //!                  stOK & suRetry if more data needs to be written
       //!                  stError on failure
       //------------------------------------------------------------------------
-      virtual Status WriteMessageBody( int       socket,
-                                       uint32_t &bytesRead )
+      virtual XRootDStatus WriteMessageBody( Socket   *socket,
+                                             uint32_t &bytesWritten )
       {
-        (void)socket; (void)bytesRead;
+        (void)socket; (void)bytesWritten;
         return Status();
       }
+
+      virtual time_t GetExpiration() = 0;
   };
 
   //----------------------------------------------------------------------------
@@ -239,14 +228,12 @@ namespace XrdCl
       //! Event callback
       //!
       //! @param event   the event that has occurred
-      //! @param stream  the stream concerned
       //! @param status  the status info
       //! @return true if the handler should be kept
       //!         false if it should be removed from further consideration
       //------------------------------------------------------------------------
       virtual bool OnChannelEvent( ChannelEvent event,
-                                   Status       status,
-                                   uint16_t     stream ) = 0;
+                                   Status       status ) = 0;
   };
 
   //----------------------------------------------------------------------------
@@ -258,15 +245,14 @@ namespace XrdCl
     //--------------------------------------------------------------------------
     //! Constructor
     //--------------------------------------------------------------------------
-    HandShakeData( const URL *addr, uint16_t stream, uint16_t subStream ):
-      step(0), out(0), in(0), url(addr), streamId(stream),
-      subStreamId( subStream ), startTime( time(0) ), serverAddr(0)
+    HandShakeData( const URL *addr, uint16_t subStream ):
+      step(0), out(0), in(0), url(addr), subStreamId( subStream ),
+      startTime( time(0) ), serverAddr(0)
     {}
     uint16_t     step;           //!< Handshake step
     Message     *out;            //!< Message to be sent out
     Message     *in;             //!< Message that has been received
     const URL   *url;            //!< Destination URL
-    uint16_t     streamId;       //!< Stream number
     uint16_t     subStreamId;    //!< Sub-stream id
     time_t       startTime;      //!< Timestamp of when the handshake started
     const
@@ -292,8 +278,29 @@ namespace XrdCl
   //----------------------------------------------------------------------------
   struct TransportQuery
   {
-    static const uint16_t Name = 1; //!< Transport name, returns const char *
-    static const uint16_t Auth = 2; //!< Transport name, returns std::string *
+    static const uint16_t Name    = 1; //!< Transport name, returns const char *
+    static const uint16_t Auth    = 2; //!< Transport name, returns std::string *
+  };
+
+  //----------------------------------------------------------------------------
+  //! XRootD related protocol queries
+  //----------------------------------------------------------------------------
+  struct XRootDQuery
+  {
+    static const uint16_t ServerFlags     = 1002; //!< returns server flags
+    static const uint16_t ProtocolVersion = 1003; //!< returns the protocol version
+    static const uint16_t IsEncrypted     = 1004; //!< returns true if the channel is encrypted
+  };
+
+  //----------------------------------------------------------------------------
+  //! Stream query definitions
+  //! The transports may support other queries, with ids > 2999 and ids < 2000
+  //----------------------------------------------------------------------------
+  struct StreamQuery
+  {
+      static const uint16_t IpAddr   = 2001;
+      static const uint16_t IpStack  = 2002;
+      static const uint16_t HostName = 2003;
   };
 
   //----------------------------------------------------------------------------
@@ -337,7 +344,7 @@ namespace XrdCl
       //!                stOK & suRetry if more data is needed
       //!                stError on failure
       //------------------------------------------------------------------------
-      virtual Status GetHeader( Message *message, int socket ) = 0;
+      virtual XRootDStatus GetHeader( Message &message, Socket *socket ) = 0;
 
       //------------------------------------------------------------------------
       //! Read the message body from the socket, the socket is non-blocking,
@@ -349,12 +356,26 @@ namespace XrdCl
       //!                stOK & suRetry if more data is needed
       //!                stError on failure
       //------------------------------------------------------------------------
-      virtual Status GetBody( Message *message, int socket ) = 0;
+      virtual XRootDStatus GetBody( Message &message, Socket *socket ) = 0;
+
+      //------------------------------------------------------------------------
+      //! Read more of the message body from the socket, the socket is
+      //! non-blocking the method may be called multiple times - see GetHeader
+      //! for details
+      //!
+      //! @param message the message buffer containing the header
+      //! @param socket  the socket
+      //! @return        stOK & suDone if the whole message has been processed
+      //!                stOK & suRetry if more data is needed
+      //!                stError on failure
+      //------------------------------------------------------------------------
+      virtual XRootDStatus GetMore( Message &message, Socket *socket ) = 0;
 
       //------------------------------------------------------------------------
       //! Initialize channel
       //------------------------------------------------------------------------
-      virtual void InitializeChannel( AnyObject &channelData ) = 0;
+      virtual void InitializeChannel( const URL  &url,
+                                      AnyObject  &channelData ) = 0;
 
       //------------------------------------------------------------------------
       //! Finalize channel
@@ -364,14 +385,20 @@ namespace XrdCl
       //------------------------------------------------------------------------
       //! HandHake
       //------------------------------------------------------------------------
-      virtual Status HandShake( HandShakeData *handShakeData,
-                                AnyObject     &channelData ) = 0;
+      virtual XRootDStatus HandShake( HandShakeData *handShakeData,
+                                      AnyObject     &channelData ) = 0;
+
+      //------------------------------------------------------------------------
+      // @return true if handshake has been done and stream is connected,
+      //         false otherwise
+      //------------------------------------------------------------------------
+      virtual bool HandShakeDone( HandShakeData *handShakeData,
+                                  AnyObject     &channelData ) = 0;
 
       //------------------------------------------------------------------------
       //! Check if the stream should be disconnected
       //------------------------------------------------------------------------
       virtual bool IsStreamTTLElapsed( time_t     inactiveTime,
-                                       uint16_t   streamId,
                                        AnyObject &channelData ) = 0;
 
       //------------------------------------------------------------------------
@@ -379,7 +406,6 @@ namespace XrdCl
       //! went undetected by the TCP stack
       //------------------------------------------------------------------------
       virtual Status IsStreamBroken( time_t     inactiveTime,
-                                     uint16_t   streamId,
                                      AnyObject &channelData ) = 0;
 
       //------------------------------------------------------------------------
@@ -401,14 +427,8 @@ namespace XrdCl
       //! the answer will be returned via the hinted stream.
       //------------------------------------------------------------------------
       virtual PathID MultiplexSubStream( Message   *msg,
-                                         uint16_t   streamId,
                                          AnyObject &channelData,
                                          PathID    *hint = 0 ) = 0;
-
-      //------------------------------------------------------------------------
-      //! Return a number of streams that should be created
-      //------------------------------------------------------------------------
-      virtual uint16_t StreamNumber( AnyObject &channelData ) = 0;
 
       //------------------------------------------------------------------------
       //! Return a number of substreams per stream that should be created
@@ -419,7 +439,6 @@ namespace XrdCl
       //! The stream has been disconnected, do the cleanups
       //------------------------------------------------------------------------
       virtual void Disconnect( AnyObject &channelData,
-                               uint16_t   streamId,
                                uint16_t   subStreamId ) = 0;
 
       //------------------------------------------------------------------------
@@ -432,8 +451,7 @@ namespace XrdCl
       //------------------------------------------------------------------------
       //! Check if the message invokes a stream action
       //------------------------------------------------------------------------
-      virtual uint32_t MessageReceived( Message   *msg,
-                                        uint16_t   streamId,
+      virtual uint32_t MessageReceived( Message   &msg,
                                         uint16_t   subStream,
                                         AnyObject &channelData ) = 0;
 
@@ -441,10 +459,37 @@ namespace XrdCl
       //! Notify the transport about a message having been sent
       //------------------------------------------------------------------------
       virtual void MessageSent( Message   *msg,
-                                uint16_t   streamId,
                                 uint16_t   subStream,
                                 uint32_t   bytesSent,
                                 AnyObject &channelData ) = 0;
+
+      //------------------------------------------------------------------------
+      //! Wait before exit
+      //------------------------------------------------------------------------
+      virtual void WaitBeforeExit() = 0;
+
+      //------------------------------------------------------------------------
+      //! @return : true if encryption should be turned on, false otherwise
+      //------------------------------------------------------------------------
+      virtual bool NeedEncryption( HandShakeData  *handShakeData,
+                                  AnyObject      &channelData ) = 0;
+
+      //------------------------------------------------------------------------
+      //! Get signature for given message
+      //------------------------------------------------------------------------
+      virtual Status GetSignature( Message *toSign, Message *&sign,
+                                   AnyObject &channelData ) = 0;
+
+      //------------------------------------------------------------------------
+      //! Decrement file object instance count bound to this channel
+      //------------------------------------------------------------------------
+      virtual void DecFileInstCnt( AnyObject &channelData ) = 0;
+
+      //------------------------------------------------------------------------
+      //! Get bind preference for the next data stream
+      //------------------------------------------------------------------------
+      virtual URL GetBindPreference( const URL  &url,
+                                     AnyObject  &channelData ) = 0;
   };
 }
 

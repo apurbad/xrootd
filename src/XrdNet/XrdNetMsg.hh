@@ -30,8 +30,8 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <stdlib.h>
-#include <string.h>
+#include <cstdlib>
+#include <cstring>
 #ifndef WIN32
 #include <strings.h>
 #include <unistd.h>
@@ -43,6 +43,7 @@
 
 #include "XrdNet/XrdNetAddr.hh"
 
+union XrdNetSockAddr;
 class XrdSysError;
 
 class XrdNetMsg
@@ -57,11 +58,11 @@ public:
 //!                  computed as strlen(buff).
 //! @param  dest     The endpint name which can be host:port or a named socket.
 //!                  If dest is zero, uses dest specified in the constructor.
-//! @param  timeout  maximum seconds to wait for a idle socket. When negative,
+//! @param  tmo      maximum seconds to wait for a idle socket. When negative,
 //!                  the default, no time limit applies.
 //! @return <0       Message not sent due to error.
 //! @return =0       Message send (well as defined by UDP)
-//! @return >0       Message not sent, timeout occured.
+//! @return >0       Message not sent, timeout occurred.
 //------------------------------------------------------------------------------
 
 int           Send(const char *buff,          // The data to be send
@@ -70,17 +71,38 @@ int           Send(const char *buff,          // The data to be send
                          int   tmo=-1);       // Timeout in ms (-1 = none)
 
 //------------------------------------------------------------------------------
+//! Send a UDP message to an endpoint.
+//!
+//! @param  buff     The data to send.
+//! @param  blen     Length of the data in buff. If not specified, the length is
+//!                  computed as strlen(buff).
+//! @param  dest     The endpoint in the form as in "host:port".
+//! @param  netSA    The endpoint address. This overrides the constructor.
+//! @param  tmo      maximum seconds to wait for a idle socket. When negative,
+//!                  the default, no time limit applies.
+//! @return <0       Message not sent due to error.
+//! @return =0       Message send (well as defined by UDP)
+//! @return >0       Message not sent, timeout occurred.
+//------------------------------------------------------------------------------
+
+int           Send(          const char *dest,    // EP: host:port
+                   const XrdNetSockAddr &netSA,   // Address of endpoint
+                             const char *buff,    // The data to be send
+                                   int   blen=0,  // Length (strlen(buff) if zero)
+                                   int   tmo=-1); // Timeout in ms (-1 = none)
+
+//------------------------------------------------------------------------------
 //! Send a UDP message to an endpoint using an I/O vector.
 //!
 //! @param  iov      The vector of data to send. Total amount be <= 4096 bytes.
 //! @param  iovcnt   The number of elements in the vector.
 //! @param  dest     The endpint name which can be host:port or a named socket.
 //!                  If dest is zero, uses dest specified in the constructor.
-//! @param  timeout  maximum seconds to wait for a idle socket. When negative,
+//! @param  tmo      maximum seconds to wait for a idle socket. When negative,
 //!                  the default, no time limit applies.
 //! @return <0       Message not sent due to error.
 //! @return =0       Message send (well as defined by UDP)
-//! @return >0       Message not sent, timeout occured.
+//! @return >0       Message not sent, timeout occurred.
 //------------------------------------------------------------------------------
 
 int           Send(const struct  iovec iov[], // Remaining parms as above

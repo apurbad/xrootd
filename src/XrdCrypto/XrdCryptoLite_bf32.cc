@@ -33,14 +33,21 @@
 
 #ifdef HAVE_SSL
 
-#include <errno.h>
-#include <stdlib.h>
-#include <string.h>
+#include <cerrno>
+#include <cstdlib>
+#include <cstring>
 #include <sys/types.h>
 #include <netinet/in.h>
-#include <inttypes.h>
+#include <cinttypes>
 
-#include <openssl/blowfish.h>
+#include <openssl/evp.h>
+#include <openssl/opensslv.h>
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
+#include "XrdTls/XrdTlsContext.hh"
+#endif
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+#include <openssl/provider.h>
+#endif
 
 #include "XrdOuc/XrdOucCRC.hh"
 #include "XrdSys/XrdSysHeaders.hh"
@@ -82,23 +89,26 @@ int XrdCryptoLite_bf32::Decrypt(const char *key,
                                 char       *dst,
                                 int         dstLen)
 {
-   BF_KEY decKey;
    unsigned char ivec[8] = {0,0,0,0,0,0,0,0};
    unsigned int crc32;
-   int ivnum = 0, dLen = srcLen-sizeof(crc32);
+   int wLen;
+   int dLen = srcLen - sizeof(crc32);
 
 // Make sure we have data
 //
    if (dstLen <= (int)sizeof(crc32) || dstLen < srcLen) return -EINVAL;
 
-// Set the key
-//
-   BF_set_key(&decKey, keyLen, (const unsigned char *)key);
-
 // Decrypt
 //
-   BF_cfb64_encrypt((const unsigned char *)src, (unsigned char *)dst, srcLen,
-                    &decKey, ivec, &ivnum, BF_DECRYPT);
+   EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+   EVP_DecryptInit_ex(ctx, EVP_bf_cfb64(), NULL, NULL, NULL);
+   EVP_CIPHER_CTX_set_padding(ctx, 0);
+   EVP_CIPHER_CTX_set_key_length(ctx, keyLen);
+   EVP_DecryptInit_ex(ctx, NULL, NULL, (unsigned char *)key, ivec);
+   EVP_DecryptUpdate(ctx, (unsigned char *)dst, &wLen,
+                          (unsigned char *)src, srcLen);
+   EVP_DecryptFinal_ex(ctx, (unsigned char *)dst, &wLen);
+   EVP_CIPHER_CTX_free(ctx);
 
 // Perform the CRC check to verify we have valid data here
 //
@@ -123,10 +133,10 @@ int XrdCryptoLite_bf32::Encrypt(const char *key,
                                 char       *dst,
                                 int         dstLen)
 {
-   BF_KEY encKey;
    unsigned char buff[4096], *bP, *mP = 0, ivec[8] = {0,0,0,0,0,0,0,0};
    unsigned int crc32;
-   int ivnum = 0, dLen = srcLen+sizeof(crc32);
+   int wLen;
+   int dLen = srcLen + sizeof(crc32);
 
 // Make sure that the destination if at least 4 bytes larger and we have data
 //
@@ -146,14 +156,16 @@ int XrdCryptoLite_bf32::Encrypt(const char *key,
    crc32 = htonl(crc32);
    memcpy((bP+srcLen), &crc32, sizeof(crc32));
 
-// Set the key
-//
-   BF_set_key(&encKey, keyLen, (const unsigned char *)key);
-
 // Encrypt
 //
-   BF_cfb64_encrypt(bP, (unsigned char *)dst, dLen,
-                    &encKey, ivec, &ivnum, BF_ENCRYPT);
+   EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+   EVP_EncryptInit_ex(ctx, EVP_bf_cfb64(), NULL, NULL, NULL);
+   EVP_CIPHER_CTX_set_padding(ctx, 0);
+   EVP_CIPHER_CTX_set_key_length(ctx, keyLen);
+   EVP_EncryptInit_ex(ctx, NULL, NULL, (unsigned char *)key, ivec);
+   EVP_EncryptUpdate(ctx, (unsigned char *)dst, &wLen, bP, dLen);
+   EVP_EncryptFinal_ex(ctx, (unsigned char *)dst, &wLen);
+   EVP_CIPHER_CTX_free(ctx);
 
 // Free temp buffer and return success
 //
@@ -169,6 +181,37 @@ int XrdCryptoLite_bf32::Encrypt(const char *key,
 XrdCryptoLite *XrdCryptoLite_New_bf32(const char Type)
 {
 #ifdef HAVE_SSL
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
+   // In case nothing has yet configured a libcrypto thread-id callback
+   // function we provide one via the XrdTlsContext Init method. Compared
+   // to the default the aim is to provide better properies when libcrypto
+   // uses the thread-id as hash-table keys for the per-thread error state.
+   static struct configThreadid {
+     configThreadid() {eText = XrdTlsContext::Init();}
+     const char *eText;
+   } ctid;
+   // Make sure all went well
+   //
+   if (ctid.eText) return (XrdCryptoLite *)0;
+#endif
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+   // With openssl v3 the blowfish cipher is only available via the "legacy"
+   // provider. Legacy is typically not enabled by default (but can be via
+   // openssl.cnf) so it is loaded here. Explicitly loading a provider will
+   // disable the automatic loading of the "default" one. The default might
+   // not have already been loaded, or standard algorithms might be available
+   // via another configured provider, such as FIPS. So an attempt is made to
+   // fetch a common default algorithm, possibly automaticlly loading the
+   // default provider. Afterwards the legacy provider is loaded.
+   static struct loadProviders {
+      loadProviders() {
+         EVP_MD *mdp = EVP_MD_fetch(NULL, "SHA2-256", NULL);
+         if (mdp) EVP_MD_free(mdp);
+         // Load legacy provider into the default (NULL) library context
+         (void) OSSL_PROVIDER_load(NULL, "legacy");
+      }
+   } lp;
+#endif
    return (XrdCryptoLite *)(new XrdCryptoLite_bf32(Type));
 #else
    return (XrdCryptoLite *)0;

@@ -39,14 +39,13 @@
 /*                         i n c l u d e   f i l e s                          */
 /******************************************************************************/
   
-#include <ctype.h>
+#include <cctype>
 #include <dirent.h>
-#include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
-#include <stdlib.h>
-#include <stdio.h>
-#include <string.h>
+#include <cstdlib>
+#include <cstdio>
+#include <cstring>
 #include <strings.h>
 #include <unistd.h>
 #include <sys/param.h>
@@ -54,6 +53,7 @@
 #include <sys/types.h>
 
 #include "XrdOuc/XrdOucTList.hh"
+#include "XrdSys/XrdSysE2T.hh"
 #include "XrdSys/XrdSysHeaders.hh"
 #include "XrdSys/XrdSysPlatform.hh"
 #include "XrdSys/XrdSysPthread.hh"
@@ -139,8 +139,8 @@ int main(int argc, char *argv[])
 //
    for (i = 1; i < argc; i++)
        {if (stat(argv[i], &Stat))
-           {eText = strerror(errno);
-            cerr <<"wait41: " <<eText <<" processing " <<argv[i] <<endl;
+           {eText = XrdSysE2T(errno);
+            std::cerr <<"wait41: " <<eText <<" processing " <<argv[i] <<std::endl;
             continue;
            }
              if (S_ISREG(Stat.st_mode))
@@ -152,15 +152,15 @@ int main(int argc, char *argv[])
 // If we have no waiters then fail
 //
    if (!gateFiles)
-      {cerr <<"wait41: Nothing to wait on!" <<endl;
-       cout <<"BAD\n" <<endl;
+      {std::cerr <<"wait41: Nothing to wait on!" <<std::endl;
+       std::cout <<"BAD\n" <<std::endl;
        _exit(1);
       }
 
 // Now wait for the first lock
 //
    eText = (XrdW41Gate::Wait41(gateFiles) ? "OK\n" : "BAD\n");
-   cout <<eText <<endl;
+   std::cout <<eText <<std::endl;
 
 // Now wait for the process to die
 //
@@ -184,8 +184,8 @@ XrdOucTList *XrdW41Dirs::Expand(const char *Path, XrdOucTList *ptl)
     DIR *DFD;
 
     if (!(DFD = opendir(Path)))
-       {eText = strerror(errno);
-        cerr <<"wait41: " <<eText <<" opening directory" <<Path <<endl;
+       {eText = XrdSysE2T(errno);
+        std::cerr <<"wait41: " <<eText <<" opening directory" <<Path <<std::endl;
         return ptl;
        }
 
@@ -197,8 +197,8 @@ XrdOucTList *XrdW41Dirs::Expand(const char *Path, XrdOucTList *ptl)
          {if (!strcmp(dp->d_name, ".") || !strcmp(dp->d_name, "..")) continue;
           strcpy(sfxDir, dp->d_name);
           if (stat(buff, &Stat))
-             {eText = strerror(errno);
-              cerr <<"wait41: " <<eText <<" processing " <<buff <<endl;
+             {eText = XrdSysE2T(errno);
+              std::cerr <<"wait41: " <<eText <<" processing " <<buff <<std::endl;
               continue;
              }
           if (S_ISREG(Stat.st_mode)) ptl = new XrdOucTList(buff, 0, ptl);
@@ -206,8 +206,8 @@ XrdOucTList *XrdW41Dirs::Expand(const char *Path, XrdOucTList *ptl)
          }
 
     if (errno)
-       {eText = strerror(errno);
-        cerr <<"wait41: " <<eText <<" reading directory" <<Path <<endl;
+       {eText = XrdSysE2T(errno);
+        std::cerr <<"wait41: " <<eText <<" reading directory" <<Path <<std::endl;
        }
 
     closedir(DFD);
@@ -240,7 +240,7 @@ void XrdW41Gate::Serialize(XrdOucTList *gfP, int Wait)
 //
    if (rc != -1) rc = 0;
       else {rc = errno;
-            cerr <<"Serialize: " <<strerror(rc) <<" locking FD " <<gfP->text <<endl;
+            std::cerr <<"Serialize: " <<XrdSysE2T(rc) <<" locking FD " <<gfP->text <<std::endl;
            }
 
 // Reflect what happened here
@@ -273,14 +273,14 @@ int XrdW41Gate::Wait41(XrdOucTList *gfP)
              gateMutex.UnLock();
             }
               if ((gfP->val = open(gfP->text, O_CREAT|O_RDWR, AMode)) < 0)
-                 {eTxt = strerror(errno);
-                  cerr <<"Wait41: " <<eTxt <<" opening " <<gfP->text <<endl;
+                 {eTxt = XrdSysE2T(errno);
+                  std::cerr <<"Wait41: " <<eTxt <<" opening " <<gfP->text <<std::endl;
                  }
          else if ((rc = XrdSysThread::Run(&tid, GateWait, (void *)gfP,
                                       XRDSYSTHREAD_BIND, "Gate Wait")))
-                 {eTxt = strerror(errno);
-                  cerr <<"Wait41: " <<eTxt <<" creating gate thread for "
-                                    <<gfP->text <<endl;
+                 {eTxt = XrdSysE2T(errno);
+                  std::cerr <<"Wait41: " <<eTxt <<" creating gate thread for "
+                                    <<gfP->text <<std::endl;
                   close(gfP->val);
                  } else Num++;
           gfP = gfP->next;

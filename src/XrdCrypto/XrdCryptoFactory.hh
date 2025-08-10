@@ -55,6 +55,7 @@ class XrdCryptoX509Chain;
 class XrdCryptogsiX509Chain;
 class XrdCryptoX509Crl;
 class XrdCryptoX509Req;
+class XrdTlsPeerCerts;
 
 //
 // Prototypes for some Utility Functions
@@ -78,7 +79,12 @@ typedef int (*XrdCryptoX509ChainToFile_t)(XrdCryptoX509Chain *, const char *);
 
 // certificates from file parsing
 typedef int (*XrdCryptoX509ParseFile_t)(const char *fname,
-                                        XrdCryptoX509Chain *);
+                                        XrdCryptoX509Chain *, const char *);
+
+// certificates from STACK_OF(X509*)
+typedef int (*XrdCryptoX509ParseStack_t)(XrdTlsPeerCerts* pc,
+                                         XrdCryptoX509Chain *c);
+
 // certificates from bucket parsing
 typedef int (*XrdCryptoX509ParseBucket_t)(XrdSutBucket *,
                                           XrdCryptoX509Chain *);
@@ -92,7 +98,7 @@ typedef bool (*XrdCryptoProxyCertInfo_t)(const void *, int &, bool *);
 typedef void (*XrdCryptoSetPathLenConstraint_t)(void *, int);
 // create a proxy certificate
 typedef struct {
-   int   bits;          // Number of bits in the RSA key [512]
+   int   bits;          // Number of bits in the RSA key [2048]
    int   valid;         // Duration validity in secs [43200 (12 hours)]
    int   depthlen;      // Maximum depth of the path of proxy certificates
                         // that can signed by this proxy certificates
@@ -173,6 +179,7 @@ public:
    virtual XrdCryptoX509VerifyCert_t X509VerifyCert();
    virtual XrdCryptoX509VerifyChain_t X509VerifyChain();
    virtual XrdCryptoX509ParseFile_t X509ParseFile();
+   virtual XrdCryptoX509ParseStack_t X509ParseStack();
    virtual XrdCryptoX509ParseBucket_t X509ParseBucket();
    virtual XrdCryptoX509ExportChain_t X509ExportChain();
    virtual XrdCryptoX509ChainToFile_t X509ChainToFile();

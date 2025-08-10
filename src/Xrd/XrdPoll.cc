@@ -28,8 +28,8 @@
 /******************************************************************************/
 
 #include <unistd.h>
-#include <stdio.h>
-#include <stdlib.h>
+#include <cstdio>
+#include <cstdlib>
   
 #include "XrdSys/XrdSysError.hh"
 #include "XrdSys/XrdSysFD.hh"
@@ -38,17 +38,17 @@
 #include "Xrd/XrdLink.hh"
 #include "Xrd/XrdProtocol.hh"
 
-#define  XRD_TRACE XrdTrace->
-#define  TRACELINK lp
+#define  TRACE_IDENT pInfo.Link.ID
 #include "Xrd/XrdTrace.hh"
 
-#if defined( __solaris__ )
-#include "Xrd/XrdPollDev.hh"
-#elif defined( __linux__ )
+#if defined( __linux__ )
 #include "Xrd/XrdPollE.hh"
+//#include "Xrd/XrdPollPoll.hh"
 #else
 #include "Xrd/XrdPollPoll.hh"
 #endif
+
+#include "Xrd/XrdPollInfo.hh"
 
 /******************************************************************************/
 /*                         L o c a l   C l a s s e s                          */
@@ -82,9 +82,13 @@ int           Stats(char *buff, int blen, int do_sync=0) {return 0;}
 
        const char *XrdPoll::TraceID = "Poll";
 
-       XrdOucTrace  *XrdPoll::XrdTrace = 0;
-       XrdSysError  *XrdPoll::XrdLog   = 0;
-       XrdScheduler *XrdPoll::XrdSched = 0;
+namespace XrdGlobal
+{
+extern XrdSysError  Log;
+extern XrdScheduler Sched;
+}
+
+using namespace XrdGlobal;
 
 /******************************************************************************/
 /*              T h r e a d   S t a r t u p   I n t e r f a c e               */
@@ -123,7 +127,7 @@ XrdPoll::XrdPoll()
        ReqFD = fildes[0];
       } else {
        CmdFD = ReqFD = -1;
-       XrdLog->Emsg("Poll", errno, "create poll pipe");
+       Log.Emsg("Poll", errno, "create poll pipe");
       }
    PipeBuff        = 0;
    PipeBlen        = 0;
@@ -135,9 +139,9 @@ XrdPoll::XrdPoll()
 /*                                A t t a c h                                 */
 /******************************************************************************/
   
-int XrdPoll__Attach(XrdLink *lp) {return XrdPoll::Attach(lp);}
+int XrdPoll__Attach(XrdLink *lp) {return lp->Activate();}
 
-int XrdPoll::Attach(XrdLink *lp)
+int XrdPoll::Attach(XrdPollInfo &pInfo)
 {
    int i;
    XrdPoll *pp;
@@ -154,41 +158,42 @@ int XrdPoll::Attach(XrdLink *lp)
 
 // Include this FD into the poll set of the poller
 //
-   if (!pp->Include(lp)) {doingAttach.UnLock(); return 0;}
+   if (!pp->Include(pInfo)) {doingAttach.UnLock(); return 0;}
 
 // Complete the link setup
 //
-   lp->Poller = pp;
+   pInfo.Poller = pp;
    pp->numAttached++;
    doingAttach.UnLock();
-   TRACEI(POLL, "FD " <<lp->FD <<" attached to poller " <<pp->PID <<"; num=" <<pp->numAttached);
-   return 1;
+   TRACEI(POLL, "FD " <<pInfo.FD <<" attached to poller " <<pp->PID
+                <<"; num=" <<pp->numAttached);
+   return 1;                                                           
 }
 
 /******************************************************************************/
 /*                                D e t a c h                                 */
 /******************************************************************************/
   
-void XrdPoll::Detach(XrdLink *lp)
+void XrdPoll::Detach(XrdPollInfo &pInfo)
 {
    XrdPoll *pp;
 
 // If link is not attached, simply return
 //
-   if (!(pp = lp->Poller)) return;
+   if (!(pp = pInfo.Poller)) return;
 
 // Exclude this link from the associated poll set
 //
-   pp->Exclude(lp);
+   pp->Exclude(pInfo);
 
 // Make sure we are consistent
 //
    doingAttach.Lock();
    if (!pp->numAttached)
-      {XrdLog->Emsg("Poll","Underflow detaching", lp->ID); abort();}
+      {Log.Emsg("Poll","Underflow detaching", pInfo.Link.ID); abort();}
    pp->numAttached--;
    doingAttach.UnLock();
-   TRACEI(POLL, "FD " <<lp->FDnum() <<" detached from poller " <<pp->PID
+   TRACEI(POLL, "FD " <<pInfo.FD <<" detached from poller " <<pp->PID
                 <<"; num=" <<pp->numAttached);
 }
 
@@ -196,27 +201,24 @@ void XrdPoll::Detach(XrdLink *lp)
 /*                                F i n i s h                                 */
 /******************************************************************************/
   
-int XrdPoll::Finish(XrdLink *lp, const char *etxt)
+int XrdPoll::Finish(XrdPollInfo &pInfo, const char *etxt)
 {
    static XrdPoll_End LinkEnd;
 
 // If this link is already scheduled for termination, ignore this call.
 //
-   if (lp->Protocol == &LinkEnd)
-      {TRACEI(POLL, "Link " <<lp->FD <<" already terminating; "
+   if (pInfo.Link.getProtocol() == &LinkEnd)
+      {TRACEI(POLL, "Link " <<pInfo.FD <<" already terminating; "
                     <<(etxt ? etxt : "") <<" request ignored.");
        return 0;
       }
 
 // Set the protocol pointer to be link termination
 //
-   lp->ProtoAlt = lp->Protocol;
-   lp->Protocol = static_cast<XrdProtocol *>(&LinkEnd);
-   if (etxt)
-      {if (lp->Etext) free(lp->Etext);
-       lp->Etext = strdup(etxt);
-      } else etxt = "reason unknown";
-   TRACEI(POLL, "Link " <<lp->FD <<" terminating: " <<etxt);
+   pInfo.Link.setProtocol(&LinkEnd, false, true);
+   if (!etxt) etxt = "reason unknown";
+   pInfo.Link.setEtext(etxt);
+   TRACEI(POLL, "Link " <<pInfo.FD <<" terminating: " <<etxt);
    return 1;
 }
   
@@ -250,7 +252,7 @@ int XrdPoll::getRequest()
    do {rlen = read(ReqFD, PipeBuff, PipeBlen);} 
       while(rlen < 0 && errno == EINTR);
    if (rlen <= 0)
-      {if (rlen) XrdLog->Emsg("Poll", errno, "read from request pipe");
+      {if (rlen) Log.Emsg("Poll", errno, "read from request pipe");
        return 0;
       }
 
@@ -271,9 +273,9 @@ char *XrdPoll::Poll2Text(short events)
 {
    if (events & POLLERR) return strdup("socket error");
 
-   if (events & POLLHUP) return strdup("client disconnected");
+   if (events & POLLHUP) return strdup("hangup");
 
-   if (events & POLLNVAL) return strdup("client closed socket");
+   if (events & POLLNVAL) return strdup("socket closed");
 
   {char buff[64];
    sprintf(buff, "unusual event (%.4x)", events);
@@ -309,11 +311,11 @@ int XrdPoll::Setup(int numfd)
         TRACE(POLL, "Starting poller " <<i);
         if ((retc = XrdSysThread::Run(&tid,XrdStartPolling,(void *)&PArg,
                                       XRDSYSTHREAD_BIND, "Poller")))
-           {XrdLog->Emsg("Poll", retc, "create poller thread"); return 0;}
+           {Log.Emsg("Poll", retc, "create poller thread"); return 0;}
         Pollers[i]->TID = tid;
         PArg.PollSync.Wait();
         if (PArg.retcode)
-           {XrdLog->Emsg("Poll", PArg.retcode, "start poller");
+           {Log.Emsg("Poll", PArg.retcode, "start poller");
             return 0;
            }
        }
@@ -358,10 +360,10 @@ int XrdPoll::Stats(char *buff, int blen, int do_sync)
 /******************************************************************************/
 /*              I m p l e m e n t a t i o n   S p e c i f i c s               */
 /******************************************************************************/
-#if defined( __solaris__ )  
-#include "Xrd/XrdPollDev.icc"
-#elif defined( __linux__ )
+
+#if defined( __linux__ )
 #include "Xrd/XrdPollE.icc"
+//#include "Xrd/XrdPollPoll.icc"
 #else
 #include "Xrd/XrdPollPoll.icc"
 #endif

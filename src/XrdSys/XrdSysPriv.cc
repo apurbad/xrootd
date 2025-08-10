@@ -41,12 +41,12 @@
 #include "XrdSys/XrdSysPriv.hh"
 
 #if !defined(WINDOWS)
-#include <stdio.h>
+#include <cstdio>
 #include "XrdSys/XrdSysHeaders.hh"
 #include "XrdSys/XrdSysPwd.hh"
 #include <unistd.h>
 #include <pwd.h>
-#include <errno.h>
+#include <cerrno>
 
 #define NOUC ((uid_t)(-1))
 #define NOGC ((gid_t)(-1))
@@ -323,13 +323,13 @@ void XrdSysPriv::DumpUGID(const char *msg)
    if (getresgid(&rgid, &egid, &sgid) != 0)
       return;
 
-   cout << "XrdSysPriv: "  << endl; 
-   cout << "XrdSysPriv: dump values: " << (msg ? msg : "") << endl; 
-   cout << "XrdSysPriv: "  << endl; 
-   cout << "XrdSysPriv: real       = (" << ruid <<","<< rgid <<")" << endl; 
-   cout << "XrdSysPriv: effective  = (" << euid <<","<< egid <<")" << endl; 
-   cout << "XrdSysPriv: saved      = (" << suid <<","<< sgid <<")" << endl; 
-   cout << "XrdSysPriv: "  << endl; 
+   std::cout << "XrdSysPriv: "  << std::endl; 
+   std::cout << "XrdSysPriv: dump values: " << (msg ? msg : "") << std::endl; 
+   std::cout << "XrdSysPriv: "  << std::endl; 
+   std::cout << "XrdSysPriv: real       = (" << ruid <<","<< rgid <<")" << std::endl; 
+   std::cout << "XrdSysPriv: effective  = (" << euid <<","<< egid <<")" << std::endl; 
+   std::cout << "XrdSysPriv: saved      = (" << suid <<","<< sgid <<")" << std::endl; 
+   std::cout << "XrdSysPriv: "  << std::endl; 
    XrdSysPriv::fgMutex.UnLock();
 #endif
 }
@@ -339,7 +339,7 @@ void XrdSysPriv::DumpUGID(const char *msg)
 //______________________________________________________________________________
 XrdSysPrivGuard::XrdSysPrivGuard(uid_t uid, gid_t gid)
 {
-   // Constructor. Create a guard object for temporarly change to privileges
+   // Constructor. Create a guard object for temporarily change to privileges
    // of {'uid', 'gid'}
 
    dum = 1;
@@ -351,7 +351,7 @@ XrdSysPrivGuard::XrdSysPrivGuard(uid_t uid, gid_t gid)
 //______________________________________________________________________________
 XrdSysPrivGuard::XrdSysPrivGuard(const char *usr)
 {
-   // Constructor. Create a guard object for temporarly change to privileges
+   // Constructor. Create a guard object for temporarily change to privileges
    // of 'usr'
 
    dum = 1;
@@ -401,7 +401,7 @@ void XrdSysPrivGuard::Init(uid_t uid, gid_t gid)
        getresgid(&rgid, &egid, &sgid) == 0) {
       if ((euid != uid) || (egid != gid)) {
          if (!ruid) {
-            // Change temporarly identity
+            // Change temporarily identity
             if (XrdSysPriv::ChangeTo(uid, gid) != 0)
                valid = 0;
             dum = 0;

@@ -33,11 +33,27 @@
 #include "XrdCl/XrdClLog.hh"
 #include "XrdCl/XrdClConstants.hh"
 
+#include "XrdCl/XrdClAsyncPageReader.hh"
+#include "XrdCl/XrdClAsyncVectorReader.hh"
+#include "XrdCl/XrdClAsyncRawReader.hh"
+#include "XrdCl/XrdClAsyncDiscardReader.hh"
+#include "XrdClAsyncRawReaderIntfc.hh"
+
 #include "XrdSys/XrdSysPthread.hh"
+#include "XrdSys/XrdSysPageSize.hh"
+#include "XrdSys/XrdSysKernelBuffer.hh"
+#include "XrdSys/XrdSysPlatform.hh"
+
+#include "XrdOuc/XrdOucPgrwUtils.hh"
+#include "XrdOuc/XrdOucUtils.hh"
 
 #include <sys/uio.h>
+#include <arpa/inet.h> // for network unmarshaling stuff
 
+#include <array>
 #include <list>
+#include <memory>
+#include <atomic>
 #include <memory>
 
 namespace XrdCl
@@ -46,6 +62,7 @@ namespace XrdCl
   class SIDManager;
   class URL;
   class LocalFileHandler;
+  class Socket;
 
   //----------------------------------------------------------------------------
   // Single entry in the redirect-trace-back
@@ -99,8 +116,7 @@ namespace XrdCl
   //----------------------------------------------------------------------------
   //! Handle/Process/Forward XRootD messages
   //----------------------------------------------------------------------------
-  class XRootDMsgHandler: public IncomingMsgHandler,
-                          public OutgoingMsgHandler
+  class XRootDMsgHandler: public MsgHandler
   {
       friend class HandleRspJob;
 
@@ -115,13 +131,12 @@ namespace XrdCl
       //! @param sidMgr      the sid manager used to allocate SID for the initial
       //!                    message
       //------------------------------------------------------------------------
-      XRootDMsgHandler( Message          *msg,
-                        ResponseHandler  *respHandler,
-                        const URL        *url,
-                        SIDManager       *sidMgr,
-                        LocalFileHandler *lFileHandler):
+      XRootDMsgHandler( Message                     *msg,
+                        ResponseHandler             *respHandler,
+                        const URL                   *url,
+                        std::shared_ptr<SIDManager>  sidMgr,
+                        LocalFileHandler            *lFileHandler):
         pRequest( msg ),
-        pResponse( 0 ),
         pResponseHandler( respHandler ),
         pUrl( *url ),
         pEffectiveDataServerUrl( 0 ),
@@ -130,27 +145,19 @@ namespace XrdCl
         pExpiration( 0 ),
         pRedirectAsAnswer( false ),
         pOksofarAsAnswer( false ),
-        pHosts( 0 ),
         pHasLoadBalancer( false ),
         pHasSessionId( false ),
         pChunkList( 0 ),
+        pKBuff( 0 ),
         pRedirectCounter( 0 ),
         pNotAuthorizedCounter( 0 ),
 
         pAsyncOffset( 0 ),
-        pAsyncReadSize( 0 ),
-        pAsyncReadBuffer( 0 ),
-        pAsyncMsgSize( 0 ),
+        pAsyncChunkIndex( 0 ),
 
-        pReadRawStarted( false ),
-        pReadRawCurrentOffset( 0 ),
-
-        pReadVRawMsgOffset( 0 ),
-        pReadVRawChunkHeaderDone( false ),
-        pReadVRawChunkHeaderStarted( false ),
-        pReadVRawSizeError( false ),
-        pReadVRawChunkIndex( 0 ),
-        pReadVRawMsgDiscard( false ),
+        pPgWrtCksumBuff( 4 ),
+        pPgWrtCurrentPageOffset( 0 ),
+        pPgWrtCurrentPageNb( 0 ),
 
         pOtherRawStarted( false ),
 
@@ -161,22 +168,40 @@ namespace XrdCl
         pAggregatedWaitTime( 0 ),
 
         pMsgInFly( false ),
+        pSendingState( 0 ),
+
+        pTimeoutFence( false ),
 
         pDirListStarted( false ),
         pDirListWithStat( false ),
 
-        pCV( 0 )
+        pCV( 0 ),
 
+        pSslErrCnt( 0 )
       {
         pPostMaster = DefaultEnv::GetPostMaster();
         if( msg->GetSessionId() )
           pHasSessionId = true;
-        memset( &pReadVRawChunkHeader, 0, sizeof( readahead_list ) );
 
         Log *log = DefaultEnv::GetLog();
-        log->Debug( ExDbgMsg, "[%s] MsgHandler created: 0x%x (message: %s ).",
-                    pUrl.GetHostId().c_str(), this,
-                    pRequest->GetDescription().c_str() );
+        log->Debug( ExDbgMsg, "[%s] MsgHandler created: %p (message: %s ).",
+                    pUrl.GetHostId().c_str(), (void*)this,
+                    pRequest->GetObfuscatedDescription().c_str() );
+
+        ClientRequestHdr *hdr = (ClientRequestHdr*)pRequest->GetBuffer();
+        if( ntohs( hdr->requestid ) == kXR_pgread )
+        {
+          ClientPgReadRequest *pgrdreq = (ClientPgReadRequest*)pRequest->GetBuffer();
+          pCrc32cDigests.reserve( XrdOucPgrwUtils::csNum( ntohll( pgrdreq->offset ),
+                                                         ntohl( pgrdreq->rlen ) ) );
+        }
+
+        if( ntohs( hdr->requestid ) == kXR_readv )
+          pBodyReader.reset( new AsyncVectorReader( *url, *pRequest ) );
+        else if( ntohs( hdr->requestid ) == kXR_read )
+          pBodyReader.reset( new AsyncRawReader( *url, *pRequest ) );
+        else
+          pBodyReader.reset( new AsyncDiscardReader( *url, *pRequest ) );
       }
 
       //------------------------------------------------------------------------
@@ -188,26 +213,18 @@ namespace XrdCl
 
         if( !pHasSessionId )
           delete pRequest;
-        delete pResponse;
-        std::vector<Message *>::iterator it;
-        for( it = pPartialResps.begin(); it != pPartialResps.end(); ++it )
-          delete *it;
-
         delete pEffectiveDataServerUrl;
 
         pRequest                = reinterpret_cast<Message*>( 0xDEADBEEF );
-        pResponse               = reinterpret_cast<Message*>( 0xDEADBEEF );
         pResponseHandler        = reinterpret_cast<ResponseHandler*>( 0xDEADBEEF );
         pPostMaster             = reinterpret_cast<PostMaster*>( 0xDEADBEEF );
-        pSidMgr                 = reinterpret_cast<SIDManager*>( 0xDEADBEEF );
         pLFileHandler           = reinterpret_cast<LocalFileHandler*>( 0xDEADBEEF );
-        pHosts                  = reinterpret_cast<HostList*>( 0xDEADBEEF );
         pChunkList              = reinterpret_cast<ChunkList*>( 0xDEADBEEF );
         pEffectiveDataServerUrl = reinterpret_cast<URL*>( 0xDEADBEEF );
 
         Log *log = DefaultEnv::GetLog();
-        log->Debug( ExDbgMsg, "[%s] Destroying MsgHandler: 0x%x.",
-                    pUrl.GetHostId().c_str(), this );
+        log->Debug( ExDbgMsg, "[%s] Destroying MsgHandler: %p.",
+                    pUrl.GetHostId().c_str(), (void*)this );
       }
 
       //------------------------------------------------------------------------
@@ -217,21 +234,33 @@ namespace XrdCl
       //! @return       action type that needs to be take wrt the message and
       //!               the handler
       //------------------------------------------------------------------------
-      virtual uint16_t Examine( Message *msg  );
+      virtual uint16_t Examine( std::shared_ptr<Message> &msg  ) override;
+
+      //------------------------------------------------------------------------
+      //! Reexamine the incoming message, and decide on the action to be taken
+      //!
+      //! In case of kXR_status the message can be only fully examined after
+      //! reading the whole body (without raw data).
+      //!
+      //! @param msg    the message, may be zero if receive failed
+      //! @return       action type that needs to be take wrt the message and
+      //!               the handler
+      //------------------------------------------------------------------------
+      virtual uint16_t InspectStatusRsp() override;
 
       //------------------------------------------------------------------------
       //! Get handler sid
       //!
       //! return sid of the corresponding request, otherwise 0
       //------------------------------------------------------------------------
-      virtual uint16_t GetSid() const;
+      virtual uint16_t GetSid() const override;
 
       //------------------------------------------------------------------------
       //! Process the message if it was "taken" by the examine action
       //!
       //! @param msg the message to be processed
       //------------------------------------------------------------------------
-      virtual void Process( Message *msg );
+      virtual void Process() override;
 
       //------------------------------------------------------------------------
       //! Read message body directly from a socket - called if Examine returns
@@ -244,56 +273,42 @@ namespace XrdCl
       //!                  stOK & suRetry if more data is needed
       //!                  stError on failure
       //------------------------------------------------------------------------
-      virtual Status ReadMessageBody( Message  *msg,
-                                      int       socket,
-                                      uint32_t &bytesRead );
+      virtual XRootDStatus ReadMessageBody( Message  *msg,
+                                            Socket   *socket,
+                                            uint32_t &bytesRead ) override;
 
       //------------------------------------------------------------------------
       //! Handle an event other that a message arrival
       //!
       //! @param event     type of the event
-      //! @param streamNum stream concerned
       //! @param status    status info
       //------------------------------------------------------------------------
-      virtual uint8_t OnStreamEvent( StreamEvent event,
-                                     uint16_t    streamNum,
-                                     Status      status );
+      virtual uint8_t OnStreamEvent( StreamEvent  event,
+                                     XRootDStatus status ) override;
 
       //------------------------------------------------------------------------
       //! The requested action has been performed and the status is available
       //------------------------------------------------------------------------
       virtual void OnStatusReady( const Message *message,
-                                  Status         status );
+                                  XRootDStatus   status ) override;
 
       //------------------------------------------------------------------------
       //! Are we a raw writer or not?
       //------------------------------------------------------------------------
-      virtual bool IsRaw() const;
+      virtual bool IsRaw() const override;
 
       //------------------------------------------------------------------------
       //! Write message body directly to a socket - called if IsRaw returns
       //! true - only socket related errors may be returned here
       //!
       //! @param socket    the socket to read from
-      //! @param bytesRead number of bytes read by the method
+      //! @param bytesWritten number of bytes written by the method
       //! @return          stOK & suDone if the whole body has been processed
       //!                  stOK & suRetry if more data needs to be written
       //!                  stError on failure
       //------------------------------------------------------------------------
-      Status WriteMessageBody( int       socket,
-                               uint32_t &bytesRead );
-
-      //------------------------------------------------------------------------
-      //! Get message body - called if IsRaw returns true
-      //!
-      //! @param asyncOffset  :  the current async offset
-      //! @return             :  the list of chunks
-      //------------------------------------------------------------------------
-      ChunkList* GetMessageBody( uint32_t *&asyncOffset )
-      {
-        asyncOffset = &pAsyncOffset;
-        return pChunkList;
-      }
+      XRootDStatus WriteMessageBody( Socket   *socket,
+                                     uint32_t &bytesWritten ) override;
 
       //------------------------------------------------------------------------
       //! Called after the wait time for kXR_wait has elapsed
@@ -308,6 +323,14 @@ namespace XrdCl
       void SetExpiration( time_t expiration )
       {
         pExpiration = expiration;
+      }
+
+      //------------------------------------------------------------------------
+      //! Get a timestamp after which we give up
+      //------------------------------------------------------------------------
+      time_t GetExpiration() override
+      {
+        return pExpiration;
       }
 
       //------------------------------------------------------------------------
@@ -352,8 +375,7 @@ namespace XrdCl
       //------------------------------------------------------------------------
       void SetHostList( HostList *hostList )
       {
-        delete pHosts;
-        pHosts = hostList;
+        pHosts.reset( hostList );
       }
 
       //------------------------------------------------------------------------
@@ -362,10 +384,25 @@ namespace XrdCl
       void SetChunkList( ChunkList *chunkList )
       {
         pChunkList = chunkList;
+        if( pBodyReader )
+          pBodyReader->SetChunkList( chunkList );
         if( chunkList )
           pChunkStatus.resize( chunkList->size() );
         else
           pChunkStatus.clear();
+      }
+
+      void SetCrc32cDigests( std::vector<uint32_t> && crc32cDigests )
+      {
+        pCrc32cDigests = std::move( crc32cDigests );
+      }
+
+      //------------------------------------------------------------------------
+      //! Set the kernel buffer
+      //------------------------------------------------------------------------
+      void SetKernelBuffer( XrdSys::KernelBuffer *kbuff )
+      {
+        pKBuff = kbuff;
       }
 
       //------------------------------------------------------------------------
@@ -386,38 +423,30 @@ namespace XrdCl
         pStateful = stateful;
       }
 
+      //------------------------------------------------------------------------
+      //! Bookkeeping after partial response has been received:
+      //! - take down the timeout fence after oksofar response has been handled
+      //! - reset status-response-body marshaled flag
+      //------------------------------------------------------------------------
+      void PartialReceived();
+
+      void OnReadyToSend( [[maybe_unused]] Message *msg ) override
+      {
+        pSendingState |= kSawReadySend;
+      }
+
     private:
-      //------------------------------------------------------------------------
-      //! Handle a kXR_read in raw mode
-      //------------------------------------------------------------------------
-      Status ReadRawRead( Message  *msg,
-                          int       socket,
-                          uint32_t &bytesRead );
 
-      //------------------------------------------------------------------------
-      //! Handle a kXR_readv in raw mode
-      //------------------------------------------------------------------------
-      Status ReadRawReadV( Message  *msg,
-                           int       socket,
-                           uint32_t &bytesRead );
-
-      //------------------------------------------------------------------------
-      //! Handle anything other than kXR_read and kXR_readv in raw mode
-      //------------------------------------------------------------------------
-      Status ReadRawOther( Message  *msg,
-                           int       socket,
-                           uint32_t &bytesRead );
-
-      //------------------------------------------------------------------------
-      //! Read a buffer asynchronously - depends on pAsyncBuffer, pAsyncSize
-      //! and pAsyncOffset
-      //------------------------------------------------------------------------
-      Status ReadAsync( int socket, uint32_t &btesRead );
+      // bit flags used with pSendingState
+      static constexpr int kSendDone     = 0x0001;
+      static constexpr int kSawResp      = 0x0002;
+      static constexpr int kFinalResp    = 0x0004;
+      static constexpr int kSawReadySend = 0x0008;
 
       //------------------------------------------------------------------------
       //! Recover error
       //------------------------------------------------------------------------
-      void HandleError( Status status, Message *msg = 0 );
+      void HandleError( XRootDStatus status );
 
       //------------------------------------------------------------------------
       //! Retry the request at another server
@@ -441,6 +470,12 @@ namespace XrdCl
       Status ParseResponse( AnyObject *&response );
 
       //------------------------------------------------------------------------
+      //! Parse the response to kXR_fattr request and put it in an object that
+      //! could be passed to the user
+      //------------------------------------------------------------------------
+      Status ParseXAttrResponse( char *data, size_t len, AnyObject *&response );
+
+      //------------------------------------------------------------------------
       //! Perform the changes to the original request needed by the redirect
       //! procedure - allocate new streamid, append redirection data and such
       //------------------------------------------------------------------------
@@ -450,16 +485,6 @@ namespace XrdCl
       //! Some requests need to be rewritten also after getting kXR_wait - sigh
       //------------------------------------------------------------------------
       Status RewriteRequestWait();
-
-      //------------------------------------------------------------------------
-      //! Post process vector read
-      //------------------------------------------------------------------------
-      Status PostProcessReadV( VectorReadInfo *vReadInfo );
-
-      //------------------------------------------------------------------------
-      //! Unpack a single readv response
-      //------------------------------------------------------------------------
-      Status UnPackReadVResponse( Message *msg );
 
       //------------------------------------------------------------------------
       //! Update the "tried=" part of the CGI of the current message
@@ -488,17 +513,17 @@ namespace XrdCl
       //! @param   reuqest : the request in question
       //! @return          : true if yes, false if no
       //------------------------------------------------------------------------
-      bool IsRetriable( Message *request );
+      bool IsRetriable();
 
       //------------------------------------------------------------------------
       //! Check if for given request and Metalink redirector  it is OK to omit
       //! the kXR_wait and proceed stright to the next entry in the Metalink file
       //!
-      //! @param   reuqest : the request in question
+      //! @param   request : the request in question
       //! @param   url     : metalink URL
       //! @return          : true if yes, false if no
       //------------------------------------------------------------------------
-      bool OmitWait( Message *request, const URL &url );
+      bool OmitWait( Message &request, const URL &url );
 
       //------------------------------------------------------------------------
       //! Checks if the given error returned by server is retriable.
@@ -513,6 +538,38 @@ namespace XrdCl
       //! Dump the redirect-trace-back into the log file
       //------------------------------------------------------------------------
       void DumpRedirectTraceBack();
+      
+      //! Read data from buffer
+      //!
+      //! @param buffer : the buffer with data
+      //! @param buflen : the size of the buffer
+      //! @param result : output parameter (data read)
+      //! @return       : status of the operation
+      //------------------------------------------------------------------------
+      template<typename T>
+      Status ReadFromBuffer( char *&buffer, size_t &buflen, T& result );
+
+      //------------------------------------------------------------------------
+      //! Read a string from buffer
+      //!
+      //! @param buffer : the buffer with data
+      //! @param buflen : the size of the buffer
+      //! @param result : output parameter (data read)
+      //! @return       : status of the operation
+      //------------------------------------------------------------------------
+      Status ReadFromBuffer( char *&buffer, size_t &buflen, std::string &result );
+
+      //------------------------------------------------------------------------
+      //! Read a string from buffer
+      //!
+      //! @param buffer : the buffer with data
+      //! @param buflen : size of the buffer
+      //! @param size   : size of the data to read
+      //! @param result : output parameter (data read)
+      //! @return       : status of the operation
+      //------------------------------------------------------------------------
+      Status ReadFromBuffer( char *&buffer, size_t &buflen, size_t size,
+                             std::string &result );
 
       //------------------------------------------------------------------------
       // Helper struct for async reading of chunks
@@ -526,71 +583,104 @@ namespace XrdCl
 
       typedef std::list<std::unique_ptr<RedirectEntry>> RedirectTraceBack;
 
-      Message                        *pRequest;
-      Message                        *pResponse;
-      std::vector<Message *>          pPartialResps;
-      ResponseHandler                *pResponseHandler;
-      URL                             pUrl;
-      URL                            *pEffectiveDataServerUrl;
-      PostMaster                     *pPostMaster;
-      SIDManager                     *pSidMgr;
-      LocalFileHandler               *pLFileHandler;
-      Status                          pStatus;
-      Status                          pLastError;
-      time_t                          pExpiration;
-      bool                            pRedirectAsAnswer;
-      bool                            pOksofarAsAnswer;
-      HostList                       *pHosts;
-      bool                            pHasLoadBalancer;
-      HostInfo                        pLoadBalancer;
-      bool                            pHasSessionId;
-      std::string                     pRedirectUrl;
-      ChunkList                      *pChunkList;
-      std::vector<ChunkStatus>        pChunkStatus;
-      uint16_t                        pRedirectCounter;
-      uint16_t                        pNotAuthorizedCounter;
+      static const size_t             CksumSize      = sizeof( uint32_t );
+      static const size_t             PageWithCksum  = XrdSys::PageSize + CksumSize;
+      static const size_t             MaxSslErrRetry = 3;
 
-      uint32_t                        pAsyncOffset;
-      uint32_t                        pAsyncReadSize;
-      char*                           pAsyncReadBuffer;
-      uint32_t                        pAsyncMsgSize;
+      inline static size_t NbPgPerRsp( uint64_t offset, uint32_t dlen )
+      {
+        uint32_t pgcnt = 0;
+        uint32_t remainder = offset % XrdSys::PageSize;
+        if( remainder > 0 )
+        {
+          // account for the first unaligned page
+          ++pgcnt;
+          // the size of the 1st unaligned page
+          uint32_t _1stpg = XrdSys::PageSize - remainder;
+          if( _1stpg + CksumSize > dlen )
+            _1stpg = dlen - CksumSize;
+          dlen -= _1stpg + CksumSize;
+        }
+        pgcnt += dlen / PageWithCksum;
+        if( dlen % PageWithCksum )
+          ++ pgcnt;
+        return pgcnt;
+      }
 
-      bool                            pReadRawStarted;
-      uint32_t                        pReadRawCurrentOffset;
+      Message                               *pRequest;
+      std::shared_ptr<Message>               pResponse; //< the ownership is shared with MsgReader
+      std::vector<std::shared_ptr<Message>>  pPartialResps; //< the ownership is shared with MsgReader
+      ResponseHandler                       *pResponseHandler;
+      URL                                    pUrl;
+      URL                                   *pEffectiveDataServerUrl;
+      PostMaster                            *pPostMaster;
+      std::shared_ptr<SIDManager>            pSidMgr;
+      LocalFileHandler                      *pLFileHandler;
+      XRootDStatus                           pStatus;
+      Status                                 pLastError;
+      time_t                                 pExpiration;
+      bool                                   pRedirectAsAnswer;
+      bool                                   pOksofarAsAnswer;
+      std::unique_ptr<HostList>              pHosts;
+      bool                                   pHasLoadBalancer;
+      HostInfo                               pLoadBalancer;
+      bool                                   pHasSessionId;
+      std::string                            pRedirectUrl;
+      ChunkList                             *pChunkList;
+      std::vector<uint32_t>                  pCrc32cDigests;
+      XrdSys::KernelBuffer                  *pKBuff;
+      std::vector<ChunkStatus>               pChunkStatus;
+      uint16_t                               pRedirectCounter;
+      uint16_t                               pNotAuthorizedCounter;
 
-      uint32_t                        pReadVRawMsgOffset;
-      bool                            pReadVRawChunkHeaderDone;
-      bool                            pReadVRawChunkHeaderStarted;
-      bool                            pReadVRawSizeError;
-      int32_t                         pReadVRawChunkIndex;
-      readahead_list                  pReadVRawChunkHeader;
-      bool                            pReadVRawMsgDiscard;
+      uint32_t                               pAsyncOffset;
+      uint32_t                               pAsyncChunkIndex;
 
-      bool                            pOtherRawStarted;
+      std::unique_ptr<AsyncPageReader>       pPageReader;
+      std::unique_ptr<AsyncRawReaderIntfc>   pBodyReader;
 
-      bool                            pFollowMetalink;
+      Buffer                                 pPgWrtCksumBuff;
+      uint32_t                               pPgWrtCurrentPageOffset;
+      uint32_t                               pPgWrtCurrentPageNb;
 
-      bool                            pStateful;
-      int                             pAggregatedWaitTime;
+      bool                                   pOtherRawStarted;
 
-      std::unique_ptr<RedirectEntry>  pRdirEntry;
-      RedirectTraceBack               pRedirectTraceBack;
+      bool                                   pFollowMetalink;
 
-      bool                            pMsgInFly;
+      bool                                   pStateful;
+      int                                    pAggregatedWaitTime;
+
+      std::unique_ptr<RedirectEntry>         pRdirEntry;
+      RedirectTraceBack                      pRedirectTraceBack;
+
+      bool                                   pMsgInFly;
+      std::atomic<int>                       pSendingState;
+
+      //------------------------------------------------------------------------
+      // true if MsgHandler is both in inQueue and installed in respective
+      // Stream (this could happen if server gave oksofar response), otherwise
+      // false
+      //------------------------------------------------------------------------
+      std::atomic<bool>                      pTimeoutFence;
 
       //------------------------------------------------------------------------
       // if we are serving chunked data to the user's handler in case of
       // kXR_dirlist we need to memorize if the response contains stat info or
       // not (the information is only encoded in the first chunk)
       //------------------------------------------------------------------------
-      bool                            pDirListStarted;
-      bool                            pDirListWithStat;
+      bool                                   pDirListStarted;
+      bool                                   pDirListWithStat;
 
       //------------------------------------------------------------------------
       // synchronization is needed in case the MsgHandler has been configured
       // to serve kXR_oksofar as a response to the user's handler
       //------------------------------------------------------------------------
-      XrdSysCondVar                   pCV;
+      XrdSysCondVar                          pCV;
+
+      //------------------------------------------------------------------------
+      // Count of consecutive `errTlsSslError` errors
+      //------------------------------------------------------------------------
+      size_t                                 pSslErrCnt;
   };
 }
 

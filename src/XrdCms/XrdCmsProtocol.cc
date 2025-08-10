@@ -29,13 +29,13 @@
 /******************************************************************************/
   
 #include <unistd.h>
-#include <ctype.h>
-#include <errno.h>
+#include <cctype>
+#include <cerrno>
 #include <signal.h>
-#include <stdlib.h>
-#include <string.h>
+#include <cstdlib>
+#include <cstring>
 #include <strings.h>
-#include <stdio.h>
+#include <cstdio>
 #include <netinet/in.h>
 #include <sys/param.h>
 
@@ -98,7 +98,7 @@ extern XrdOucEnv        theEnv;
 // to provide a default protocol (which, for cms protocol we do). The interface
 // below is used by Xrd to obtain a copy of the protocol object that can be
 // used to decide whether or not a link is talking our particular protocol.
-// Phase 1 initialization occured on the call to XrdgetProtocolPort(). At this
+// Phase 1 initialization occurred on the call to XrdgetProtocolPort(). At this
 // point a network interface is defined and we can complete initialization.
 //
 XrdVERSIONINFO(XrdgetProtocol,cmsd);
@@ -162,20 +162,10 @@ int XrdgetProtocolPort(const char *pname, char *parms,
        return thePort;
       }
 
-// Initialize the error message handler and some default values
+// Call the level 0 configurator
 //
-   Say.logger(pi->eDest->logger(0));
-   Config.myName    = strdup(pi->myName);
-   Config.PortTCP   = (pi->Port < 0 ? 0 : pi->Port);
-   Config.myInsName = strdup(pi->myInst);
-   Config.myProg    = strdup(pi->myProg);
-   Sched            = pi->Sched;
-   if (pi->DebugON) Trace.What = TRACE_ALL;
-
-// Create an xrootd compatabile environment
-//
-   XrdCms::theEnv.PutPtr("XrdScheduler*", Sched);
-   if (pi->theEnv) XrdCms::theEnv.PutPtr("xrdEnv*", pi->theEnv);
+   if (Config.Configure0(pi))
+      {Config.doWait = -1; return 0;}
 
 // The only parameter we accept is the name of an alternate config file
 //
@@ -190,7 +180,7 @@ int XrdgetProtocolPort(const char *pname, char *parms,
 
 // Put up the banner
 //
-   Say.Say("Copr.  2007 Stanford University/SLAC cmsd.");
+   Say.Say("Copr.  2003-2020 Stanford University/SLAC cmsd.");
 
 // Indicate failure if static init fails
 //
@@ -277,6 +267,7 @@ void XrdCmsProtocol::Pander(const char *manager, int mport)
    EPNAME("Pander");
 
    CmsLoginData Data, loginData;
+   time_t ddmsg = time(0);
    unsigned int Mode, Role = 0;
    int myShare = Config.P_gshr << CmsLoginData::kYR_shift;
    int myTimeZ = Config.TimeZone<< CmsLoginData::kYR_shifttz;
@@ -348,7 +339,12 @@ void XrdCmsProtocol::Pander(const char *manager, int mport)
        DEBUG("trying to connect to lvl " <<Lvl <<' ' <<manp <<':' <<xport);
 
        if (!(Link = Config.NetTCP->Connect(manp, xport, Netopts)))
-          {if (tries--) Netopts = XRDNET_NOEMSG;
+          {if (!Netopts && XrdNetAddr::DynDNS() && (time(0) - ddmsg) >= 90)
+              {Say.Emsg("Pander", "Is hostname", manp, "spelled correctly "
+                                  "or just not running?");
+               ddmsg = time(0);
+              }
+           if (tries--) Netopts = XRDNET_NOEMSG;
               else {tries = 6; Netopts = 0;}
            if ((Lvl = Manager->myMans->Next(xport,manbuff,manblen)))
                    {XrdSysTimer::Snooze(3); manp = manbuff;}
@@ -358,6 +354,23 @@ void XrdCmsProtocol::Pander(const char *manager, int mport)
            continue;
           }
        Netopts = 0; tries = waits = 6;
+
+       // Verify that this node has the real DNS name if it's IPv6
+       //
+       if (!(Link->AddrInfo()->isRegistered())
+       &&    Link->AddrInfo()->isIPType(XrdNetAddrInfo::IPv6))
+          {char *oldName = strdup(Link->Host());
+           Say.Emsg("Protocol", oldName, "is missing an IPv6 ptr record; "
+                               "attempting local registration as", manp);
+           if (!(Link->Register(manp)))
+              {Say.Emsg("Protocol", oldName,
+                        "registration failed; address mismatch.");
+              } else {
+               Say.Emsg("Protocol", oldName,
+                        "is now locally registered as", manp);
+              }
+           free(oldName);
+          }
 
        // Obtain a new node object for this connection
        //
@@ -479,7 +492,7 @@ int XrdCmsProtocol::Process(XrdLink *lp)
    lp->Serialize();
    if (!myNode) return -1;
    Sync();
-   myNode->Lock(false);
+   myNode->Lock();
 
 // Immediately terminate redirectors (they have an Rslot). The redirector node
 // can be directly deleted as all references were serialized through the
@@ -551,7 +564,30 @@ int XrdCmsProtocol::Stats(char *buff, int blen, int do_sync)
 /******************************************************************************/
 /*                                 A d m i t                                  */
 /******************************************************************************/
-  
+
+namespace
+{
+char *getAltName(char *sid, char *buff, int blen)
+{
+   char *atsign, *spacec, *retval = 0;
+   int  n;
+   if (sid)
+   if ((atsign = index(sid, '@')))
+      {atsign++;
+       if ((spacec = index(atsign, ' ')))
+          {*spacec = 0;
+           n = strlen(atsign);
+           if (n > 3 && n < blen)
+              {strcpy(buff, atsign);
+               retval = buff;
+              }
+           *spacec = ' ';
+          }
+      }
+   return retval;
+}
+}
+
 XrdCmsRouting *XrdCmsProtocol::Admit()
 {
    EPNAME("Admit");
@@ -584,6 +620,41 @@ XrdCmsRouting *XrdCmsProtocol::Admit()
 //
    if (!Source.Admit(Link, Data, Config.mySID, envP)) return 0;
 
+// Construct environment for incoming node
+//
+   XrdOucEnv cgiEnv((const char *)Data.envCGI);
+
+// We have this problem hat many times the IPv6 address is missing the ptr
+// record in DNS. If this node is IPv6 unregistered and the incoming node
+// supplied it's host name then we can attempt to register it locally.
+//
+   if (!(Link->AddrInfo()->isRegistered())
+   &&    Link->AddrInfo()->isIPType(XrdNetAddrInfo::IPv6))
+      {const char *altName = cgiEnv.Get("myHN");
+       const char *altType = "stated mapping";
+       char hBF[256], *oldName = strdup(Link->Host());
+       if (!altName) {altName = getAltName((char *)Data.SID, hBF, sizeof(hBF));
+                      altType = "inferred mapping";
+                     }
+       Say.Emsg("Protocol", "DNS lookup for", oldName, "failed; "
+                            "IPv6 ptr record missing!");
+       if (!altName)
+          {Say.Emsg("Protocol", oldName, "did not supply a fallback "
+                                         "mapping; using IPv6 address.");
+          } else {
+           char buff[512];
+           snprintf(buff, sizeof(buff), "%s -> %s", oldName, altName);
+           Say.Emsg("Protocol", "Attempting to use", altType, buff);
+           if (!(Link->Register(altName)))
+              {Say.Emsg("Protocol", buff, altType,"failed; address mismatch.");
+              } else {
+               Say.Emsg("Protocol", oldName,
+                        "is now locally registered as", altName);
+              }
+          }
+       free(oldName);
+      }
+
 // Handle Redirectors here (minimal stuff to do)
 //
    if (Data.Mode & CmsLoginData::kYR_director) 
@@ -602,7 +673,7 @@ XrdCmsRouting *XrdCmsProtocol::Admit()
    isServ = Data.Mode & CmsLoginData::kYR_server;
    isSubm = Data.Mode & CmsLoginData::kYR_subman;
 
-// Determine the role of this incomming login.
+// Determine the role of this incoming login.
 //
         if (isMan)
            {Status = (isServ ? CMS_isSuper|CMS_isMan : CMS_isMan);
@@ -630,7 +701,7 @@ XrdCmsRouting *XrdCmsProtocol::Admit()
    myRole = XrdCmsRole::Name(roleID);
    Link->setID(myRole, Data.HoldTime);
 
-// Make sure that our role is compatible with the incomming role
+// Make sure that our role is compatible with the incoming role
 //
    Reason = 0;
         if (Config.asProxy()) {if (!isProxy || isPeer)
@@ -730,7 +801,6 @@ XrdCmsRouting *XrdCmsProtocol::Admit()
 
 // Document the login
 //
-   XrdOucEnv cgiEnv((const char *)Data.envCGI);
    const char *sname = cgiEnv.Get("site");
    const char *lfmt  = (myNode->isMan > 1 ? "Standby%s%s" : "Primary%s%s");
    snprintf(envBuff,sizeof(envBuff),lfmt,(sname ? " ":""),(sname ? sname : ""));
@@ -763,12 +833,12 @@ XrdCmsRouting *XrdCmsProtocol::Admit_Redirector(int wasSuspended)
 // Director logins have no additional parameters. We return with the node object
 // locked to be consistent with the way server/suprvisors nodes are returned.
 //
-   myNode = new XrdCmsNode(Link); myNode->Lock(false);
+   myNode = new XrdCmsNode(Link); myNode->Lock();
    if (!(RSlot = RTable.Add(myNode)))
-      {myNode->UnLock();
+      {Say.Emsg("Protocol",myNode->Ident,"login failed; too many redirectors.");
+       myNode->UnLock();
        delete myNode;
        myNode = 0;
-       Say.Emsg("Protocol",myNode->Ident,"login failed; too many redirectors.");
        return 0;
       } else myNode->setSlot(RSlot);
 
@@ -797,7 +867,8 @@ SMask_t XrdCmsProtocol::AddPath(XrdCmsNode *nP,
 // Process: addpath {r | w | rw}[s] path
 //
    while(*pType)
-        {     if ('r' == *pType) pinfo.rovec =               nP->Mask();
+        {     if ('r' == *pType || (Config.forceRO && 'w' == *pType))
+                                 pinfo.rovec =               nP->Mask();
          else if ('w' == *pType) pinfo.rovec = pinfo.rwvec = nP->Mask();
          else if ('s' == *pType) pinfo.rovec = pinfo.ssvec = nP->Mask();
          else return 0;

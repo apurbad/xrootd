@@ -28,14 +28,15 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <ctype.h>
-#include <stdio.h>
+#include <cctype>
+#include <cstdio>
 #include <unistd.h>
 
 #include "XrdCms/XrdCmsUtils.hh"
 #include "XrdNet/XrdNetAddr.hh"
 #include "XrdNet/XrdNetUtils.hh"
 #include "XrdOuc/XrdOuca2x.hh"
+#include "XrdOuc/XrdOucPinLoader.hh"
 #include "XrdOuc/XrdOucStream.hh"
 #include "XrdOuc/XrdOucTList.hh"
 #include "XrdSys/XrdSysError.hh"
@@ -101,6 +102,21 @@ void XrdCmsUtils::Display(XrdSysError *eDest, const char *hSpec,
 }
 
 /******************************************************************************/
+/*                           l o a d P e r f M o n                            */
+/******************************************************************************/
+
+XrdCmsPerfMon *XrdCmsUtils::loadPerfMon(XrdSysError    *eDest,
+                                        const char     *libPath,
+                                        XrdVersionInfo &urVer)
+{
+   XrdOucPinLoader perfLib(eDest, &urVer, "cms.perf", libPath);
+
+   XrdCmsPerfMon **perfMon = (XrdCmsPerfMon**)perfLib.Resolve("XrdCmsPerfMonitor");
+
+   return (perfMon ? *perfMon : 0);
+}
+  
+/******************************************************************************/
 /*                              P a r s e M a n                               */
 /******************************************************************************/
   
@@ -111,7 +127,7 @@ bool XrdCmsUtils::ParseMan(XrdSysError *eDest, XrdOucTList **oldMans,
    XrdOucTList *newMans, *newP, *oldP, *appList = (oldMans ? *oldMans : 0);
    XrdOucTList *sP = siteList;
    const char *eText;
-   char *plus, *atsn;
+   char *plus, *atsn, *iName = 0;
    int nPort, maxIP = 1, snum = 0;
    bool isBad;
 
@@ -135,10 +151,26 @@ bool XrdCmsUtils::ParseMan(XrdSysError *eDest, XrdOucTList **oldMans,
                }
       }
 
+// Handle scope qualification next
+//
+   if ((iName = index(hPort, '%')))
+      {if (*(iName+1) == '\0')
+          {eDest->Emsg("Config", "instance name missing for", hSpec); return 0;}
+       *iName++ = 0;
+       const char *xName = getenv("XRDNAME");
+       if (!xName || strcmp(xName, iName)) sPort = 0;
+      }
+
 // Check if this is a multi request
 //
    if (!(plus = index(hSpec, '+')) || *(plus+1) != 0) plus = 0;
-      else {*plus = 0; maxIP = 8;}
+      else {*plus = 0; maxIP = 8;
+            if (XrdNetAddr::DynDNS())
+               {eDest->Emsg("Config", "Hostname globbing is not supported "
+                                      "via dynamic DNS!");
+                return false;
+               }
+           }
 
 // Check if the port was specified
 //
@@ -152,13 +184,22 @@ bool XrdCmsUtils::ParseMan(XrdSysError *eDest, XrdOucTList **oldMans,
           }
       }
 
-// Obtain the list
+// Obtain the list. We can't fully resolve this now if we are using a dynamic
+// DNS so that part will have to wait.
 //
-   if (!(newMans = XrdNetUtils::Hosts(hSpec, nPort, maxIP, sPort, &eText)))
-      {char buff[1024];
-       snprintf(buff, sizeof(buff), "; %s", eText);
-       eDest->Emsg("Config", "Unable to add host", hSpec, buff);
-       return false;
+   if (XrdNetAddr::DynDNS())
+      {if (sPort)
+          {XrdNetAddr myAddr(0), urAddr;
+           if (!urAddr.Set(hSpec, 0) && myAddr.Same(&urAddr)) *sPort = nPort;
+          }
+       newMans = new XrdOucTList(hSpec, nPort);
+      } else {
+       if (!(newMans = XrdNetUtils::Hosts(hSpec, nPort, maxIP, sPort, &eText)))
+          {char buff[1024];
+           snprintf(buff,sizeof(buff),"'%s'; %c%s",hSpec,tolower(*eText),eText+1);
+           eDest->Emsg("Config", "Unable to add host", buff);
+           return false;
+          }
       }
 
 // If there is no pointer to a list, then the caller merely wanted sPort
@@ -182,15 +223,15 @@ bool XrdCmsUtils::ParseMan(XrdSysError *eDest, XrdOucTList **oldMans,
                   }
                oldP = oldP->next;
               }
-         if (!plus || strcmp(hSpec, newP->text)) isBad = false;
-            else {eDest->Say("Config warning: "
-                             "Cyclic DNS registration for ",newP->text,"\n"
-                             "Config warning: This cluster will exhibit "
-                             "undefined behaviour!!!");
-             isBad = true;
-            }
-         if (!oldP) 
-            {appList = SInsert(appList, newP);
+         if (!oldP)
+            {if (!plus || strcmp(hSpec, newP->text)) isBad = false;
+                else {eDest->Say("Config warning: "
+                                 "Cyclic DNS registration for ",newP->text,"\n"
+                                 "Config warning: This cluster will exhibit "
+                                 "undefined behaviour!!!");
+                      isBad = true;
+                     }
+             appList = SInsert(appList, newP);
              if (plus && !hush) Display(eDest, hSpec, newP->text, isBad);
             }
         }

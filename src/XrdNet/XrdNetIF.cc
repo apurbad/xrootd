@@ -28,10 +28,9 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <ctype.h>
-#include <errno.h>
+#include <cctype>
 #include <netdb.h>
-#include <stdio.h>
+#include <cstdio>
 #include <sys/types.h>
 
 #ifdef HAVE_GETIFADDRS
@@ -41,12 +40,13 @@
 
 #include "XrdNet/XrdNetAddr.hh"
 #include "XrdNet/XrdNetIF.hh"
+#include "XrdNet/XrdNetIdentity.hh"
 #include "XrdNet/XrdNetUtils.hh"
 #include "XrdOuc/XrdOucTList.hh"
+#include "XrdSys/XrdSysE2T.hh"
 #include "XrdSys/XrdSysError.hh"
 
 #include <iostream>
-using namespace std;
   
 /******************************************************************************/
 /*                         L o c a l   S t a t i c s                          */
@@ -107,9 +107,9 @@ const char *sName[hasNum] = {"pub4 ",  "prv4 ",   "pub6 ",  "prv6"};
 
 XrdSysError      *XrdNetIF::eDest     = 0;
 
-char             *XrdNetIF::myDomain  = XrdNetIF::SetDomain();
+const char       *XrdNetIF::myDomain  = XrdNetIF::GetDomain();
 
-char             *XrdNetIF::ifCfg[2]  = {0,0};
+char             *XrdNetIF::ifCfg[2]  = {0,0}; // public, private
 
 const char       *XrdNetIF::ifTName[ifMax] = {"public IPv4",   // 01
                                               "private IPv4",  // 02
@@ -266,7 +266,7 @@ bool XrdNetIF::GenAddrs(ifAddrs &ifTab, const char *hName, bool wantV6)
 
 #define RLOSLOT(xdst) xdst = (ifData *)(ifBuff+((char *)xdst-buff))
 
-bool XrdNetIF::GenIF(XrdNetAddrInfo **src, int srcnum)
+bool XrdNetIF::GenIF(XrdNetAddrInfo **src, int srcnum, const char *xName)
 {
    ifAddrs ifTab;
    const char *hName;
@@ -323,7 +323,9 @@ for (i = 0; i < srcnum; i++)
    if (!rPIPA && isPrivate)
       {ADDSLOT(ifName[ifT], ifTab.hAddr, ifTab.hALen);
       } else {
-       if ((hName = src[i]->Name()) && src[i]->isRegistered())
+       hName = src[i]->Name();
+       if (!hName || !(src[i]->isRegistered())) hName = xName;
+       if (hName)
           {ADDSLOT(ifName[ifT], hName, strlen(hName));
            ifxDNS[ifT] = true;
           } else  ifName[ifT]  = ifDest[ifT];
@@ -406,7 +408,7 @@ int XrdNetIF::GetDest(char *dest, int dlen, ifType ifT, bool prefn)
 /*                                 G e t I F                                  */
 /******************************************************************************/
 
-#define prtaddr(x) cerr <<"Addr!!! " << *x <<endl;
+#define prtaddr(x) std::cerr <<"Addr!!! " << *x <<std::endl;
 
 int XrdNetIF::GetIF(XrdOucTList **ifList, const char **eText)
 {
@@ -426,9 +428,10 @@ int XrdNetIF::GetIF(XrdOucTList **ifList, const char **eText)
    struct ifaddrs *ifBase, *ifP;
    XrdOucTList    *tLP, *tList = 0, *tLast = 0;
    int             n = 0;
+   bool            anyIF = (ifCfg[0] == 0 && ifCfg[1] == 0);
 
    if (getifaddrs(&ifBase) < 0)
-      {if (eText) *eText = strerror(errno);
+      {if (eText) *eText = XrdSysE2T(errno);
        if (ifList) *ifList = 0;
        if (eDest) eDest->Emsg("GetIF", errno, "get interface addresses.");
        return 0;
@@ -440,7 +443,7 @@ int XrdNetIF::GetIF(XrdOucTList **ifList, const char **eText)
    ifP = ifBase;
    while(ifP)
         {if ((ifP->ifa_addr != 0)
-         &&  (!ifList || IsOkName(ifP->ifa_name, ifIdx))
+         &&  (!ifList || anyIF || IsOkName(ifP->ifa_name, ifIdx))
          &&  (ifP->ifa_flags & (IFF_UP))
          &&  (ifP->ifa_flags & (IFF_RUNNING))
          && !(ifP->ifa_flags & (IFF_LOOPBACK))
@@ -457,7 +460,7 @@ int XrdNetIF::GetIF(XrdOucTList **ifList, const char **eText)
                 {netAddr.Set(ifP->ifa_addr);
                  if ((iLen = netAddr.Format(ipBuff, sizeof(ipBuff),
                              XrdNetAddrInfo::fmtAddr,XrdNetAddrInfo::noPort)))
-                    {sval[2] = ifIdx;
+                    {sval[2] = (anyIF ? 3 : ifIdx);
                      sval[1] = (netAddr.isPrivate() ? 1 : 0);
                      sval[0] = iLen;
                      haveIF |= (sval[1] ? prvIF[ifT] : pubIF[ifT]);
@@ -517,9 +520,10 @@ int XrdNetIF::GetIF(XrdOucTList **ifList, const char **eText)
 int XrdNetIF::GetIF(char *buff, int blen, const char **eText, bool show)
 {
    XrdOucTList *ifP, *ifN;
+   const char *ifName[3] = {ifCfg[0], ifCfg[1], "anon"};
    char *bP = buff;
    int n, bLeft = blen-8;
-   bool ifOK[2] = {false, false};
+   bool ifOK[3] = {false, false, false};
 
 #ifndef HAVE_GETIFADDRS
 // Display warning on how we are getting the interface addresses
@@ -542,7 +546,7 @@ int XrdNetIF::GetIF(char *buff, int blen, const char **eText, bool show)
              ifOK[ifP->sval[2]] = true;
              if (show && eDest)
                 {const char *kind = (ifP->sval[1] ? " private" : " public ");
-                 eDest->Say("Config ", ifCfg[ifP->sval[2]], kind,
+                 eDest->Say("Config ", ifName[ifP->sval[2]], kind,
                                     " network interface: ", ifP->text);
                 }
              ifN = ifP->next; delete ifP;
@@ -580,6 +584,19 @@ int XrdNetIF::GetIF(char *&ifline, const char **eText, bool show)
       eDest->Say("Config ", "No usable interfaces; using DNS registered "
                             "address as the interface.");
    return n;
+}
+
+/******************************************************************************/
+/* Private:                    G e t D o m a i n                              */
+/******************************************************************************/
+  
+const char *XrdNetIF::GetDomain()
+{
+   const char *dnP = XrdNetIdentity::Domain();
+
+// Get our fully resilved name (this doesn't always work)
+//
+   return (dnP ? dnP+1 : 0);
 }
 
 /******************************************************************************/
@@ -665,30 +682,11 @@ void XrdNetIF::Routing(XrdNetIF::netType nettype)
 }
 
 /******************************************************************************/
-/* Private:                    S e t D o m a i n                              */
-/******************************************************************************/
-  
-char *XrdNetIF::SetDomain()
-{
-   XrdNetAddr myAddr((int)0);
-   const char *hnP;
-
-// Get our fully resilved name (this doesn't always work)
-//
-   if (!(hnP = myAddr.Name()) || !(hnP = index(hnP,'.')) || !(*(hnP+1)))
-      return 0;
-
-// Return the components after the first as the domain name
-//
-   return strdup(hnP+1);
-}
-
-/******************************************************************************/
 /*                                 S e t I F                                  */
 /******************************************************************************/
   
 bool XrdNetIF::SetIF(XrdNetAddrInfo *src, const char *ifList, int port,
-                     netType nettype)
+                     netType nettype, const char *xName)
 {
    XrdNetAddrInfo *netIF[4] = {0,0,0,0}; //pub 0:v4, prv 1:v4 pub 2:v6 prv 3:v6
    XrdNetAddr      netAdr[4];
@@ -710,13 +708,14 @@ bool XrdNetIF::SetIF(XrdNetAddrInfo *src, const char *ifList, int port,
       {XrdNetAddrInfo *ifVec[8];
        XrdNetAddr *iP;
        const char *hName = src->Name();
+       if (!(src->isRegistered()) && xName) hName = xName;
        ifCnt = 0;
        if (!hName
        ||  XrdNetUtils::GetAddrs(hName,&iP,ifCnt,XrdNetUtils::allIPv64,ifPort)
        || !ifCnt) return SetIF64(GenIF(&src, 1));
        if (ifCnt > 8) ifCnt = 8;
        for (i = 0; i < ifCnt; i++) ifVec[i] = &iP[i];
-       bool aOK = GenIF(ifVec, ifCnt);
+       bool aOK = GenIF(ifVec, ifCnt, hName);
        delete [] iP;
        return SetIF64(aOK);
       }
@@ -730,7 +729,6 @@ bool XrdNetIF::SetIF(XrdNetAddrInfo *src, const char *ifList, int port,
 
 // Process the iflist (up to four interfaces)
 //
-   if (ifList && *ifList)
    do {while (*ifBeg && *ifBeg == ' ') ifBeg++;
        if ( !(*ifBeg)) break;
        if (!(ifEnd = index(ifBeg, ' '))) {ifAdr = ifBeg; ifBeg = "";}

@@ -26,20 +26,20 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <stdio.h>
-#include <string.h>
+#include <cstdio>
+#include <cstring>
 #include <unistd.h>
-#include <stdlib.h>
+#include <cstdlib>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
-#include <errno.h>
-#include <time.h>
+#include <ctime>
 
 #include "XrdSut/XrdSutAux.hh"
 #include "XrdSut/XrdSutPFEntry.hh"
 #include "XrdSut/XrdSutPFile.hh"
 #include "XrdSut/XrdSutTrace.hh"
+#include "XrdSys/XrdSysE2T.hh"
 
 //_________________________________________________________________
 XrdSutPFEntInd::XrdSutPFEntInd(const char *n, kXR_int32 no,
@@ -1520,7 +1520,8 @@ kXR_int32 XrdSutPFile::ReadInd(kXR_int32 ofs, XrdSutPFEntInd &ind)
       ind.name = 0;
    }
    if (lnam) {
-      ind.name = new char[lnam+1];
+      if (lnam > 0)
+         ind.name = new char[lnam+1];
       if (ind.name) {
          if ((nr = read(fFd,ind.name,lnam)) != lnam)
             return Err(kPFErrRead,"ReadInd",(const char *)&fFd);
@@ -1961,7 +1962,7 @@ kXR_int32 XrdSutPFile::UpdateHashTable(bool force)
 {
    // Update hash table reflecting the index of the file
    // If force is .true. the table is recreated even if no recent 
-   // change in the index has occured.
+   // change in the index has occurred.
    // Returns the number of entries in the table.
 
    // The file must be open
@@ -2213,7 +2214,7 @@ kXR_int32 XrdSutPFile::Err(kXR_int32 code, const char *loc,
    fError = code;
 
    // Build string following the error code
-   char *errbuf = strerror(errno);
+   const char *errbuf = XrdSysE2T(errno);
    switch (code) {
       case kPFErrBadInputs:
          snprintf(buf,XrdSutMAXBUF,

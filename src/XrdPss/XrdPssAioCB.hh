@@ -30,6 +30,9 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
+#include <cstdint>
+#include <vector>
+
 #include "XrdPosix/XrdPosixCallBack.hh"
 #include "XrdSys/XrdSysPthread.hh"
 
@@ -39,13 +42,15 @@ class XrdPssAioCB : public XrdPosixCallBackIO
 {
 public:
 
-static XrdPssAioCB  *Alloc(XrdSfsAio *aiop, bool isWr);
+static XrdPssAioCB  *Alloc(XrdSfsAio *aiop, bool isWr, bool pgrw=false);
 
 virtual void         Complete(ssize_t Result);
 
         void         Recycle();
 
 static  void         SetMax(int mval) {maxFree = mval;}
+
+std::vector<uint32_t> csVec;
 
 private:
              XrdPssAioCB() : theAIOP(0), isWrite(false) {}
@@ -60,5 +65,6 @@ union  {XrdSfsAio   *theAIOP;
         XrdPssAioCB *next;
        };
 bool                 isWrite;
+bool                 isPGrw;
 };
 #endif

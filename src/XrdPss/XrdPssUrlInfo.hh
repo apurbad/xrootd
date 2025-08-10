@@ -30,7 +30,7 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <stdio.h>
+#include <cstdio>
 
 class XrdOucEnv;
 
@@ -38,11 +38,7 @@ class XrdPssUrlInfo
 {
 public:
 
-      bool  addCGI(char *buff, int blen)
-                  {if ((CgiSsz + CgiUsz) >= blen) return false;
-                   int n = snprintf(buff, blen, "?%s%s", CgiUsr, CgiSfx);
-                   return n < blen;
-                  }
+      bool  addCGI(const char *prot, char *buff, int blen);
 
       bool  Extend(const char *cgi, int cgiln);
 
@@ -58,24 +54,20 @@ const char *getID() {return theID;}
                   snprintf(theID, sizeof(theID), "p%d@", idVal.sidS);
                  }
 
+static void setMapID(bool onoff) {MapID = onoff;}
+
 const char *thePath() {return Path;}
 
 const char *Tident() {return tident;}
 
       XrdPssUrlInfo(XrdOucEnv *envP, const char *path, const char *xtra="",
-                    bool addusrcgi=true, bool addident=true)
-               : tident("unk.0:0@host"), Path(path), CgiUsr(""), CgiUsz(0),
-                 CgiSsz(0), sidP(0) {Setup(envP, xtra, addusrcgi, addident);}
-
-      XrdPssUrlInfo(const char *tid, const char *path, const char *xtra="",
-                    bool addusrcgi=true, bool addident=true)
-               : tident(tid), Path(path), CgiUsr(""), CgiUsz(0),
-                 CgiSsz(0), sidP(0) {Setup(0,    xtra, addusrcgi, addident);}
+                    bool addusrcgi=true, bool addident=true);
 
      ~XrdPssUrlInfo() {if (*theID == 'p' && sidP) sidP->Release(&idVal);}
 
 private:
-void  Setup(XrdOucEnv *envP, const char *xtra, bool addusrcgi, bool addident);
+
+static bool       MapID;
 
 const char       *tident;
 const char       *Path;
@@ -83,7 +75,10 @@ const char       *CgiUsr;
       int         CgiUsz;
       int         CgiSsz;
       XrdOucSid  *sidP;
-      char        theID[14];
+unsigned
+      int         entityID;
+      bool        eIDvalid;
+      char        theID[13];
 XrdOucSid::theSid idVal;
       char        CgiSfx[512];
 };

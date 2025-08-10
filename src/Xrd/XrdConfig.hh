@@ -29,21 +29,20 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include "Xrd/XrdBuffer.hh"
-#include "Xrd/XrdInet.hh"
+#include <vector>
+
 #include "Xrd/XrdProtLoad.hh"
 #include "Xrd/XrdProtocol.hh"
-#include "Xrd/XrdScheduler.hh"
-#define   XRD_TRACE Trace.
-#include "Xrd/XrdTrace.hh"
 
-#include "XrdOuc/XrdOucTrace.hh"
-#include "XrdSys/XrdSysError.hh"
-#include "XrdSys/XrdSysLogger.hh"
+#include <sys/types.h>
 
+class XrdSysError;
+class XrdTcpMonInfo;
 class XrdNetSecurity;
 class XrdOucStream;
+class XrdInet;
 class XrdConfigProt;
+class XrdMonitor;
 
 class XrdConfig
 {
@@ -56,44 +55,49 @@ int         ConfigXeq(char *var, XrdOucStream &Config, XrdSysError *eDest=0);
          XrdConfig();
         ~XrdConfig() {}
 
-XrdProtocol_Config  ProtInfo;
-XrdInet            *NetADM;
-XrdInet            *NetTCP[XrdProtLoad::ProtoMax+1];
+XrdProtocol_Config    ProtInfo;
+XrdInet              *NetADM;
+std::vector<XrdInet*> NetTCP;
 
 private:
 
 int   ASocket(const char *path, const char *fname, mode_t mode);
 int   ConfigProc(void);
+XrdInet *getNet(int port, bool isTLS);
 int   getUG(char *parm, uid_t &theUid, gid_t &theGid);
 void  Manifest(const char *pidfn);
-void  setCFG();
+bool  PidFile(const char *clpFN, bool optbg);
+void  setCFG(bool start);
 int   setFDL();
-int   Setup(char *dfltp);
+int   Setup(char *dfltp, char *libProt);
+int   SetupAPath();
+bool  SetupTLS();
 void  Usage(int rc);
 int   xallow(XrdSysError *edest, XrdOucStream &Config);
 int   xapath(XrdSysError *edest, XrdOucStream &Config);
 int   xhpath(XrdSysError *edest, XrdOucStream &Config);
 int   xbuf(XrdSysError *edest, XrdOucStream &Config);
+int   xmaxfd(XrdSysError *edest, XrdOucStream &Config);
 int   xnet(XrdSysError *edest, XrdOucStream &Config);
 int   xnkap(XrdSysError *edest, char *val);
 int   xlog(XrdSysError *edest, XrdOucStream &Config);
+int   xpidf(XrdSysError *edest, XrdOucStream &Config);
 int   xport(XrdSysError *edest, XrdOucStream &Config);
 int   xprot(XrdSysError *edest, XrdOucStream &Config);
 int   xrep(XrdSysError *edest, XrdOucStream &Config);
 int   xsched(XrdSysError *edest, XrdOucStream &Config);
 int   xsit(XrdSysError *edest, XrdOucStream &Config);
+int   xtcpmon(XrdSysError *edest, XrdOucStream &Config);
+int   xtls(XrdSysError *edest, XrdOucStream &Config);
+int   xtlsca(XrdSysError *edest, XrdOucStream &Config);
+int   xtlsci(XrdSysError *edest, XrdOucStream &Config);
 int   xtrace(XrdSysError *edest, XrdOucStream &Config);
 int   xtmo(XrdSysError *edest, XrdOucStream &Config);
-int   yport(XrdSysError *edest, const char *ptyp, const char *pval);
 
 static const char  *TraceID;
-
-XrdSysLogger        Logger;
-XrdSysError         Log;
-XrdOucTrace         Trace;
-XrdScheduler        Sched;
-XrdBuffManager      BuffPool;
 XrdNetSecurity     *Police;
+XrdTcpMonInfo      *tmoInfo;
+XrdMonitor         *theMon;
 const char         *myProg;
 const char         *myName;
 const char         *myDomain;
@@ -102,24 +106,39 @@ const char         *myInsName;
 char               *myInstance;
 char               *AdminPath;
 char               *HomePath;
+char               *PidPath;
+char               *tlsCert;
+char               *tlsKey;
+char               *caDir;
+char               *caFile;
 char               *ConfigFN;
 char               *repDest[2];
 XrdConfigProt      *Firstcp;
 XrdConfigProt      *Lastcp;
 int                 Net_Blen;
 int                 Net_Opts;
-int                 Wan_Blen;
-int                 Wan_Opts;
+int                 TLS_Blen;
+int                 TLS_Opts;
 
 int                 PortTCP;      // TCP Port to listen on
 int                 PortUDP;      // UDP Port to listen on (currently unsupported)
-int                 PortWAN;      // TCP port to listen on for WAN connections
-int                 NetTCPlep;
+int                 PortTLS;      // TCP port to listen on for TLS connections
+
 int                 AdminMode;
 int                 HomeMode;
 int                 repInt;
+
+uint64_t            tlsOpts;
+bool                tlsNoVer;
+bool                tlsNoCAD;
+
 char                repOpts;
 char                ppNet;
 signed char         coreV;
+char                Specs;
+static const int    hpSpec = 0x01;
+
+bool                isStrict;
+unsigned int        maxFD;
 };
 #endif

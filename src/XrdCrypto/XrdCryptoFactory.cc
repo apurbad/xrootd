@@ -33,7 +33,7 @@
 /* (OpenSSL, Botan, ...)                                                      */
 /*                                                                            */
 /* ************************************************************************** */
-#include <string.h>
+#include <cstring>
 #include <dlfcn.h>
 
 #include "XrdCrypto/XrdCryptoAux.hh"
@@ -43,6 +43,7 @@
 #include "XrdOuc/XrdOucHash.hh"
 #include "XrdOuc/XrdOucPinLoader.hh"
 #include "XrdSys/XrdSysPlatform.hh"
+#include "XrdSys/XrdSysPthread.hh"
 
 #include "XrdVersion.hh"
   
@@ -315,6 +316,16 @@ XrdCryptoX509ParseFile_t XrdCryptoFactory::X509ParseFile()
 }
 
 //______________________________________________________________________________
+XrdCryptoX509ParseStack_t XrdCryptoFactory::X509ParseStack()
+{
+   // Return an instance of an implementation of a function
+   // to parse a stack supposed to contain for X509 certificates.
+
+   ABSTRACTMETHOD("XrdCryptoFactory::X509ParseStack");
+   return 0;
+}
+
+//______________________________________________________________________________
 XrdCryptoX509ParseBucket_t XrdCryptoFactory::X509ParseBucket()
 {
    // Return an instance of an implementation of a function
@@ -408,6 +419,7 @@ XrdCryptoFactory *XrdCryptoFactory::GetCryptoFactory(const char *factoryid)
    // Static method to load/locate the crypto factory named factoryid
  
    static XrdVERSIONINFODEF(myVer,cryptoloader,XrdVNUMBER,XrdVERSION);
+   static XrdSysMutex    fMutex;
    static FactoryEntry  *factorylist = 0;
    static int            factorynum = 0;
    static XrdOucHash<XrdOucPinLoader> plugins;
@@ -415,6 +427,10 @@ XrdCryptoFactory *XrdCryptoFactory::GetCryptoFactory(const char *factoryid)
    XrdCryptoFactory *factory;
    char factobjname[80], libfn[80];
    EPNAME("Factory::GetCryptoFactory");
+
+   // Factory entries are tracked in a static list.
+   // Make sure only one thread may be using or modifying the list at a time.
+   XrdSysMutexHelper mHelp(fMutex);
 
    //
    // The id must be defined

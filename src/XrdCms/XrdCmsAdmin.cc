@@ -28,11 +28,11 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <stdio.h>
+#include <cstdio>
 #include <limits.h>
 #include <string>
 #include <unistd.h>
-#include <inttypes.h>
+#include <cinttypes>
 #include <netinet/in.h>
 #include <sys/types.h>
 
@@ -42,6 +42,7 @@
 #include "XrdCms/XrdCmsAdmin.hh"
 #include "XrdCms/XrdCmsConfig.hh"
 #include "XrdCms/XrdCmsManager.hh"
+#include "XrdCms/XrdCmsMeter.hh"
 #include "XrdCms/XrdCmsPrepare.hh"
 #include "XrdCms/XrdCmsState.hh"
 #include "XrdCms/XrdCmsTrace.hh"
@@ -112,6 +113,8 @@ static XrdSysMutex     QMutex;
 static AdminReq       *First;
 static AdminReq       *Last;
 };
+
+extern XrdCmsMeter Meter;
 };
 
 /******************************************************************************/
@@ -140,28 +143,31 @@ static AdminReq       *Last;
 /*            E x t e r n a l   T h r e a d   I n t e r f a c e s             */
 /******************************************************************************/
   
-void *XrdCmsAdminLogin(void *carg)
+namespace
+{
+void *AdminLogin(void *carg)
       {XrdCmsAdmin *Admin = new XrdCmsAdmin();
        Admin->Login(*(int *)carg);
        delete Admin;
        return (void *)0;
       }
   
-void *XrdCmsAdminMonAds(void *carg)
+void *AdminMonAds(void *carg)
       {XrdCmsAdmin *Admin = (XrdCmsAdmin *)carg;
        Admin->MonAds();
        return (void *)0;
       }
   
-void *XrdCmsAdminMonARE(void *carg)
+void *AdminMonARE(void *carg)
       {XrdCmsAdmin::RelayAREvent();
        return (void *)0;
       }
 
-void *XrdCmsAdminSend(void *carg)
+void *AdminSend(void *carg)
       {XrdCmsAdmin::Relay(0,0);
        return (void *)0;
       }
+}
   
 /******************************************************************************/
 /*                          I n i t A R E v e n t s                           */
@@ -177,7 +183,7 @@ bool XrdCmsAdmin::InitAREvents(void *arFunc)
 
 // Start the event relay
 //
-   if (XrdSysThread::Run(&tid,XrdCmsAdminMonARE,(void *)0))
+   if (XrdSysThread::Run(&tid, AdminMonARE, (void *)0))
       {Say.Emsg("InitAREvents", errno, "start arevent relay");
        return false;
       }
@@ -227,6 +233,8 @@ void XrdCmsAdmin::Login(int socknum)
                      }
              else if (!strcmp("rmdid",    tp)) do_RmDid();   // via lfn
              else if (!strcmp("newfn",    tp)) do_RmDud();   // via lfn
+             else if (!strcmp("perf",     tp)) do_Perf();
+             else if (!strcmp("PERF",     tp)) do_Perf(true);
              else if (!strcmp("suspend",  tp)) 
                      {if ((tp = Stream.GetToken()) && *tp == 't') sPerm = 0;
                          else sPerm = 1;
@@ -448,14 +456,17 @@ void *XrdCmsAdmin::Start(XrdNetSocket *AdminSock)
 
 // Start the relay thread
 //
-   if (XrdSysThread::Run(&tid,XrdCmsAdminSend,(void *)0))
+   if (XrdSysThread::Run(&tid, AdminSend, (void *)0))
       Say.Emsg(epname, errno, "start admin relay");
 
 // If we are in independent mode then let the caller continue
 //
    if (Config.doWait)
       {if (Config.adsPort) BegAds();
-          else Say.Emsg(epname, "Waiting for primary server to login.");
+          {char dest[512];
+           AdminSock->SockName(dest, sizeof(dest));
+           Say.Emsg(epname, "Waiting for primary server to login via", dest);
+          }
       }
        else if (SyncUp) {SyncUp->Post(); SyncUp = 0;}
 
@@ -463,7 +474,7 @@ void *XrdCmsAdmin::Start(XrdNetSocket *AdminSock)
 //
    while(1) if ((InSock = AdminSock->Accept()) >= 0)
                {XrdNetSocket::setOpts(InSock, 0);
-                if (XrdSysThread::Run(&tid,XrdCmsAdminLogin,(void *)&InSock))
+                if (XrdSysThread::Run(&tid, AdminLogin, (void *)&InSock))
                    {Say.Emsg(epname, errno, "start admin");
                     close(InSock);
                    }
@@ -513,7 +524,7 @@ void XrdCmsAdmin::BegAds()
 
 // Start the connection/ping thread for the alternate data server
 //
-   if (XrdSysThread::Run(&tid,XrdCmsAdminMonAds,(void *)this))
+   if (XrdSysThread::Run(&tid, AdminMonAds, (void *)this))
       Say.Emsg(epname, errno, "start alternate data server monitor");
 }
   
@@ -559,7 +570,7 @@ int XrdCmsAdmin::Con2Ads(const char *pname)
                                          (kXR_unt16)htons(kXR_login),
                                          (kXR_int32)htonl(getpid()),
                                          {'c', 'm', 's', 'd', 0, 0, 0, 0},
-                                         0, 0, {0}, {0}, 0};
+                                         0, 0, {0}, 0, 0};
    struct {kXR_int32 siHS[4];} hsRsp;
    XrdNetSocket adsSocket;
    int ecode, snum;
@@ -732,6 +743,21 @@ int XrdCmsAdmin::do_Login()
    return 1;
 }
  
+/******************************************************************************/
+/*                               d o _ P e r f                                */
+/******************************************************************************/
+  
+void XrdCmsAdmin::do_Perf(bool alert)
+{
+   const char *epname = "do_Perf";
+   char  buff[256];
+
+   if (!Stream.GetRest(buff, sizeof(buff)))
+      Say.Emsg(epname,"performance data is too long.");
+      else if (!Meter.Update(buff, alert))
+              Say.Emsg(epname,"performance data is invalid.");
+}
+  
 /******************************************************************************/
 /*                              d o _ R m D i d                               */
 /******************************************************************************/

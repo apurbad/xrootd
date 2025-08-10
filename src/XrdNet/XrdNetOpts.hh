@@ -86,6 +86,10 @@
 //
 #define XRDNET_NORLKUP   0x00800000
 
+// Enable TLS upon connection
+//
+#define XRDNET_USETLS    0x01000000
+
 /******************************************************************************/
 /*                  X r d N e t S o c k e t   O p t i o n s                   */
 /******************************************************************************/
@@ -94,7 +98,7 @@
 //
 #define XRDNET_SERVER    0x10000000
 
-// Maximum backlog for incomming connections. The backlog value goes in low
+// Maximum backlog for incoming connections. The backlog value goes in low
 // order byte and is used only when XRDNET_SERVER is specified.
 //
 #define XRDNET_BKLG      0x000000FF

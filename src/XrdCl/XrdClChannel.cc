@@ -28,156 +28,11 @@
 #include "XrdCl/XrdClSocket.hh"
 #include "XrdCl/XrdClConstants.hh"
 #include "XrdCl/XrdClLog.hh"
-#include "XrdCl/XrdClUglyHacks.hh"
 #include "XrdCl/XrdClRedirectorRegistry.hh"
-
+#include "XrdCl/XrdClXRootDTransport.hh"
 #include "XrdSys/XrdSysPthread.hh"
 
 #include <ctime>
-
-namespace
-{
-  //----------------------------------------------------------------------------
-  // Filter handler
-  //----------------------------------------------------------------------------
-  class FilterHandler: public XrdCl::IncomingMsgHandler
-  {
-    public:
-      //------------------------------------------------------------------------
-      // Constructor
-      //------------------------------------------------------------------------
-      FilterHandler( XrdCl::MessageFilter *filter ):
-        pSem( new XrdCl::Semaphore(0) ), pFilter( filter ), pMsg( 0 )
-      {
-      }
-
-      //------------------------------------------------------------------------
-      // Destructor
-      //------------------------------------------------------------------------
-      virtual ~FilterHandler()
-      {
-        delete pSem;
-      }
-
-      //------------------------------------------------------------------------
-      // Message handler
-      //------------------------------------------------------------------------
-      virtual uint16_t Examine( XrdCl::Message *msg )
-      {
-        if( pFilter->Filter( msg ) )
-          return Take | RemoveHandler;
-        return Ignore;
-      }
-
-      virtual void Process( XrdCl::Message *msg )
-      {
-        pMsg = msg;
-        pSem->Post();
-      }
-
-      //------------------------------------------------------------------------
-      // Handle a fault
-      //------------------------------------------------------------------------
-      virtual uint8_t OnStreamEvent( StreamEvent   event,
-                                     uint16_t      streamNum,
-                                     XrdCl::Status status )
-      {
-        if( event == Ready )
-          return 0;
-        pStatus = status;
-        pSem->Post();
-        return RemoveHandler;
-      }
-
-      //------------------------------------------------------------------------
-      // Wait for a status of the message
-      //------------------------------------------------------------------------
-      XrdCl::Status WaitForStatus()
-      {
-        pSem->Wait();
-        return pStatus;
-      }
-
-      //------------------------------------------------------------------------
-      // Wait for the arrival of the message
-      //------------------------------------------------------------------------
-      XrdCl::Message *GetMessage()
-      {
-        return pMsg;
-      }
-
-      //------------------------------------------------------------------------
-      // Get underlying message filter sid
-      //------------------------------------------------------------------------
-      uint16_t GetSid() const
-      {
-	if (pFilter)
-	  return pFilter->GetSid();
-
-	return 0;
-      }
-
-    private:
-      FilterHandler(const FilterHandler &other);
-      FilterHandler &operator = (const FilterHandler &other);
-
-      XrdCl::Semaphore     *pSem;
-      XrdCl::MessageFilter *pFilter;
-      XrdCl::Message       *pMsg;
-      XrdCl::Status         pStatus;
-  };
-
-  //----------------------------------------------------------------------------
-  // Status handler
-  //----------------------------------------------------------------------------
-  class StatusHandler: public XrdCl::OutgoingMsgHandler
-  {
-    public:
-      //------------------------------------------------------------------------
-      // Constructor
-      //------------------------------------------------------------------------
-      StatusHandler( XrdCl::Message *msg ):
-        pSem( new XrdCl::Semaphore(0) ),
-        pMsg( msg ) {}
-
-      //------------------------------------------------------------------------
-      // Destructor
-      //------------------------------------------------------------------------
-      virtual ~StatusHandler()
-      {
-        delete pSem;
-      }
-
-      //------------------------------------------------------------------------
-      // Handle the status information
-      //------------------------------------------------------------------------
-      void OnStatusReady( const XrdCl::Message *message,
-                          XrdCl::Status         status )
-      {
-        if( pMsg == message )
-          pStatus = status;
-        pSem->Post();
-      }
-
-      //------------------------------------------------------------------------
-      // Wait for the status to be ready
-      //------------------------------------------------------------------------
-      XrdCl::Status WaitForStatus()
-      {
-        pSem->Wait();
-        return pStatus;
-      }
-      
-    private:
-      StatusHandler(const StatusHandler &other);
-      StatusHandler &operator = (const StatusHandler &other);
-
-      XrdCl::Semaphore *pSem;
-      XrdCl::Status     pStatus;
-      XrdCl::Message   *pMsg;
-  };
-
-}
 
 namespace XrdCl
 {
@@ -230,7 +85,8 @@ namespace XrdCl
                     Poller           *poller,
                     TransportHandler *transport,
                     TaskManager      *taskManager,
-                    JobManager       *jobManager ):
+                    JobManager       *jobManager,
+                    const URL        &prefurl ):
     pUrl( url.GetHostId() ),
     pPoller( poller ),
     pTransport( transport ),
@@ -244,33 +100,29 @@ namespace XrdCl
     int  timeoutResolution = DefaultTimeoutResolution;
     env->GetInt( "TimeoutResolution", timeoutResolution );
 
-    pTransport->InitializeChannel( pChannelData );
-    uint16_t numStreams = transport->StreamNumber( pChannelData );
-    log->Debug( PostMasterMsg, "Creating new channel to: %s %d stream(s)",
-                                url.GetHostId().c_str(), numStreams );
+    pTransport->InitializeChannel( url, pChannelData );
+    log->Debug( PostMasterMsg, "Creating new channel to: %s",
+                                url.GetChannelId().c_str() );
 
     pUrl.SetParams( url.GetParams() );
+    pUrl.SetProtocol( url.GetProtocol() );
 
     //--------------------------------------------------------------------------
-    // Create the streams
+    // Create the stream
     //--------------------------------------------------------------------------
-    pStreams.resize( numStreams );
-    for( uint16_t i = 0; i < numStreams; ++i )
-    {
-      pStreams[i] = new Stream( &pUrl, i );
-      pStreams[i]->SetTransport( transport );
-      pStreams[i]->SetPoller( poller );
-      pStreams[i]->SetIncomingQueue( &pIncoming );
-      pStreams[i]->SetTaskManager( taskManager );
-      pStreams[i]->SetJobManager( jobManager );
-      pStreams[i]->SetChannelData( &pChannelData );
-      pStreams[i]->Initialize();
-    }
+    pStream = new Stream( &pUrl, prefurl );
+    pStream->SetTransport( transport );
+    pStream->SetPoller( poller );
+    pStream->SetIncomingQueue( &pIncoming );
+    pStream->SetTaskManager( taskManager );
+    pStream->SetJobManager( jobManager );
+    pStream->SetChannelData( &pChannelData );
+    pStream->Initialize();
 
     //--------------------------------------------------------------------------
     // Register the task generating timeout events
     //--------------------------------------------------------------------------
-    pTickGenerator = new TickGeneratorTask( this, pUrl.GetHostId() );
+    pTickGenerator = new TickGeneratorTask( this, pUrl.GetChannelId() );
     pTaskManager->RegisterTask( pTickGenerator, ::time(0)+timeoutResolution );
   }
 
@@ -280,63 +132,20 @@ namespace XrdCl
   Channel::~Channel()
   {
     pTickGenerator->Invalidate();
-    pTaskManager->UnregisterTask( pTickGenerator );
-    for( uint32_t i = 0; i < pStreams.size(); ++i )
-      delete pStreams[i];
+    delete pStream;
     pTransport->FinalizeChannel( pChannelData );
-  }
-
-  //----------------------------------------------------------------------------
-  // Send a message synchronously
-  //----------------------------------------------------------------------------
-  Status Channel::Send( Message *msg, bool stateful, time_t expires )
-  {
-    StatusHandler sh( msg );
-    Status sc = Send( msg, &sh, stateful, expires );
-    if( !sc.IsOK() )
-      return sc;
-    sc = sh.WaitForStatus();
-    return sc;
   }
 
   //----------------------------------------------------------------------------
   // Send the message asynchronously
   //----------------------------------------------------------------------------
-  Status Channel::Send( Message              *msg,
-                        OutgoingMsgHandler   *handler,
-                        bool                  stateful,
-                        time_t                expires )
+  XRootDStatus Channel::Send( Message              *msg,
+                              MsgHandler   *handler,
+                              bool                  stateful,
+                              time_t                expires )
 
   {
-    PathID path = pTransport->Multiplex( msg, pChannelData );
-    return pStreams[path.up]->Send( msg, handler, stateful, expires );
-  }
-
-  //----------------------------------------------------------------------------
-  // Synchronously receive a message - blocks until a message matching
-  //----------------------------------------------------------------------------
-  Status Channel::Receive( Message       *&msg,
-                           MessageFilter  *filter,
-                           time_t          expires )
-  {
-    FilterHandler fh( filter );
-    Status sc = Receive( &fh, expires );
-    if( !sc.IsOK() )
-      return sc;
-
-    sc = fh.WaitForStatus();
-    if( sc.IsOK() )
-      msg = fh.GetMessage();
-    return sc;
-  }
-
-  //----------------------------------------------------------------------------
-  // Listen to incoming messages
-  //----------------------------------------------------------------------------
-  Status Channel::Receive( IncomingMsgHandler *handler, time_t expires )
-  {
-    pIncoming.AddMessageHandler( handler, expires );
-    return Status();
+    return pStream->Send( msg, handler, stateful, expires );
   }
 
   //----------------------------------------------------------------------------
@@ -344,9 +153,7 @@ namespace XrdCl
   //----------------------------------------------------------------------------
   void Channel::Tick( time_t now )
   {
-    std::vector<Stream *>::iterator it;
-    for( it = pStreams.begin(); it != pStreams.end(); ++it )
-      (*it)->Tick( now );
+    pStream->Tick( now );
   }
 
   //----------------------------------------------------------------------------
@@ -354,13 +161,61 @@ namespace XrdCl
   //----------------------------------------------------------------------------
   Status Channel::ForceDisconnect()
   {
+    return ForceDisconnect(false);
+  }
+
+  //----------------------------------------------------------------------------
+  // Force disconnect of all streams
+  //----------------------------------------------------------------------------
+  Status Channel::ForceDisconnect( bool hush )
+  {
     //--------------------------------------------------------------------------
     // Disconnect and recreate the streams
     //--------------------------------------------------------------------------
-    for( uint32_t i = 0; i < pStreams.size(); ++i )
-      pStreams[i]->ForceError( Status( stError, errOperationInterrupted ) );
+    pStream->ForceError( Status( stError, errOperationInterrupted ), hush );
 
     return Status();
+  }
+
+  //----------------------------------------------------------------------------
+  // Force reconnect
+  //----------------------------------------------------------------------------
+  Status Channel::ForceReconnect()
+  {
+    pStream->ForceConnect();
+    return Status();
+  }
+
+  //------------------------------------------------------------------------
+  // Get the number of connected data streams
+  //------------------------------------------------------------------------
+  uint16_t Channel::NbConnectedStrm()
+  {
+    return XRootDTransport::NbConnectedStrm( pChannelData );
+  }
+
+  //------------------------------------------------------------------------
+  // Set the on-connect handler for data streams
+  //------------------------------------------------------------------------
+  void Channel::SetOnDataConnectHandler( std::shared_ptr<Job> &onConnJob )
+  {
+    pStream->SetOnDataConnectHandler( onConnJob );
+  }
+
+  //------------------------------------------------------------------------
+  // Check if channel can be collapsed using given URL
+  //------------------------------------------------------------------------
+  bool Channel::CanCollapse( const URL &url )
+  {
+    return pStream->CanCollapse( url );
+  }
+
+  //------------------------------------------------------------------------
+  // Decrement file object instance count bound to this channel
+  //------------------------------------------------------------------------
+  void Channel::DecFileInstCnt()
+  {
+    pTransport->DecFileInstCnt( pChannelData );
   }
 
   //----------------------------------------------------------------------------
@@ -368,7 +223,9 @@ namespace XrdCl
   //----------------------------------------------------------------------------
   Status Channel::QueryTransport( uint16_t query, AnyObject &result )
   {
-    return pTransport->Query( query, result, pChannelData );
+    if( query < 2000 )
+      return pTransport->Query( query, result, pChannelData );
+    return pStream->Query( query, result );
   }
 
   //----------------------------------------------------------------------------
@@ -376,9 +233,7 @@ namespace XrdCl
   //----------------------------------------------------------------------------
   void Channel::RegisterEventHandler( ChannelEventHandler *handler )
   {
-    std::vector<Stream *>::iterator it;
-    for( it = pStreams.begin(); it != pStreams.end(); ++it )
-      (*it)->RegisterEventHandler( handler );
+    pStream->RegisterEventHandler( handler );
   }
 
   //------------------------------------------------------------------------
@@ -386,8 +241,6 @@ namespace XrdCl
   //------------------------------------------------------------------------
   void Channel::RemoveEventHandler( ChannelEventHandler *handler )
   {
-    std::vector<Stream *>::iterator it;
-    for( it = pStreams.begin(); it != pStreams.end(); ++it )
-      (*it)->RemoveEventHandler( handler );
+    pStream->RemoveEventHandler( handler );
   }
 }

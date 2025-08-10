@@ -34,6 +34,7 @@
 
 class XrdCks;
 class XrdOss;
+class XrdOucEnv;
 class XrdOucStream;
 class XrdSysError;
 
@@ -43,7 +44,8 @@ class XrdCksConfig
 {
 public:
 
-XrdCks *Configure(const char *dfltCalc=0, int rdsz=0, XrdOss *ossP=0);
+XrdCks *Configure(const char *dfltCalc=0, int rdsz=0,
+                  XrdOss *ossP=0, XrdOucEnv *envP=0);
 
 int     Manager() {return CksLib != 0;}
 
@@ -54,15 +56,19 @@ char   *ManLib() {return CksLib;}
 
 int     ParseLib(XrdOucStream &Config, int &libType);
 
+bool    ParseOpt(XrdOucStream &Config);
+
         XrdCksConfig(const char *cFN, XrdSysError *Eroute, int &aOK,
                      XrdVersionInfo &vInfo);
        ~XrdCksConfig() {XrdOucTList *tP;
                         if (CksLib)  free(CksLib);
                         if (CksParm) free(CksParm);
                         while((tP = CksList)) {CksList = tP->next; delete tP;}
+                        while((tP = LibList)) {LibList = tP->next; delete tP;}
                        }
 
 private:
+XrdCks      *addCks(XrdCks *pCks, XrdOucEnv *envP);
 XrdCks      *getCks(XrdOss *ossP, int rdsz);
 
 XrdSysError    *eDest;
@@ -71,6 +77,9 @@ char           *CksLib;
 char           *CksParm;
 XrdOucTList    *CksList;
 XrdOucTList    *CksLast;
+XrdOucTList    *LibList;
+XrdOucTList    *LibLast;
 XrdVersionInfo &myVersion;
+int            CKSopts;
 };
 #endif

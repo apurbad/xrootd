@@ -30,8 +30,8 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <stdlib.h>
-#include <string.h>
+#include <cstdlib>
+#include <cstring>
 
 template<class T>
 class XrdOucTable
@@ -40,7 +40,7 @@ public:
 
          XrdOucTable(int maxe)
                     {int i;
-                     Table = new OucTable[maxe];
+                     Table = new OucTable[(unsigned int)maxe];
                      maxnum = maxe; curnum = 0; avlnum = 0;
                      for (i = 1; i < maxe; i++) Table[i-1].Fnum = i;
                      Table[maxe-1].Fnum = -1;
@@ -137,7 +137,9 @@ T  *Remove(int Tnum)
            Table[Tnum].Fnum = avlnum;
            avlnum = Tnum;
            if (Tnum == (curnum-1))
-              while(curnum && Table[curnum].Item == 0) curnum--;
+              {if (curnum == maxnum) curnum--;
+               while(curnum && Table[curnum].Item == 0) curnum--;
+              }
            return temp;
           }
 

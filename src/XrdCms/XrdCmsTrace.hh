@@ -31,7 +31,7 @@
 /******************************************************************************/
 
 #include "XrdSys/XrdSysError.hh"
-#include "XrdOuc/XrdOucTrace.hh"
+#include "XrdSys/XrdSysTrace.hh"
 
 #define TRACE_ALL       0xffff
 #define TRACE_Debug     0x0001
@@ -40,6 +40,7 @@
 #define TRACE_Forward   0x0008
 #define TRACE_Redirect  0x0010
 #define TRACE_Files     0x0020
+#define TRACE_Space     0x0040
 
 #ifndef NODEBUG
 
@@ -48,16 +49,16 @@
 #define QTRACE(act) Trace.What & TRACE_ ## act
 
 #define DEBUGR(y) if (Trace.What & TRACE_Debug) \
-                  {Trace.Beg(epname, Arg.Ident); cerr <<y; Trace.End();}
+                  {SYSTRACE(Trace., Arg.Ident, epname, 0, y)}
 
 #define DEBUG(y) if (Trace.What & TRACE_Debug) TRACEX(y)
 
 #define TRACE(x,y) if (Trace.What & TRACE_ ## x) TRACEX(y)
 
 #define TRACER(x,y) if (Trace.What & TRACE_ ## x) \
-                       {Trace.Beg(epname, Arg.Ident); cerr <<y; Trace.End();}
+                       {SYSTRACE(Trace., Arg.Ident, epname, 0, y)}
 
-#define TRACEX(y) {Trace.Beg(0,epname); cerr <<y; Trace.End();}
+#define TRACEX(y) {SYSTRACE(Trace., 0, epname, 0, y)}
 
 #define EPNAME(x) static const char *epname = x;
 
@@ -71,7 +72,7 @@
 
 namespace XrdCms
 {
-extern    XrdOucTrace Trace;
+extern    XrdSysTrace Trace;
 extern    XrdSysError Say;
 }
 #endif

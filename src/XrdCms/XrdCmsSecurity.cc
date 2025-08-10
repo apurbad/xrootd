@@ -28,7 +28,7 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <stdlib.h>
+#include <cstdlib>
 #include <string>
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -106,14 +106,15 @@ do {
 //
    if (!AuthProt)
       {if (!DHS || !(AuthProt=DHS->getProtocol(Link->Host(),
-                                             *(Link->AddrInfo()),&cred,&eMsg)))
+                                             *(Link->AddrInfo()),&cred,eMsg)))
           {eText = eMsg.getErrText(rc); break;}
       }
 
 // Perform the authentication
 //
     AuthProt->Entity.addrInfo = Link->AddrInfo();
-    if (!(rc = AuthProt->Authenticate(&cred, &parm, &eMsg))) break;
+    if (!(rc = AuthProt->Authenticate(&cred, &parm, &eMsg))
+    &&  DHS->PostProcess(AuthProt->Entity, eMsg)) break;
     if (rc < 0) {eText = eMsg.getErrText(rc); break;}
     if (parm) 
        {eText = XrdCmsTalk::Request(Link, myHdr, parm->buffer, parm->size);

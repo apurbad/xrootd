@@ -28,9 +28,14 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
+#include <utility>
+#include <vector>
+
 #include "Xrd/XrdScheduler.hh"
 
 #include "XrdOuc/XrdOucCache.hh"
+#include "XrdOuc/XrdOucCRC.hh"
+#include "XrdOuc/XrdOucPgrwUtils.hh"
 
 #include "XrdPosix/XrdPosixFileRH.hh"
 #include "XrdPosix/XrdPosixFile.hh"
@@ -87,12 +92,15 @@ XrdPosixFileRH *XrdPosixFileRH::Alloc(XrdOucCacheIOCB *cbp,
 //
    newCB->theCB   = cbp;
    newCB->theFile = fp;
+   newCB->csVec   = 0;
+   newCB->csfix   = 0;
    newCB->offset  = offs;
    newCB->result  = xResult;
    newCB->typeIO  = typeIO;
+   newCB->csFrc   = false;
    return newCB;
 }
-
+  
 /******************************************************************************/
 /*                        H a n d l e R e s p o n s e                         */
 /******************************************************************************/
@@ -103,7 +111,8 @@ void XrdPosixFileRH::HandleResponse(XrdCl::XRootDStatus *status,
 
 // Determine ending status. Note: error indicated as result set to -errno.
 //
-        if (!(status->IsOK())) result = XrdPosixMap::Result(*status, false);
+        if (!(status->IsOK()))
+           result = XrdPosixMap::Result(*status, theFile->ecMsg, false);
    else if (typeIO == nonIO) result = 0;
    else if (typeIO == isRead)
            {XrdCl::ChunkInfo *cInfo = 0;
@@ -111,6 +120,30 @@ void XrdPosixFileRH::HandleResponse(XrdCl::XRootDStatus *status,
             response->Get(cInfo);
             ubRead = (cInfo ? cInfo->length : 0);
             result = ibRead;
+           }
+   else if (typeIO == isReadP)
+           {XrdCl::PageInfo *pInfo = 0;
+            union {uint32_t ubRead; int ibRead;};
+            response->Get(pInfo);
+            if (pInfo)
+               {ubRead = pInfo->GetLength();
+                result = ibRead;
+                if (csVec) 
+                   {if (!csFrc || pInfo->GetCksums().size() != 0 || result <= 0)
+                       *csVec = std::move(pInfo->GetCksums() );
+                       else {uint64_t offs = pInfo->GetOffset();
+                             void *buff = pInfo->GetBuffer();
+                             XrdOucPgrwUtils::csCalc((const char *)buff,
+                                                     (ssize_t)offs, ubRead,
+                                                     *csVec);
+                            }
+                    csVec = 0;
+                   }
+                if (csfix) *csfix = pInfo->GetNbRepair();
+               } else {
+                result = 0;
+                if (csVec) {csVec->clear(); csVec = 0;}
+               }
            }
    else if (typeIO == isWrite) theFile->UpdtSize(offset+result);
 

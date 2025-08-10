@@ -30,8 +30,8 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <string.h>
-#include <time.h>
+#include <cstring>
+#include <ctime>
 #include <sys/types.h>
 
 #include "XrdSys/XrdSysPthread.hh"
@@ -66,7 +66,7 @@ char  *Find(XrdNetAddrInfo *hAddr);
 //------------------------------------------------------------------------------
 //! Set the default keep time for entries in the cache during initialization.
 //!
-//! @param  ktVal  the number of seconds to keep an entry in the cache.
+//! @param  ktval  the number of seconds to keep an entry in the cache.
 //------------------------------------------------------------------------------
 static
 void   SetKT(int ktval) {keepTime = ktval;}

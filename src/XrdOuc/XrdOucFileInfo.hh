@@ -29,9 +29,9 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <ctype.h>
-#include <stdlib.h>
-#include <string.h>
+#include <cctype>
+#include <cstdlib>
+#include <cstring>
 #include <string>
   
 //-----------------------------------------------------------------------------
@@ -97,7 +97,7 @@ void            AddProtocol(const char * protname);
 //-----------------------------------------------------------------------------
 //! Obtain the next digest that can be used to validate the file.
 //!
-//! @param  hVal     Place to put the pointer to the hash value in ASCII
+//! @param  hval     Place to put the pointer to the hash value in ASCII
 //!                  encoded hex,
 //! @param  xrdname  When true the corresponding name expected by XRootD is
 //!                  returned
@@ -145,7 +145,7 @@ long long       GetSize() {return fSize;}
 //!
 //! @return Pointer to the url. The url is valid until this object is deleted.
 //!         If no more urls exist, a nil pointer is returned. A subsequent call
-//!         will start at the front of teh list.
+//!         will start at the front of the list.
 //-----------------------------------------------------------------------------
 
 const char     *GetUrl(char *cntry=0, int *prty=0);

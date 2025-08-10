@@ -28,9 +28,9 @@
 /******************************************************************************/
 
 #define _FILE_OFFSET_BITS 64
-#include <errno.h>
-#include <stdio.h>
-#include <string.h>
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
 #include <sys/types.h>
 
 #if !defined(__solaris__) && !defined(__FreeBSD__)
@@ -44,13 +44,18 @@
 #include <iostream>
 #include <libgen.h>
 #include <unistd.h>
-#include <stdlib.h>
+#include <cstdlib>
 #include <syslog.h>
 #include "XrdFfs/XrdFfsPosix.hh"
 #include "XrdPosix/XrdPosixXrootd.hh"
 #include "XrdFfs/XrdFfsMisc.hh"
 #include "XrdFfs/XrdFfsDent.hh"
 #include "XrdFfs/XrdFfsQueue.hh"
+
+#include "XrdCl/XrdClFileSystem.hh"
+#include "XrdCl/XrdClFile.hh"
+#include "XrdCl/XrdClURL.hh"
+#include "XrdCl/XrdClXRootDResponses.hh"
 
 #ifdef __cplusplus
   extern "C" {
@@ -67,9 +72,9 @@ int XrdFfsPosix_stat(const char *path, struct stat *buf)
     {                                     /* So we re-mark it to a regular file */
         buf->st_mode &= 0007777;
         if ( buf->st_mode & S_IXUSR )
-            buf->st_mode |= 0040000;   /* a directory */
+            buf->st_mode |= S_IFDIR;   /* a directory */
         else
-            buf->st_mode |= 0100000;   /* a file */
+            buf->st_mode |= S_IFREG;   /* a file */
     }
     return rc;
 }
@@ -91,12 +96,26 @@ int XrdFfsPosix_closedir(DIR *dirp)
 
 int XrdFfsPosix_mkdir(const char *path, mode_t mode)
 {
-    return XrdPosixXrootd::Mkdir(path, mode);
+    XrdCl::URL url(path);
+    std::string dir = url.GetPath();
+    XrdCl::LocationInfo *info = nullptr;
+    XrdCl::FileSystem fs(path);
+
+    XrdCl::XRootDStatus st = fs.DeepLocate("*", XrdCl::OpenFlags::PrefName, info );
+    std::unique_ptr<XrdCl::LocationInfo> ptr( info );  
+
+    if( !st.IsOK() )
+    {
+        errno = ENOENT;
+        return -1;
+    }
+    std::string nodeUrl = "root://" + info->At(0).GetAddress() + "/" + dir;
+
+    return XrdPosixXrootd::Mkdir(nodeUrl.c_str(), mode);
 }
 
 int XrdFfsPosix_rmdir(const char *path)
 {
-/* Note: Xrootd returns ENOSYS rather than ENOTEMPTY when a directory is not empty */
     return XrdPosixXrootd::Rmdir(path);
 }
 
@@ -420,7 +439,7 @@ struct XrdFfsPosixX_readdirall_args {
    NULL in this case.
 
    Do we need some protection here? We are not in trouble so far
-   because FUSE's _getattr will test the existance of the dir
+   because FUSE's _getattr will test the existence of the dir
    so we know that at least one data server has the directory.
  */
 void* XrdFfsPosix_x_readdirall(void* x)
@@ -801,8 +820,11 @@ int XrdFfsPosix_statall(const char *rdrurl, const char *path, struct stat *stbuf
     res = -1;
     errno = ENOENT;
     for (i = 0; i < nurls; i++)
+    {
+        time_t max_mtime = 0;
         if (res_i[i] == 0) 
         {
+            if (stbuf_i[i].st_mtime <= max_mtime) continue; 
             res = 0;
             errno = 0;
             memcpy((void*)stbuf, (void*)(&stbuf_i[i]), sizeof(struct stat));
@@ -814,6 +836,7 @@ int XrdFfsPosix_statall(const char *rdrurl, const char *path, struct stat *stbuf
             errno = ETIMEDOUT;
             syslog(LOG_WARNING, "WARNING: stat(%s) failed (connection timeout)", newurls[i]);
         }
+    }
 
     for (i = 0; i < nurls; i++)
         free(newurls[i]);

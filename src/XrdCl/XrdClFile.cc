@@ -36,13 +36,31 @@
 namespace XrdCl
 {
   //----------------------------------------------------------------------------
+  // The implementation
+  //----------------------------------------------------------------------------
+  struct FileImpl
+  {
+    FileImpl( FilePlugIn *plugin ) :
+      pStateHandler( std::make_shared<FileStateHandler>( plugin ) )
+    {
+    }
+
+    FileImpl( bool useVirtRedirector, FilePlugIn *plugin ) :
+      pStateHandler( std::make_shared<FileStateHandler>( useVirtRedirector, plugin ) )
+    {
+    }
+
+    std::shared_ptr<FileStateHandler> pStateHandler;
+  };
+
+  //----------------------------------------------------------------------------
   // Constructor
   //----------------------------------------------------------------------------
   File::File( bool enablePlugIns ):
     pPlugIn(0),
     pEnablePlugIns( enablePlugIns )
   {
-    pStateHandler = new FileStateHandler();
+    pImpl = new FileImpl( pPlugIn );
   }
 
   //----------------------------------------------------------------------------
@@ -52,12 +70,12 @@ namespace XrdCl
     pPlugIn(0),
     pEnablePlugIns( enablePlugIns )
   {
-    pStateHandler = new FileStateHandler( virtRedirect == EnableVirtRedirect );
+    pImpl = new FileImpl( virtRedirect == EnableVirtRedirect, pPlugIn );
   }
 
-  //------------------------------------------------------------------------
+  //----------------------------------------------------------------------------
   // Destructor
-  //------------------------------------------------------------------------
+  //----------------------------------------------------------------------------
   File::~File()
   {
     //--------------------------------------------------------------------------
@@ -66,9 +84,12 @@ namespace XrdCl
     // its garbage collector, from its __cxa_finalize, ie. after the XrdCl lib
     // has been finalized by the linker. So, if we don't have the log object
     // at this point we just give up the hope.
+    // Also, make sure the PostMaster threads are running - if not the Close
+    // will hang forever (this could happen when Python interpreter exits).
     //--------------------------------------------------------------------------
-    if ( DefaultEnv::GetLog() && IsOpen() ) {XRootDStatus status = Close();}
-    delete pStateHandler;
+    if ( DefaultEnv::GetLog() && DefaultEnv::GetPostMaster()->IsRunning() && IsOpen() )
+      XRootDStatus status = Close( nullptr, 0 );
+    delete pImpl;
     delete pPlugIn;
   }
 
@@ -105,7 +126,7 @@ namespace XrdCl
     if( pPlugIn )
       return pPlugIn->Open( url, flags, mode, handler, timeout );
 
-    return pStateHandler->Open( url, flags, mode, handler, timeout );
+    return FileStateHandler::Open( pImpl->pStateHandler, url, flags, mode, handler, timeout );
   }
 
   //----------------------------------------------------------------------------
@@ -117,7 +138,7 @@ namespace XrdCl
                            uint16_t           timeout )
   {
     SyncResponseHandler handler;
-    Status st = Open( url, flags, mode, &handler, timeout );
+    XRootDStatus st = Open( url, flags, mode, &handler, timeout );
     if( !st.IsOK() )
       return st;
 
@@ -133,7 +154,7 @@ namespace XrdCl
     if( pPlugIn )
       return pPlugIn->Close( handler, timeout );
 
-    return pStateHandler->Close( handler, timeout );
+    return FileStateHandler::Close( pImpl->pStateHandler, handler, timeout );
   }
 
 
@@ -143,8 +164,8 @@ namespace XrdCl
   XRootDStatus File::Close( uint16_t timeout )
   {
     SyncResponseHandler handler;
-    Status st = Close( &handler, timeout );
-    if( !st.IsOK() )
+    XRootDStatus st = Close( &handler, timeout );
+    if( !st.IsOK() || st.code == suAlreadyDone )
       return st;
 
     return MessageUtils::WaitForStatus( &handler );
@@ -160,7 +181,7 @@ namespace XrdCl
     if( pPlugIn )
       return pPlugIn->Stat( force, handler, timeout );
 
-    return pStateHandler->Stat( force, handler, timeout );
+    return FileStateHandler::Stat( pImpl->pStateHandler, force, handler, timeout );
   }
 
   //----------------------------------------------------------------------------
@@ -171,7 +192,7 @@ namespace XrdCl
                            uint16_t   timeout )
   {
     SyncResponseHandler handler;
-    Status st = Stat( force, &handler, timeout );
+    XRootDStatus st = Stat( force, &handler, timeout );
     if( !st.IsOK() )
       return st;
 
@@ -191,7 +212,7 @@ namespace XrdCl
     if( pPlugIn )
       return pPlugIn->Read( offset, size, buffer, handler, timeout );
 
-    return pStateHandler->Read( offset, size, buffer, handler, timeout );
+    return FileStateHandler::Read( pImpl->pStateHandler, offset, size, buffer, handler, timeout );
   }
 
   //----------------------------------------------------------------------------
@@ -204,7 +225,7 @@ namespace XrdCl
                            uint16_t  timeout )
   {
     SyncResponseHandler handler;
-    Status st = Read( offset, size, buffer, &handler, timeout );
+    XRootDStatus st = Read( offset, size, buffer, &handler, timeout );
     if( !st.IsOK() )
       return st;
 
@@ -214,6 +235,47 @@ namespace XrdCl
     {
       bytesRead = chunkInfo->length;
       delete chunkInfo;
+    }
+    return status;
+  }
+
+  //------------------------------------------------------------------------
+  // Read number of pages at a given offset - async
+  //------------------------------------------------------------------------
+  XRootDStatus File::PgRead( uint64_t         offset,
+                             uint32_t         size,
+                             void            *buffer,
+                             ResponseHandler *handler,
+                             uint16_t         timeout )
+  {
+    if( pPlugIn )
+      return pPlugIn->PgRead( offset, size, buffer, handler, timeout );
+
+    return FileStateHandler::PgRead( pImpl->pStateHandler, offset, size, buffer, handler, timeout );
+  }
+
+  //------------------------------------------------------------------------
+  // Read number of pages at a given offset - async
+  //------------------------------------------------------------------------
+  XRootDStatus File::PgRead( uint64_t               offset,
+                             uint32_t               size,
+                             void                  *buffer,
+                             std::vector<uint32_t> &cksums,
+                             uint32_t              &bytesRead,
+                             uint16_t               timeout )
+  {
+    SyncResponseHandler handler;
+    XRootDStatus st = PgRead( offset, size, buffer, &handler, timeout );
+    if( !st.IsOK() )
+      return st;
+
+    PageInfo *pageInfo = 0;
+    XRootDStatus status = MessageUtils::WaitForResponse( &handler, pageInfo );
+    if( status.IsOK() )
+    {
+      bytesRead = pageInfo->GetLength();
+      cksums = pageInfo->GetCksums();
+      delete pageInfo;
     }
     return status;
   }
@@ -230,7 +292,7 @@ namespace XrdCl
     if( pPlugIn )
       return pPlugIn->Write( offset, size, buffer, handler, timeout );
 
-    return pStateHandler->Write( offset, size, buffer, handler, timeout );
+    return FileStateHandler::Write( pImpl->pStateHandler, offset, size, buffer, handler, timeout );
   }
 
   //----------------------------------------------------------------------------
@@ -242,7 +304,103 @@ namespace XrdCl
                             uint16_t    timeout )
   {
     SyncResponseHandler handler;
-    Status st = Write( offset, size, buffer, &handler, timeout );
+    XRootDStatus st = Write( offset, size, buffer, &handler, timeout );
+    if( !st.IsOK() )
+      return st;
+
+    XRootDStatus status = MessageUtils::WaitForStatus( &handler );
+    return status;
+  }
+
+
+  XRootDStatus File::Write( uint64_t          offset,
+                            Buffer          &&buffer,
+                            ResponseHandler  *handler,
+                            uint16_t          timeout )
+  {
+    if( pPlugIn )
+      return pPlugIn->Write( offset, std::move( buffer ), handler, timeout );
+
+    return FileStateHandler::Write( pImpl->pStateHandler, offset, std::move( buffer ), handler, timeout );
+  }
+
+  //----------------------------------------------------------------------------
+  // Write a data chunk at a given offset - async
+  //----------------------------------------------------------------------------
+  XRootDStatus File::Write( uint64_t    offset,
+                            Buffer    &&buffer,
+                            uint16_t    timeout )
+  {
+    SyncResponseHandler handler;
+    XRootDStatus st = Write( offset, std::move( buffer ), &handler, timeout );
+    if( !st.IsOK() )
+      return st;
+
+    XRootDStatus status = MessageUtils::WaitForStatus( &handler );
+    return status;
+  }
+
+  //------------------------------------------------------------------------
+  // Write a data from a given file descriptor at a given offset - async
+  //------------------------------------------------------------------------
+  XRootDStatus File::Write( uint64_t            offset,
+                            uint32_t            size,
+                            Optional<uint64_t>  fdoff,
+                            int                 fd,
+                            ResponseHandler    *handler,
+                            uint16_t            timeout )
+  {
+    if( pPlugIn )
+      return pPlugIn->Write( offset, size, fdoff, fd, handler, timeout );
+
+    return FileStateHandler::Write( pImpl->pStateHandler, offset, size, fdoff, fd, handler, timeout );
+  }
+
+  //------------------------------------------------------------------------
+  // Write a data from a given file descriptor at a given offset - sync
+  //------------------------------------------------------------------------
+  XRootDStatus File::Write( uint64_t            offset,
+                            uint32_t            size,
+                            Optional<uint64_t>  fdoff,
+                            int                 fd,
+                            uint16_t            timeout )
+  {
+    SyncResponseHandler handler;
+    XRootDStatus st = Write( offset, size, fdoff, fd, &handler, timeout );
+    if( !st.IsOK() )
+      return st;
+
+    XRootDStatus status = MessageUtils::WaitForStatus( &handler );
+    return status;
+  }
+
+  //------------------------------------------------------------------------
+  // Write number of pages at a given offset - async
+  //------------------------------------------------------------------------
+  XRootDStatus File::PgWrite( uint64_t               offset,
+                              uint32_t               size,
+                              const void            *buffer,
+                              std::vector<uint32_t> &cksums,
+                              ResponseHandler       *handler,
+                              uint16_t               timeout )
+  {
+    if( pPlugIn )
+      return pPlugIn->PgWrite( offset, size, buffer, cksums, handler, timeout );
+
+    return FileStateHandler::PgWrite( pImpl->pStateHandler, offset, size, buffer, cksums, handler, timeout );
+  }
+
+  //------------------------------------------------------------------------
+  // Write number of pages at a given offset - sync
+  //------------------------------------------------------------------------
+  XRootDStatus File::PgWrite( uint64_t               offset,
+                              uint32_t               size,
+                              const void            *buffer,
+                              std::vector<uint32_t> &cksums,
+                              uint16_t               timeout )
+  {
+    SyncResponseHandler handler;
+    XRootDStatus st = PgWrite( offset, size, buffer, cksums, &handler, timeout );
     if( !st.IsOK() )
       return st;
 
@@ -259,7 +417,7 @@ namespace XrdCl
     if( pPlugIn )
       return pPlugIn->Sync( handler, timeout );
 
-    return pStateHandler->Sync( handler, timeout );
+    return FileStateHandler::Sync( pImpl->pStateHandler, handler, timeout );
   }
 
   //----------------------------------------------------------------------------
@@ -268,7 +426,7 @@ namespace XrdCl
   XRootDStatus File::Sync( uint16_t timeout )
   {
     SyncResponseHandler handler;
-    Status st = Sync( &handler, timeout );
+    XRootDStatus st = Sync( &handler, timeout );
     if( !st.IsOK() )
       return st;
 
@@ -286,7 +444,7 @@ namespace XrdCl
     if( pPlugIn )
       return pPlugIn->Truncate( size, handler, timeout );
 
-    return pStateHandler->Truncate( size, handler, timeout );
+    return FileStateHandler::Truncate( pImpl->pStateHandler, size, handler, timeout );
   }
 
 
@@ -296,7 +454,7 @@ namespace XrdCl
   XRootDStatus File::Truncate( uint64_t size, uint16_t timeout )
   {
     SyncResponseHandler handler;
-    Status st = Truncate( size, &handler, timeout );
+    XRootDStatus st = Truncate( size, &handler, timeout );
     if( !st.IsOK() )
       return st;
 
@@ -315,7 +473,7 @@ namespace XrdCl
     if( pPlugIn )
       return pPlugIn->VectorRead( chunks, buffer, handler, timeout );
 
-    return pStateHandler->VectorRead( chunks, buffer, handler, timeout );
+    return FileStateHandler::VectorRead( pImpl->pStateHandler, chunks, buffer, handler, timeout );
   }
 
   //----------------------------------------------------------------------------
@@ -327,7 +485,7 @@ namespace XrdCl
                                  uint16_t          timeout )
   {
     SyncResponseHandler handler;
-    Status st = VectorRead( chunks, buffer, &handler, timeout );
+    XRootDStatus st = VectorRead( chunks, buffer, &handler, timeout );
     if( !st.IsOK() )
       return st;
 
@@ -342,9 +500,9 @@ namespace XrdCl
                             uint16_t         timeout )
   {
     if( pPlugIn )
-      return XRootDStatus( stError, errNotSupported );
+      return pPlugIn->VectorWrite( chunks, handler, timeout );
 
-    return pStateHandler->VectorWrite( chunks, handler, timeout );
+    return FileStateHandler::VectorWrite( pImpl->pStateHandler, chunks, handler, timeout );
   }
 
   //------------------------------------------------------------------------
@@ -354,7 +512,7 @@ namespace XrdCl
                            uint16_t          timeout )
   {
     SyncResponseHandler handler;
-    Status st = VectorWrite( chunks, &handler, timeout );
+    XRootDStatus st = VectorWrite( chunks, &handler, timeout );
     if( !st.IsOK() )
       return st;
 
@@ -365,26 +523,27 @@ namespace XrdCl
   // Write scattered buffers in one operation - async
   //------------------------------------------------------------------------
   XRootDStatus File::WriteV( uint64_t            offset,
-                                  const struct iovec *iov,
-                                  int                 iovcnt,
-                                  ResponseHandler    *handler,
-                                  uint16_t            timeout )
+                             const struct iovec *iov,
+                             int                 iovcnt,
+                             ResponseHandler    *handler,
+                             uint16_t            timeout )
   {
-    // TODO check pPlugIn
+    if( pPlugIn )
+      return pPlugIn->WriteV( offset, iov, iovcnt, handler, timeout );
 
-    return pStateHandler->WriteV( offset, iov, iovcnt, handler, timeout );
+    return FileStateHandler::WriteV( pImpl->pStateHandler, offset, iov, iovcnt, handler, timeout );
   }
 
   //------------------------------------------------------------------------
   // Write scattered buffers in one operation - sync
   //------------------------------------------------------------------------
   XRootDStatus File::WriteV( uint64_t            offset,
-                                  const struct iovec *iov,
-                                  int                 iovcnt,
-                                  uint16_t            timeout )
+                             const struct iovec *iov,
+                             int                 iovcnt,
+                             uint16_t            timeout )
   {
     SyncResponseHandler handler;
-    Status st = WriteV( offset, iov, iovcnt, &handler, timeout );
+    XRootDStatus st = WriteV( offset, iov, iovcnt, &handler, timeout );
     if( !st.IsOK() )
       return st;
 
@@ -392,6 +551,57 @@ namespace XrdCl
     return status;
   }
 
+  //------------------------------------------------------------------------
+  //! Read data into scattered buffers in one operation - async
+  //!
+  //! @param offset    offset from the beginning of the file
+  //! @param iov       list of the buffers to be written
+  //! @param iovcnt    number of buffers
+  //! @param handler   handler to be notified when the response arrives
+  //! @param timeout   timeout value, if 0 then the environment default
+  //!                  will be used
+  //! @return          status of the operation
+  //------------------------------------------------------------------------
+  XRootDStatus File::ReadV( uint64_t         offset,
+                            struct iovec    *iov,
+                            int              iovcnt,
+                            ResponseHandler *handler,
+                            uint16_t         timeout )
+  {
+    return FileStateHandler::ReadV( pImpl->pStateHandler, offset, iov, iovcnt, handler, timeout );
+  }
+
+  //------------------------------------------------------------------------
+  //! Read data into scattered buffers in one operation - sync
+  //!
+  //! @param offset    offset from the beginning of the file
+  //! @param iov       list of the buffers to be written
+  //! @param iovcnt    number of buffers
+  //! @param handler   handler to be notified when the response arrives
+  //! @param timeout   timeout value, if 0 then the environment default
+  //!                  will be used
+  //! @return          status of the operation
+  //------------------------------------------------------------------------
+  XRootDStatus File::ReadV( uint64_t      offset,
+                            struct iovec *iov,
+                            int           iovcnt,
+                            uint32_t     &bytesRead,
+                            uint16_t      timeout )
+  {
+    SyncResponseHandler handler;
+    XRootDStatus st = ReadV( offset, iov, iovcnt, &handler, timeout );
+    if( !st.IsOK() )
+      return st;
+
+    VectorReadInfo *vrInfo = 0;
+    XRootDStatus status = MessageUtils::WaitForResponse( &handler, vrInfo );
+    if( status.IsOK() )
+    {
+      bytesRead = vrInfo->GetSize();
+      delete vrInfo;
+    }
+    return status;
+  }
 
   //----------------------------------------------------------------------------
   // Performs a custom operation on an open file, server implementation
@@ -404,7 +614,7 @@ namespace XrdCl
     if( pPlugIn )
       return pPlugIn->Fcntl( arg, handler, timeout );
 
-    return pStateHandler->Fcntl( arg, handler, timeout );
+    return FileStateHandler::Fcntl( pImpl->pStateHandler, arg, handler, timeout );
   }
 
   //----------------------------------------------------------------------------
@@ -416,7 +626,7 @@ namespace XrdCl
                             uint16_t          timeout )
   {
     SyncResponseHandler handler;
-    Status st = Fcntl( arg, &handler, timeout );
+    XRootDStatus st = Fcntl( arg, &handler, timeout );
     if( !st.IsOK() )
       return st;
 
@@ -432,7 +642,7 @@ namespace XrdCl
     if( pPlugIn )
       return pPlugIn->Visa( handler, timeout );
 
-    return pStateHandler->Visa( handler, timeout );
+    return FileStateHandler::Visa( pImpl->pStateHandler, handler, timeout );
   }
 
   //----------------------------------------------------------------------------
@@ -442,11 +652,192 @@ namespace XrdCl
                            uint16_t   timeout )
   {
     SyncResponseHandler handler;
-    Status st = Visa( &handler, timeout );
+    XRootDStatus st = Visa( &handler, timeout );
     if( !st.IsOK() )
       return st;
 
     return MessageUtils::WaitForResponse( &handler, visa );
+  }
+
+  //------------------------------------------------------------------------
+  // Set extended attributes - async
+  //------------------------------------------------------------------------
+  XRootDStatus File::SetXAttr( const std::vector<xattr_t>  &attrs,
+                               ResponseHandler             *handler,
+                               uint16_t                     timeout )
+  {
+    if( pPlugIn )
+      return XRootDStatus( stError, errNotSupported );
+
+    return FileStateHandler::SetXAttr( pImpl->pStateHandler, attrs, handler, timeout );
+  }
+
+  //------------------------------------------------------------------------
+  // Set extended attributes - sync
+  //------------------------------------------------------------------------
+  XRootDStatus File::SetXAttr( const std::vector<xattr_t>  &attrs,
+                               std::vector<XAttrStatus>    &result,
+                               uint16_t                     timeout )
+  {
+    SyncResponseHandler handler;
+    XRootDStatus st = SetXAttr( attrs, &handler, timeout );
+    if( !st.IsOK() )
+      return st;
+
+    std::vector<XAttrStatus> *resp = 0;
+    st = MessageUtils::WaitForResponse( &handler, resp );
+    if( resp ) result.swap( *resp );
+    delete resp;
+
+    return st;
+  }
+
+  //------------------------------------------------------------------------
+  // Get extended attributes - async
+  //------------------------------------------------------------------------
+  XRootDStatus File::GetXAttr( const std::vector<std::string>  &attrs,
+                               ResponseHandler                 *handler,
+                               uint16_t                         timeout )
+  {
+    if( pPlugIn )
+      return XRootDStatus( stError, errNotSupported );
+
+    return FileStateHandler::GetXAttr( pImpl->pStateHandler, attrs, handler, timeout );
+  }
+
+  //------------------------------------------------------------------------
+  // Get extended attributes - sync
+  //------------------------------------------------------------------------
+  XRootDStatus File::GetXAttr( const std::vector<std::string>  &attrs,
+                               std::vector<XAttr>              &result,
+                               uint16_t                         timeout )
+  {
+    SyncResponseHandler handler;
+    XRootDStatus st = GetXAttr( attrs, &handler, timeout );
+    if( !st.IsOK() )
+      return st;
+
+    std::vector<XAttr> *resp = 0;
+    st = MessageUtils::WaitForResponse( &handler, resp );
+    if( resp ) result.swap( *resp );
+    delete resp;
+
+    return st;
+  }
+
+  //------------------------------------------------------------------------
+  // Delete extended attributes - async
+  //------------------------------------------------------------------------
+  XRootDStatus File::DelXAttr( const std::vector<std::string>  &attrs,
+                               ResponseHandler                 *handler,
+                               uint16_t                         timeout )
+  {
+    if( pPlugIn )
+      return XRootDStatus( stError, errNotSupported );
+
+    return FileStateHandler::DelXAttr( pImpl->pStateHandler, attrs, handler, timeout );
+  }
+
+  //------------------------------------------------------------------------
+  // Delete extended attributes - sync
+  //------------------------------------------------------------------------
+  XRootDStatus File::DelXAttr( const std::vector<std::string>  &attrs,
+                               std::vector<XAttrStatus>        &result,
+                               uint16_t                         timeout )
+  {
+    SyncResponseHandler handler;
+    XRootDStatus st = DelXAttr( attrs, &handler, timeout );
+    if( !st.IsOK() )
+      return st;
+
+    std::vector<XAttrStatus> *resp = 0;
+    st = MessageUtils::WaitForResponse( &handler, resp );
+    if( resp ) result.swap( *resp );
+    delete resp;
+
+    return st;
+  }
+
+  //------------------------------------------------------------------------
+  // List extended attributes - async
+  //------------------------------------------------------------------------
+  XRootDStatus File::ListXAttr( ResponseHandler  *handler,
+                                uint16_t          timeout )
+  {
+    if( pPlugIn )
+      return XRootDStatus( stError, errNotSupported );
+
+    return FileStateHandler::ListXAttr( pImpl->pStateHandler, handler, timeout );
+  }
+
+  //------------------------------------------------------------------------
+  // List extended attributes - sync
+  //------------------------------------------------------------------------
+  XRootDStatus File::ListXAttr( std::vector<XAttr>  &result,
+                                uint16_t             timeout )
+  {
+    SyncResponseHandler handler;
+    XRootDStatus st = ListXAttr( &handler, timeout );
+    if( !st.IsOK() )
+      return st;
+
+    std::vector<XAttr> *resp = 0;
+    st = MessageUtils::WaitForResponse( &handler, resp );
+    if( resp ) result.swap( *resp );
+    delete resp;
+
+    return st;
+  }
+
+  //------------------------------------------------------------------------
+  // Create a checkpoint
+  //------------------------------------------------------------------------
+  XRootDStatus File::Checkpoint( kXR_char                  code,
+                                 ResponseHandler          *handler,
+                                 uint16_t                  timeout )
+  {
+    if( pPlugIn )
+      return XRootDStatus( stError, errNotSupported );
+
+    return FileStateHandler::Checkpoint( pImpl->pStateHandler, code, handler, timeout );
+  }
+
+  //------------------------------------------------------------------------
+  //! Checkpointed write - async
+  //------------------------------------------------------------------------
+  XRootDStatus File::ChkptWrt( uint64_t         offset,
+                               uint32_t         size,
+                               const void      *buffer,
+                               ResponseHandler *handler,
+                               uint16_t         timeout )
+  {
+    if( pPlugIn )
+      return XRootDStatus( stError, errNotSupported );
+
+    return FileStateHandler::ChkptWrt( pImpl->pStateHandler, offset, size, buffer, handler, timeout );
+  }
+
+  //------------------------------------------------------------------------
+  //! Checkpointed WriteV - async
+  //------------------------------------------------------------------------
+  XRootDStatus File::ChkptWrtV( uint64_t            offset,
+                                const struct iovec *iov,
+                                int                 iovcnt,
+                                ResponseHandler    *handler,
+                                uint16_t            timeout )
+  {
+    if( pPlugIn )
+      return XRootDStatus( stError, errNotSupported );
+
+    return FileStateHandler::ChkptWrtV( pImpl->pStateHandler, offset, iov, iovcnt, handler, timeout );
+  }
+
+  //------------------------------------------------------------------------
+  // Try different data server
+  //------------------------------------------------------------------------
+  XRootDStatus File::TryOtherServer( uint16_t timeout )
+  {
+    return FileStateHandler::TryOtherServer( pImpl->pStateHandler, timeout );
   }
 
   //----------------------------------------------------------------------------
@@ -457,7 +848,17 @@ namespace XrdCl
     if( pPlugIn )
       return pPlugIn->IsOpen();
 
-    return pStateHandler->IsOpen();
+    return pImpl->pStateHandler->IsOpen();
+  }
+
+  //------------------------------------------------------------------------
+  //! Check if the file is using an encrypted connection
+  //------------------------------------------------------------------------
+  bool File::IsSecure() const
+  {
+    if( pPlugIn )
+      return false;
+    return pImpl->pStateHandler->IsSecure();
   }
 
   //----------------------------------------------------------------------------
@@ -468,7 +869,7 @@ namespace XrdCl
     if( pPlugIn )
       return pPlugIn->SetProperty( name, value );
 
-    return pStateHandler->SetProperty( name, value );
+    return pImpl->pStateHandler->SetProperty( name, value );
   }
 
   //----------------------------------------------------------------------------
@@ -479,6 +880,6 @@ namespace XrdCl
     if( pPlugIn )
       return pPlugIn->GetProperty( name, value );
 
-    return pStateHandler->GetProperty( name, value );
+    return pImpl->pStateHandler->GetProperty( name, value );
   }
 }

@@ -27,20 +27,16 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <ctype.h>
-#include <errno.h>
+#include <cctype>
 #include <fcntl.h>
-#include <stdlib.h>
-#include <string.h>
-#include <stdio.h>
+#include <cstdlib>
+#include <cstring>
+#include <cstdio>
 #ifndef WIN32
 #include <poll.h>
 #include <unistd.h>
 #include <strings.h>
-#if !defined(__linux__) && !defined(__CYGWIN__)
-#ifdef __FreeBSD__
-#include <sys/param.h>
-#endif
+#if !defined(__linux__) && !defined(__CYGWIN__) && !defined(__GNU__) && !defined(__FreeBSD__)
 #include <sys/conf.h>
 #endif
 #include <sys/stat.h>
@@ -57,9 +53,11 @@
 
 #include "XrdOuc/XrdOucEnv.hh"
 #include "XrdOuc/XrdOucNSWalk.hh"
+#include "XrdOuc/XrdOucString.hh"
 #include "XrdOuc/XrdOucStream.hh"
 #include "XrdOuc/XrdOucTList.hh"
 #include "XrdOuc/XrdOucUtils.hh"
+#include "XrdSys/XrdSysE2T.hh"
 #include "XrdSys/XrdSysFD.hh"
 #include "XrdSys/XrdSysHeaders.hh"
 #include "XrdSys/XrdSysLogger.hh"
@@ -85,12 +83,18 @@
 
 // The following is used by child processes prior to exec() to avoid deadlocks
 //
-#define Erx(p, a, b) cerr <<#p <<": " <<strerror(a) <<' ' <<b <<endl;
+#define Erx(p, a, b) std::cerr <<#p <<": " <<XrdSysE2T(a) <<' ' <<b <<std::endl;
 
+/******************************************************************************/
+/*              S t a t i c   M e m b e r s   &   O b j e c t s               */
+/******************************************************************************/
+  
 // The following mutex is used to allow only one fork at a time so that
 // we do not leak file descriptors. It is a short-lived lock.
 //
 namespace {XrdSysMutex forkMutex;}
+
+XrdOucString *XrdOucStream::theCFG = 0;
 
 /******************************************************************************/
 /*                         L o c a l   C l a s s e s                          */
@@ -104,7 +108,8 @@ struct StreamInfo
        std::set<std::string> *fcList;
        std::set<std::string>::iterator itFC;
 
-       StreamInfo() : myHost(0), myName(0), myExec(0), fcList(0) {}
+       StreamInfo() : myHost(0), myName(0), myExec(0),
+                      fcList(0) {}
       ~StreamInfo() {if (fcList) delete fcList;}
       };
 
@@ -279,6 +284,39 @@ int XrdOucStream::Attach(int FileDescriptor, int bsz)
 }
   
 /******************************************************************************/
+/*                               C a p t u r e                                */
+/******************************************************************************/
+
+void XrdOucStream::Capture(const char **cVec, bool linefeed)
+{
+// Make sure we can handle this
+//
+   if (theCFG && cVec && cVec[0])
+      {if (linefeed) theCFG->append("\n# ");
+          else theCFG->append("# ");
+       int i = 0;
+       while(cVec[i]) theCFG->append(cVec[i++]);
+       theCFG->append('\n');
+      }
+}
+
+/******************************************************************************/
+
+XrdOucString *XrdOucStream::Capture(XrdOucString *newCFG)
+{
+   XrdOucString *oldCFG = theCFG;
+   theCFG = newCFG;
+   return oldCFG;
+}
+
+/******************************************************************************/
+
+XrdOucString *XrdOucStream::Capture()
+{
+   return theCFG;
+}
+
+/******************************************************************************/
 /*                                 C l o s e                                  */
 /******************************************************************************/
 
@@ -306,8 +344,11 @@ void XrdOucStream::Close(int hold)
 
     // Check if we should echo the last line
     //
-    if (llBuff && Verbose && Eroute)
-       {if (*llBuff && llBok > 1) Eroute->Say(llPrefix, llBuff);
+    if (llBuff)
+       {if (Verbose && *llBuff && llBok > 1)
+           {if (Eroute) Eroute->Say(llPrefix, llBuff);
+            if (theCFG) add2CFG(llBuff);
+           }
         llBok = 0;
        }
 
@@ -348,24 +389,29 @@ int XrdOucStream::Drain()
 /******************************************************************************/
 /*                                  E c h o                                   */
 /******************************************************************************/
-  
-bool XrdOucStream::Echo(int ec, const char *t1, const char *t2, const char *t3)
-{
-   if (Eroute)
-      {if (t1) Eroute->Emsg("Stream", t1, t2, t3);
-       if (llBok > 1 && Verbose && llBuff) Eroute->Say(llPrefix,llBuff);
-      }
-   ecode = ec;
-   llBok = 0;
-   return false;
-}
 
 void XrdOucStream::Echo()
 {
-   if (llBok > 1 && Verbose && llBuff && Eroute) Eroute->Say(llPrefix,llBuff);
+   if (llBok > 1 && Verbose && llBuff)
+      {if (Eroute) Eroute->Say(llPrefix,llBuff);
+       if (theCFG) add2CFG(llBuff);
+      }
    llBok = 0;
 }
 
+/******************************************************************************/
+/*                              E c h o O n l y                               */
+/******************************************************************************/
+
+void XrdOucStream::Echo(bool capture)
+{
+   if (llBok && Verbose && llBuff)
+      {if (Eroute) Eroute->Say(llPrefix,llBuff);
+       if (capture && theCFG) add2CFG(llBuff);
+      }
+   llBok = 0;
+}
+  
 /******************************************************************************/
 /*                               E   x   e   c                                */
 /******************************************************************************/
@@ -374,6 +420,9 @@ int XrdOucStream::Exec(const char *theCmd, int inrd, int efd)
 {
     int j;
     char *cmd, *origcmd, *parm[MaxARGC];
+
+    if (!theCmd)
+      return EINVAL;
 
     // Allocate a buffer for the command as we will be modifying it
     //
@@ -393,9 +442,9 @@ int XrdOucStream::Exec(const char *theCmd, int inrd, int efd)
 
     // Continue with normal processing
     //
-    j = Exec(parm, inrd, efd);
+    int ret = j > 0 ? Exec(parm, inrd, efd) : EINVAL;
     free(origcmd);
-    return j;
+    return ret;
 }
 
 int XrdOucStream::Exec(char **parm, int inrd, int efd)
@@ -457,7 +506,7 @@ int XrdOucStream::Exec(char **parm, int inrd, int efd)
        {if (inrd)
            {if (dup2(Child_in, STDIN_FILENO) < 0)
                {Erx(Exec, errno, "setting up standard in for " <<parm[0]);
-                exit(255);
+                _exit(255);
                } else if (Child_in != Child_out) close(Child_in);
            }
        }
@@ -467,7 +516,7 @@ int XrdOucStream::Exec(char **parm, int inrd, int efd)
     if (Child_out >= 0)
        {if (dup2(Child_out, STDOUT_FILENO) < 0)
            {Erx(Exec, errno, "setting up standard out for " <<parm[0]);
-            exit(255);
+            _exit(255);
            } else if (Child_out != Child_log) close(Child_out);
        }
 
@@ -476,7 +525,7 @@ int XrdOucStream::Exec(char **parm, int inrd, int efd)
     if (Child_log >= 0)
        {if (dup2(Child_log, STDERR_FILENO) < 0)
            {Erx(Exec, errno, "set up standard err for " <<parm[0]);
-            exit(255);
+            _exit(255);
            } else close(Child_log);
        }
 
@@ -495,7 +544,7 @@ int XrdOucStream::Exec(char **parm, int inrd, int efd)
     setpgid(0,0);
     execv(parm[0], parm);
     Erx(Exec, errno, "executing " <<parm[0]);
-    exit(255);
+    _exit(255);
 }
 
 /******************************************************************************/
@@ -528,8 +577,7 @@ char *XrdOucStream::GetLine()
   
    // There is no next record, so move up data in the buffer.
    //
-      strncpy(buff, bnext, bleft);
-      bnext = buff + bleft;
+      bnext = stpncpy(buff, bnext, bleft);
       }
       else bnext = buff;
 
@@ -679,7 +727,7 @@ char *XrdOucStream::GetMyFirstWord(int lowcase)
         if (var && !strcmp("fi",   var))
            {if (sawif) sawif = skpel = skip2fi = 0;
                else {if (Eroute)
-                        Eroute->Emsg("Stream", "No preceeding 'if' for 'fi'.");
+                        Eroute->Emsg("Stream", "No preceding 'if' for 'fi'.");
                      ecode = EINVAL;
                     }
             continue;
@@ -697,6 +745,11 @@ char *XrdOucStream::GetMyFirstWord(int lowcase)
 char *XrdOucStream::GetWord(int lowcase)
 {
      char *wp, *ep;
+
+     // A call means the first token was acceptable and we continuing to
+     // parse, hence the line is echoable.
+     //
+     if (llBok == 1) llBok = 2;
 
      // If we have a token, return it
      //
@@ -906,6 +959,17 @@ int XrdOucStream::Wait4Data(int msMax)
 /*                       P r i v a t e   M e t h o d s                        */
 /******************************************************************************/
 /******************************************************************************/
+/*                               a d d 2 C F G                                */
+/******************************************************************************/
+
+void XrdOucStream::add2CFG(const char *data, bool isCMT)
+{
+   if (isCMT) theCFG->append("# ");
+   theCFG->append(data);
+   theCFG->append('\n');
+}
+  
+/******************************************************************************/
 /*                               a d d 2 l l B                                */
 /******************************************************************************/
 
@@ -934,10 +998,25 @@ char *XrdOucStream::add2llB(char *tok, int reset)
 //
    if (tok)
       {tlen = strlen(tok);
-       if (tlen < llBsz)
+       if (tlen < llBleft)
           {strcpy(llBcur, tok); llBcur += tlen; llBleft -= tlen;}
       }
    return tok;
+}
+  
+/******************************************************************************/
+/*                                  E c h o                                   */
+/******************************************************************************/
+  
+bool XrdOucStream::Echo(int ec, const char *t1, const char *t2, const char *t3)
+{
+   if (Eroute)
+      {if (t1) Eroute->Emsg("Stream", t1, t2, t3);
+       if (llBok > 1 && Verbose && llBuff) Eroute->Say(llPrefix,llBuff);
+      }
+   ecode = ec;
+   llBok = 0;
+   return false;
 }
 
 /******************************************************************************/
@@ -1000,7 +1079,7 @@ bool XrdOucStream::docont(const char *path, XrdOucTList *tlP)
 // A continue directive in the context of a continuation is illegal
 //
    if ((myInfo && myInfo->fcList) || (flags & XrdOucStream_CONT) != 0)
-      return Echo(EINVAL, "'continue' is a continuation is not allowed.");
+      return Echo(EINVAL, "'continue' in a continuation is not allowed.");
 
 // Check if this file must exist (we also take care of empty paths)
 //
@@ -1021,7 +1100,7 @@ bool XrdOucStream::docont(const char *path, XrdOucTList *tlP)
       }
 
 // For directory continuation, there is much more to do (this can only happen
-// once). Note that we used to allow a limited number of chained fle
+// once). Note that we used to allow a limited number of chained file
 // continuations. No more, but we are still setup to easily do so.
 //
    if ((Stat.st_mode & S_IFMT) == S_IFDIR)
@@ -1078,7 +1157,7 @@ bool XrdOucStream::docontD(const char *path, XrdOucTList *tlP)
    if (myInfo->fcList->size() == 0)
       {delete myInfo->fcList;
        myInfo->fcList = 0;
-       return true;
+       return false;
       }
 
 // All done
@@ -1121,6 +1200,7 @@ bool XrdOucStream::docontF(const char *path, bool noentok)
 //
    if (Eroute) Eroute->Say("Config continuing with file ", path, " ...");
    bleft = 0;
+   close(cFD);
    return true;
 }
   
@@ -1135,7 +1215,7 @@ char *XrdOucStream::doelse()
 // An else must be preceeded by an if and not by a naked else
 //
    if (!sawif || sawif == 2)
-      {if (Eroute) Eroute->Emsg("Stream", "No preceeding 'if' for 'else'.");
+      {if (Eroute) Eroute->Emsg("Stream", "No preceding 'if' for 'else'.");
        ecode = EINVAL;
        return 0;
       }
@@ -1241,6 +1321,32 @@ char *XrdOucStream::doif()
 }
 
 /******************************************************************************/
+/*                              g e t V a l u e                               */
+/******************************************************************************/
+  
+int XrdOucStream::getValue(const char *path, char *vbuff, int  vbsz)
+{
+   struct stat Stat;
+   int n, rc = 0, vFD;
+
+// Make sure the file exists and it not too big
+//
+   if (stat(path, &Stat)) return errno;
+   if (Stat.st_size >= vbsz) return EFBIG;
+
+// Open the file and read it in
+//
+   if ((vFD = XrdSysFD_Open(path, O_RDONLY)) < 0) return errno;
+   if ((n = read(vFD, vbuff, vbsz-1)) >= 0) vbuff[n] = 0;
+      else rc = errno;
+
+// All done
+//
+   close(vFD);
+   return rc;
+}
+  
+/******************************************************************************/
 /*                                 i s S e t                                  */
 /******************************************************************************/
   
@@ -1249,8 +1355,9 @@ int XrdOucStream::isSet(char *var)
    static const char *Mtxt1[2] = {"setenv", "set"};
    static const char *Mtxt2[2] = {"Setenv variable", "Set variable"};
    static const char *Mtxt3[2] = {"Variable", "Environmental variable"};
-   char *tp, *vn, *vp, *pv, Vname[64], ec, Nil = 0;
-   int sawEQ, Set = 1;
+   char *tp, *vn, *vp, *pv, Vname[64] = "", ec, Nil = 0, sawIT = 0;
+   int Set = 1;
+   char valBuff[1024] = "";
 
 // Process set var = value | set -v | setenv = value
 //
@@ -1276,10 +1383,10 @@ int XrdOucStream::isSet(char *var)
       }
   }
 
-// Next may be var= | var | var=val
+// Next may be var= | var | var=val | var< | var<val
 //
-   if ((vp = index(tp, '='))) {sawEQ = 1; *vp = '\0'; vp++;}
-      else sawEQ = 0;
+   if ((vp = index(tp, '=')) || (vp = index(tp, '<')))
+      {sawIT = *vp; *vp = '\0'; vp++;}
    if (strlcpy(Vname, tp, sizeof(Vname)) >= sizeof(Vname))
       return xMsg(Mtxt2[Set],tp,"is too long.");
    if (!Set && !strncmp("XRD", Vname, 3))
@@ -1293,11 +1400,25 @@ int XrdOucStream::isSet(char *var)
 
 // Now look for the value
 //
-   if (sawEQ) tp = vp;
-      else if (!(tp = GetToken()) || *tp != '=')
+   if (sawIT) tp = vp;
+      else if (!(tp = GetToken()) || (*tp != '=' && *tp != '<'))
               return xMsg("Missing '=' after", Mtxt1[Set], Vname);
-              else tp++;
+              else {sawIT = *tp; tp++;}
    if (!*tp && !(tp = GetToken())) tp = (char *)"";
+
+// Handle reading value from a file
+//
+   if (sawIT == '<')
+      {int rc;
+       if (!*tp) return xMsg(Mtxt2[Set], Vname, "path to value not specified");
+       if ((rc = getValue(tp, valBuff, sizeof(valBuff))))
+          {char tbuff[512];
+           snprintf(tbuff, sizeof(tbuff), "cannot be set via path %s; %s",
+                    tp, XrdSysE2T(rc));
+           return xMsg(Mtxt2[Set], Vname, tbuff);
+          }
+       tp = valBuff;
+      }
 
 // The value may be '$var', in which case we need to get it out of the env if
 // this is a set or from our environment if this is a setenv

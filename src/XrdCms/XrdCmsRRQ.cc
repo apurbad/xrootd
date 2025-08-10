@@ -28,10 +28,10 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <string.h>
+#include <cstring>
 #include <sys/types.h>
 #include <netinet/in.h>
-#include <inttypes.h>
+#include <cinttypes>
 
 #include "XrdCms/XrdCmsCluster.hh"
 #include "XrdCms/XrdCmsNode.hh"
@@ -40,7 +40,7 @@
 #include "XrdCms/XrdCmsTrace.hh"
 #include "XrdSys/XrdSysError.hh"
 #include "XrdSys/XrdSysTimer.hh"
-#include <stdio.h>
+#include <cstdio>
 
 using namespace XrdCms;
 
@@ -360,7 +360,7 @@ void XrdCmsRRQ::sendRedResp(XrdCmsRRQSlot *rP)
 // EPNAME("sendRedResp");
    static const int ovhd = sizeof(kXR_unt32);
    XrdCmsNode *nP;
-   int doredir, port, hlen = 0;
+   int doredir = 0, port = 0, hlen = 0;
 
 // Determine where the client should be redirected
 //
@@ -402,7 +402,7 @@ void *XrdCmsRRQ::TimeOut()
 
 // We measure millisecond intervals to timeout waiting requests. We used to zero
 // out arg1/2 to force expiration, but they would be zero anyway if no responses
-// occurred. Now with qdn we need to leave them alone as we may have defered
+// occurred. Now with qdn we need to leave them alone as we may have deferred
 // a fast dispatch because we were waiting for more than one responder.
 //
    while(1)

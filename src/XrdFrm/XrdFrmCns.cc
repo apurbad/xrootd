@@ -28,20 +28,21 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <errno.h>
+#include <cerrno>
 #include <poll.h>
 #include <unistd.h>
 #include <sys/param.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
-#include <stdio.h>
+#include <cstdio>
 
 #include "XrdFrc/XrdFrcTrace.hh"
 #include "XrdFrm/XrdFrmCns.hh"
 #include "XrdFrm/XrdFrmConfig.hh"
 #include "XrdOuc/XrdOucSxeq.hh"
 #include "XrdOuc/XrdOucUtils.hh"
+#include "XrdSys/XrdSysPlatform.hh"
 #include "XrdSys/XrdSysPthread.hh"
 #include "XrdSys/XrdSysTimer.hh"
 

@@ -27,8 +27,8 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <stdio.h>
-#include <string.h>
+#include <cstdio>
+#include <cstring>
 #include <sys/types.h>
 
 #include "XProtocol/XProtocol.hh"
@@ -116,7 +116,7 @@ bool               isActive;
 char *XrdSsiUtils::b2x(const char *ibuff, int ilen, char *obuff, int olen,
                              char xbuff[4])
 {
-    static char hv[] = "0123456789abcdef";
+    static const char hv[] = "0123456789abcdef";
     char *oP = obuff;
 
     // Gaurd against too short of an output buffer (minimum if 3 bytes)
@@ -210,19 +210,7 @@ int XrdSsiUtils::GetErr(XrdCl::XRootDStatus &Status, std::string &eText)
 
 int XrdSsiUtils::MapErr(int xEnum)
 {
-    switch(xEnum)
-       {case kXR_NotFound:      return ENOENT;
-        case kXR_NotAuthorized: return EACCES;
-        case kXR_IOError:       return EIO;
-        case kXR_NoMemory:      return ENOMEM;
-        case kXR_NoSpace:       return ENOSPC;
-        case kXR_ArgTooLong:    return ENAMETOOLONG;
-        case kXR_noserver:      return EHOSTUNREACH;
-        case kXR_NotFile:       return ENOTBLK;
-        case kXR_isDirectory:   return EISDIR;
-        case kXR_FSError:       return ENOSYS;
-        default:                return ECANCELED;
-       }
+    return XProtocol::mapError(xEnum);
 }
 
 /******************************************************************************/

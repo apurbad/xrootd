@@ -30,17 +30,22 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
+#include <vector>
+
 #include "XrdCms/XrdCmsClient.hh"
 
 class  XrdAccAuthorize;
 class  XrdCks;
 class  XrdCksConfig;
 class  XrdOfs;
+class  XrdOfsFSctl_PI;
 class  XrdOfsPrepare;
 class  XrdOss;
 class  XrdOucEnv;
 class  XrdOucStream;
+class  XrdSfsFileSystem;
 class  XrdSysError;
+class  XrdSysXAttr;
 struct XrdVersionInfo;
 
 //-----------------------------------------------------------------------------
@@ -65,10 +70,11 @@ enum TheLib {theAtrLib = 0x0100,  //!< Extended attribute plugin
              theAutLib = 0x0201,  //!< Authorization plugin
              theCksLib = 0x0402,  //!< Checksum manager plugin
              theCmsLib = 0x0803,  //!< Cms client plugin
-             theOssLib = 0x1004,  //!< Oss plugin
-             thePrpLib = 0x2005,  //!< Prp plugin (prepare)
-             allXXXLib = 0x3f06,  //!< All plugins (Load() only)
-             maxXXXLib = 0x0006,  //!< Maximum different plugins
+             theCtlLib = 0x1004,  //!< Ctl plugin (FSCtl)
+             theOssLib = 0x2005,  //!< Oss plugin
+             thePrpLib = 0x4006,  //!< Prp plugin (prepare)
+             allXXXLib = 0x7f07,  //!< All plugins (Load() only)
+             maxXXXLib = 0x0007,  //!< Maximum different plugins
              libIXMask = 0x00ff
             };
 
@@ -83,6 +89,15 @@ enum TheLib {theAtrLib = 0x0100,  //!< Extended attribute plugin
 //-----------------------------------------------------------------------------
 
 bool   Configure(XrdCmsClient *cmscP, XrdOucEnv *envP);
+
+//-----------------------------------------------------------------------------
+//! Configure the fsctl plugin.
+//!
+//! @param   cmscP   Pointer to the cms plugin.
+//! @param   envP    Pointer to the environment.
+//-----------------------------------------------------------------------------
+
+bool   ConfigCtl(XrdCmsClient *cmscP, XrdOucEnv *envP=0);
 
 //-----------------------------------------------------------------------------
 //! Set the default plugin path and parms. This method may be called before or
@@ -115,14 +130,13 @@ void   Display();
 //!
 //! @param   what    A "or" combination of TheLib enums specifying which
 //!                  plugins need to be loaded.
-//! @param   ofsP    Pointer to the ofs plugin requesting he load.
 //! @param   envP    Pointer to the environment normally passed to the default
 //!                  oss plugin at load time.
 //!
 //! @return          true upon success and false upon failure.
 //-----------------------------------------------------------------------------
 
-bool   Load(int what, XrdOfs *ofsP=0, XrdOucEnv *envP=0);
+bool   Load(int what, XrdOucEnv *envP=0);
 
 //-----------------------------------------------------------------------------
 //! Obtain an instance of this class (note that the constructor is private).
@@ -134,6 +148,7 @@ bool   Load(int what, XrdOfs *ofsP=0, XrdOucEnv *envP=0);
 //!                  If zero, the version information of this object is used.
 //!                  Generally, if the creator resides in a different shared
 //!                  library, the creator's version should be supplied.
+//! @param   sfsP    Pointer to file system doing the loading, if applicable.
 //!
 //! @return          Pointer to an instance of this class. If the pointer is
 //!                  nil, either the caller's version is incompatible or
@@ -142,7 +157,7 @@ bool   Load(int what, XrdOfs *ofsP=0, XrdOucEnv *envP=0);
 
 static
 XrdOfsConfigPI *New(const char *cfn, XrdOucStream *cfgP, XrdSysError *errP,
-                    XrdVersionInfo *verP=0);
+                    XrdVersionInfo *verP=0, XrdSfsFileSystem *sfsP=0);
 
 //-----------------------------------------------------------------------------
 //! Check if the checksum plugin runs on tghe local node irrespective of type.
@@ -181,6 +196,7 @@ bool   Parse(TheLib what);
 bool   Plugin(XrdAccAuthorize *&piP);    //!< Get Authorization plugin
 bool   Plugin(XrdCks          *&pip);    //!< Get Checksum manager plugin
 bool   Plugin(XrdCmsClient_t   &piP);    //!< Get Cms client object generator
+bool   Plugin(XrdOfsFSctl_PI  *&piP);    //!< Get Ctl plugin
 bool   Plugin(XrdOfsPrepare   *&piP);    //!< Get Prp plugin (prepare)
 bool   Plugin(XrdOss          *&piP);    //!< Get Oss plugin
 
@@ -191,6 +207,18 @@ bool   Plugin(XrdOss          *&piP);    //!< Get Oss plugin
 //-----------------------------------------------------------------------------
 
 bool   PrepAuth();
+
+//-----------------------------------------------------------------------------
+//! Push a plugin on top of eixsting plugins to be loaded.
+//!
+//! @param   what    The enum specifying which plugin to push.
+//! @param   plugP   Pointer to the name or path of the shared library
+//! @param   parmP   Pointer to library parameters, if any.
+//!
+//! @return  True upon success, false if plugin is not pushable.
+//-----------------------------------------------------------------------------
+
+bool   Push(TheLib what, const char *plugP, const char *parmP=0);
 
 //-----------------------------------------------------------------------------
 //! Set the checksum read size
@@ -214,6 +242,7 @@ private:
 //! @param   cfn     Pointer to the configuration file name.
 //! @param   cfgP    Pointer to the stream that reads the configuration file.
 //! @param   errP    Pointer to the error message object that routes messages.
+//! @param   sfsP    Pointer to the file system plugin (i.e. caller).
 //! @param   verP    Pointer to the version information of the object creator.
 //!                  If zero, the version information of this object is used.
 //!                  Generally, if the creator resides in a different shared
@@ -221,23 +250,32 @@ private:
 //-----------------------------------------------------------------------------
 
        XrdOfsConfigPI(const char *cfn, XrdOucStream *cfgP, XrdSysError *errP,
-                      XrdVersionInfo *verP=0);
+                      XrdSfsFileSystem *sfsP, XrdVersionInfo *verP=0);
 
+bool          AddLib(TheLib what);
+bool          AddLibAtr(XrdOucEnv *envP, XrdSysXAttr *&atrPI);
+bool          AddLibAut(XrdOucEnv *envP);
+bool          AddLibCtl(XrdOucEnv *envP);
+bool          AddLibOss(XrdOucEnv *envP);
+bool          AddLibPrp(XrdOucEnv *envP);
 bool          ParseAtrLib();
 bool          ParseOssLib();
 bool          ParsePrpLib();
 bool          RepLib(TheLib what, const char *newLib, const char *newParms=0, bool parseParms=true);
-bool          SetupAttr(TheLib what);
-bool          SetupAuth();
+bool          SetupAttr(TheLib what, XrdOucEnv *envP);
+bool          SetupAuth(XrdOucEnv *envP);
+bool          SetupCtl(XrdOucEnv *envP);
 bool          SetupCms();
-bool          SetupPrp(XrdOfs *ofsP, XrdOucEnv *envP);
+bool          SetupPrp(XrdOucEnv *envP);
 
-XrdAccAuthorize *autPI;    //!< -> Authorization plugin
-XrdCks          *cksPI;    //!< -> Checksum manager plugin
-XrdCmsClient_t   cmsPI;    //!< -> Cms client object generator plugin
-XrdOfsPrepare   *prpPI;    //!< -> Prp plugin (prepare)
-XrdOss          *ossPI;    //!< -> Oss plugin
-XrdVersionInfo  *urVer;    //!< -> Version information
+XrdAccAuthorize  *autPI;    //!< -> Authorization plugin
+XrdCks           *cksPI;    //!< -> Checksum manager plugin
+XrdCmsClient_t    cmsPI;    //!< -> Cms client object generator plugin
+XrdOfsFSctl_PI   *ctlPI;    //!< -> Ctl plugin (FSCtl)
+XrdOfsPrepare    *prpPI;    //!< -> Prp plugin (prepare)
+XrdOss           *ossPI;    //!< -> Oss plugin
+XrdSfsFileSystem *sfsPI;    //!< -> Ofs plugin
+XrdVersionInfo   *urVer;    //!< -> Version information
 
 XrdOucStream *Config;
 XrdSysError  *Eroute;
@@ -253,12 +291,29 @@ struct xxxLP
                        if (parms) free(parms);
                        if (opts)  free(opts);
                       }
+              xxxLP& operator=(const xxxLP& rhs)
+                      {if (this != &rhs)
+                          {lib   = (rhs.lib   ? strdup(rhs.lib)   : 0);
+                           parms = (rhs.parms ? strdup(rhs.parms) : 0);
+                           opts  = (rhs.opts  ? strdup(rhs.opts)  : 0);
+                          }
+                       return *this;
+                      }
+              xxxLP(const xxxLP& rhs) {*this = rhs;}
+
       }       LP[maxXXXLib];
+std::vector<xxxLP> ALP[maxXXXLib];
+
+struct ctlLP {XrdOfsFSctl_PI *ctlPI; const char *parms;};
+
+std::vector<ctlLP> ctlVec;
+
 char         *CksAlg;
 int           CksRdsz;
+bool          pushOK[maxXXXLib];
 bool          defLib[maxXXXLib];
 bool          ossXAttr;
-bool          ossCksio;
+char          ossCksio;
 bool          prpAuth;
 bool          Loaded;
 bool          LoadOK;

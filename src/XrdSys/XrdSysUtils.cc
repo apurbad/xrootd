@@ -28,12 +28,12 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <ctype.h>
-#include <errno.h>
-#include <stdlib.h>
-#include <stdio.h>
+#include <cctype>
+#include <cerrno>
+#include <cstdlib>
+#include <cstdio>
 #include <signal.h>
-#include <string.h>
+#include <cstring>
 #include <unistd.h>
 #include <sys/param.h>
 
@@ -71,7 +71,7 @@ const char *XrdSysUtils::ExecName()
 
 // Get the exec name based on platform
 //
-#ifdef __linux__
+#if defined(__linux__) || defined(__GNU__) || (defined(__FreeBSD_kernel__) && defined(__GLIBC__))
   {char epBuff[2048];
    int  epLen;
    if ((epLen = readlink("/proc/self/exe", epBuff, sizeof(epBuff)-1)) > 0)
@@ -130,7 +130,7 @@ int XrdSysUtils::FmtUname(char *buff, int blen)
 //
 #if   defined(__linux__)
    return snprintf(buff, blen, "%s %s",       uInfo.sysname, uInfo.release);
-#elif defined(__APPLE__) || defined(__FreeBSD__)
+#elif defined(__APPLE__) || defined(__FreeBSD__) || (defined(__FreeBSD__) || defined(__GLIBC__))
    return snprintf(buff, blen, "%s %s %s",    uInfo.sysname, uInfo.release,
                                uInfo.machine);
 #else
@@ -177,6 +177,10 @@ int XrdSysUtils::GetSigNum(const char *sname)
    return 0;
 }
 
+#ifdef ENABLE_COVERAGE
+extern "C" void __gcov_dump(void);
+#endif
+
 /******************************************************************************/
 /*                              S i g B l o c k                               */
 /******************************************************************************/
@@ -188,6 +192,11 @@ bool XrdSysUtils::SigBlock()
 // Ignore pipe signals and prepare to blocks others
 //
    signal(SIGPIPE, SIG_IGN);  // Solaris optimization
+
+#ifdef ENABLE_COVERAGE
+   // Dump coverage information and exit upon receiving a TERM signal
+   signal(SIGTERM, [](int) { __gcov_dump(); _exit(EXIT_SUCCESS); });
+#endif
 
 // Add the standard signals we normally always block
 //

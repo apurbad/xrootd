@@ -27,11 +27,10 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <errno.h>
-#include <inttypes.h>
+#include <cinttypes>
 #include <netinet/in.h>
-#include <stdarg.h>
-#include <string.h>
+#include <cstdarg>
+#include <cstring>
 #include <sys/types.h>
 #include <sys/uio.h>
 
@@ -39,8 +38,10 @@
 #define COMMON_DIGEST_FOR_OPENSSL
 #include "CommonCrypto/CommonDigest.h"
 #else
-#include "openssl/sha.h"
+#include <openssl/sha.h>
 #endif
+
+#include <openssl/evp.h>
 
 #include "XrdVersion.hh"
 
@@ -49,9 +50,25 @@
 #include "XrdSec/XrdSecProtect.hh"
 #include "XrdSec/XrdSecProtector.hh"
 #include "XrdSys/XrdSysAtomics.hh"
+#include "XrdSys/XrdSysE2T.hh"
 #include "XrdSys/XrdSysPlatform.hh"
 #include "XrdSys/XrdSysPthread.hh"
   
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
+static EVP_MD_CTX* EVP_MD_CTX_new() {
+  EVP_MD_CTX *ctx = (EVP_MD_CTX *)OPENSSL_malloc(sizeof(EVP_MD_CTX));
+  if (ctx) EVP_MD_CTX_init(ctx);
+  return ctx;
+}
+
+static void EVP_MD_CTX_free(EVP_MD_CTX *ctx) {
+  if (ctx) {
+    EVP_MD_CTX_cleanup(ctx);
+    OPENSSL_free(ctx);
+  }
+}
+#endif
+
 /******************************************************************************/
 /*                      S t r u c t   X r d S e c R e q                       */
 /******************************************************************************/
@@ -106,24 +123,25 @@ namespace
 
 XrdSecVec secTable(0,
 //             Compatible      Standard        Intense         Pedantic
-kXR_admin,     kXR_signNeeded, kXR_signNeeded, kXR_signNeeded, kXR_signNeeded, 
 kXR_auth,      kXR_signIgnore, kXR_signIgnore, kXR_signIgnore, kXR_signIgnore, 
 kXR_bind,      kXR_signIgnore, kXR_signIgnore, kXR_signNeeded, kXR_signNeeded,
 kXR_chmod,     kXR_signNeeded, kXR_signNeeded, kXR_signNeeded, kXR_signNeeded, 
+kXR_chkpoint,  kXR_signNeeded, kXR_signNeeded, kXR_signNeeded, kXR_signNeeded,
 kXR_close,     kXR_signIgnore, kXR_signIgnore, kXR_signNeeded, kXR_signNeeded,
-kXR_decrypt,   kXR_signIgnore, kXR_signIgnore, kXR_signIgnore, kXR_signIgnore, 
 kXR_dirlist,   kXR_signIgnore, kXR_signIgnore, kXR_signIgnore, kXR_signNeeded,
 kXR_endsess,   kXR_signIgnore, kXR_signIgnore, kXR_signNeeded, kXR_signNeeded,
-kXR_getfile,   kXR_signNeeded, kXR_signNeeded, kXR_signNeeded, kXR_signNeeded, 
+kXR_fattr,     kXR_signNeeded, kXR_signNeeded, kXR_signNeeded, kXR_signNeeded,
+kXR_gpfile,    kXR_signNeeded, kXR_signNeeded, kXR_signNeeded, kXR_signNeeded,
 kXR_locate,    kXR_signIgnore, kXR_signIgnore, kXR_signIgnore, kXR_signNeeded,
 kXR_login,     kXR_signIgnore, kXR_signIgnore, kXR_signIgnore, kXR_signIgnore, 
 kXR_mkdir,     kXR_signIgnore, kXR_signNeeded, kXR_signNeeded, kXR_signNeeded,
 kXR_mv,        kXR_signNeeded, kXR_signNeeded, kXR_signNeeded, kXR_signNeeded, 
 kXR_open,      kXR_signLikely, kXR_signNeeded, kXR_signNeeded, kXR_signNeeded, 
+kXR_pgread,    kXR_signIgnore, kXR_signIgnore, kXR_signNeeded, kXR_signNeeded,
+kXR_pgwrite,   kXR_signIgnore, kXR_signIgnore, kXR_signNeeded, kXR_signNeeded,
 kXR_ping,      kXR_signIgnore, kXR_signIgnore, kXR_signIgnore, kXR_signIgnore, 
 kXR_prepare,   kXR_signIgnore, kXR_signIgnore, kXR_signIgnore, kXR_signNeeded,
 kXR_protocol,  kXR_signIgnore, kXR_signIgnore, kXR_signIgnore, kXR_signIgnore, 
-kXR_putfile,   kXR_signNeeded, kXR_signNeeded, kXR_signNeeded, kXR_signNeeded, 
 kXR_query,     kXR_signIgnore, kXR_signIgnore, kXR_signLikely, kXR_signNeeded,
 kXR_read,      kXR_signIgnore, kXR_signIgnore, kXR_signIgnore, kXR_signNeeded,
 kXR_readv,     kXR_signIgnore, kXR_signIgnore, kXR_signIgnore, kXR_signNeeded,
@@ -135,7 +153,6 @@ kXR_stat,      kXR_signIgnore, kXR_signIgnore, kXR_signIgnore, kXR_signNeeded,
 kXR_statx,     kXR_signIgnore, kXR_signIgnore, kXR_signIgnore, kXR_signNeeded,
 kXR_sync,      kXR_signIgnore, kXR_signIgnore, kXR_signIgnore, kXR_signNeeded,
 kXR_truncate,  kXR_signNeeded, kXR_signNeeded, kXR_signNeeded, kXR_signNeeded, 
-kXR_verifyw,   kXR_signIgnore, kXR_signIgnore, kXR_signNeeded, kXR_signNeeded,
 kXR_write,     kXR_signIgnore, kXR_signIgnore, kXR_signNeeded, kXR_signNeeded,
 0);
 }
@@ -146,22 +163,30 @@ kXR_write,     kXR_signIgnore, kXR_signIgnore, kXR_signNeeded, kXR_signNeeded,
 
 bool XrdSecProtect::GetSHA2(unsigned char *hBuff, struct iovec *iovP, int iovN)
 {
-   SHA256_CTX sha256;
+   bool ret = false;
+   EVP_MD_CTX *mdctx = EVP_MD_CTX_new();
+   const EVP_MD *md = EVP_get_digestbyname("sha256");
 
 // Initialize the hash calculattion
 //
-   if (0 == SHA256_Init(&sha256)) return false;
+   if (1 != EVP_DigestInit_ex(mdctx, md, 0)) goto err;
 
 // Go through the iovec updating the hash
 //
    for (int i = 0; i < iovN; i++)
-       {if (1 != SHA256_Update(&sha256, iovP[i].iov_base, iovP[i].iov_len))
-           return false;
-       }
+   {
+      if (1 != EVP_DigestUpdate(mdctx, iovP[i].iov_base, iovP[i].iov_len))
+         goto err;
+   }
 
 // Compute final hash and return result
 //
-  return (1 == SHA256_Final(hBuff, &sha256));
+   if (1 != EVP_DigestFinal_ex(mdctx, hBuff, 0)) goto err;
+
+   ret = true;
+ err:
+   EVP_MD_CTX_free (mdctx);
+   return ret;
 }
 
 /******************************************************************************/
@@ -259,7 +284,7 @@ int XrdSecProtect::Secure(SecurityRequest *&newreq,
       {kXR_unt16 reqid = htons(thereq.header.requestid);
        paysize = ntohl(thereq.header.dlen);
        if (!payload) payload = ((char *)&thereq) + sizeof(ClientRequest);
-       if (reqid == kXR_write || reqid == kXR_verifyw) n = (secVerData ? 3 : 2);
+       if (reqid == kXR_write || reqid == kXR_pgwrite) n = (secVerData ? 3 : 2);
           else n = 3;
       }   else n = 2;
 
@@ -387,7 +412,7 @@ const char *XrdSecProtect::Verify(SecurityRequest  &secreq,
    unsigned char *inHash, secHash[SHA256_DIGEST_LENGTH];
    int           dlen, n, rc;
 
-// First check for replay attacks. The incomming sequence number must be greater
+// First check for replay attacks. The incoming sequence number must be greater
 // the previous one we have seen. Since it is in network byte order we can use
 // a simple byte for byte compare (no need for byte swapping).
 //
@@ -417,7 +442,7 @@ const char *XrdSecProtect::Verify(SecurityRequest  &secreq,
 //
    if (edOK)
       {rc = authProt->Decrypt((const char *)inHash, dlen, &myReq.bP);
-       if (rc < 0) return strerror(-rc);
+       if (rc < 0) return XrdSysE2T(-rc);
        if (myReq.bP->size != (int)sizeof(secHash))
           return "Invalid signature hash length";
        inHash = (unsigned char *)myReq.bP->buffer;

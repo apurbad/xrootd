@@ -24,14 +24,18 @@
 #include "XrdCl/XrdClFileSystem.hh"
 #include "XProtocol/XProtocol.hh"
 
+#include "XrdSys/XrdSysE2T.hh"
+#include "XrdSys/XrdSysXAttr.hh"
+#include "XrdSys/XrdSysFAttr.hh"
+#include "XrdSys/XrdSysFD.hh"
+
 #include <string>
 #include <memory>
 #include <stdexcept>
-#include <iostream>
 
 #include <fcntl.h>
-#include <stdio.h>
-#include <stdlib.h>
+#include <cstdio>
+#include <cstdlib>
 #include <unistd.h>
 #include <sys/stat.h>
 #include <arpa/inet.h>
@@ -134,7 +138,7 @@ namespace
           newact.sa_flags = SA_SIGINFO;
           int rc = sigaction( SIGUSR1, &newact, &oldact );
           if( rc < 0 )
-            throw std::runtime_error( strerror( errno ) );
+            throw std::runtime_error( XrdSysE2T( errno ) );
         }
       };
 
@@ -148,11 +152,10 @@ namespace
         int rc = aio_return( me->cb.get() );
         if( rc < 0 )
         {
+          int errcode = aio_error( me->cb.get() );
           Log *log = DefaultEnv::GetLog();
-          log->Error( FileMsg, GetErrMsg( me->opcode ), strerror( errno ) );
-          XRootDStatus *error = new XRootDStatus( stError, errErrorResponse,
-                                                  XProtocol::mapError( errno ),
-                                                  strerror( errno ) );
+          log->Error( FileMsg, GetErrMsg( me->opcode ), XrdSysE2T( errcode ) );
+          XRootDStatus *error = new XRootDStatus( stError, errLocalError, errcode ) ;
           QueueTask( error, 0, me->hosts, me->handler );
         }
         else
@@ -161,8 +164,7 @@ namespace
 
           if( me->opcode == Opcode::Read )
           {
-            ChunkInfo *chunk = new ChunkInfo( me->cb->aio_offset,
-                                              rc,
+            ChunkInfo *chunk = new ChunkInfo( me->cb->aio_offset, rc,
                                               const_cast<void*>( me->cb->aio_buf ) );
             resp = new AnyObject();
             resp->Set( chunk );
@@ -197,17 +199,13 @@ namespace
 
         // if it is simply the sync handler we can release the semaphore
         // and return there is no need to execute this in the thread-pool
-        SyncResponseHandler *syncHandler =
-            dynamic_cast<SyncResponseHandler*>( handler );
-        if( syncHandler )
-        {
+        if(SyncResponseHandler *syncHandler = dynamic_cast<SyncResponseHandler*>( handler )) {
           syncHandler->HandleResponse( status, resp );
-        }
-        else
-        {
-          JobManager *jmngr = DefaultEnv::GetPostMaster()->GetJobManager();
-          LocalFileTask *task = new LocalFileTask( status, resp, hosts, handler );
-          jmngr->QueueJob( task );
+        } else if(auto postmaster = DefaultEnv::GetPostMaster()) {
+          if (JobManager *jmngr = postmaster->GetJobManager()) {
+            LocalFileTask *task = new LocalFileTask( status, resp, hosts, handler );
+            jmngr->QueueJob( task );
+          }
         }
       }
       
@@ -228,7 +226,6 @@ namespace XrdCl
   LocalFileHandler::LocalFileHandler() :
       fd( -1 )
   {
-    jmngr = DefaultEnv::GetPostMaster()->GetJobManager();
   }
 
   //------------------------------------------------------------------------
@@ -247,7 +244,7 @@ namespace XrdCl
   {
     AnyObject *resp = 0;
     XRootDStatus st = OpenImpl( url, flags, mode, resp );
-    if( !st.IsOK() && st.code != errErrorResponse )
+    if( !st.IsOK() && st.code != errLocalError )
       return st;
 
     return QueueTask( new XRootDStatus( st ), resp, handler );
@@ -271,10 +268,8 @@ namespace XrdCl
     if( close( fd ) == -1 )
     {
       Log *log = DefaultEnv::GetLog();
-      log->Error( FileMsg, "Close: file fd: %i %s", fd, strerror( errno ) );
-      XRootDStatus *error = new XRootDStatus( stError, errErrorResponse,
-                                              XProtocol::mapError( errno ),
-                                              strerror( errno ) );
+      log->Error( FileMsg, "Close: file fd: %i %s", fd, XrdSysE2T( errno ) );
+      XRootDStatus *error = new XRootDStatus( stError, errLocalError, errno );
       return QueueTask( error, 0, handler );
     }
 
@@ -292,23 +287,21 @@ namespace XrdCl
     struct stat ssp;
     if( fstat( fd, &ssp ) == -1 )
     {
-      log->Error( FileMsg, "Stat: failed fd: %i %s", fd, strerror( errno ) );
-      XRootDStatus *error = new XRootDStatus( stError, errErrorResponse,
-                                              XProtocol::mapError( errno ),
-                                              strerror( errno ) );
+      log->Error( FileMsg, "Stat: failed fd: %i %s", fd, XrdSysE2T( errno ) );
+      XRootDStatus *error = new XRootDStatus( stError, errLocalError, errno );
       return QueueTask( error, 0, handler );
     }
     std::ostringstream data;
     data << ssp.st_dev << " " << ssp.st_size << " " << ssp.st_mode << " "
         << ssp.st_mtime;
-    log->Debug( FileMsg, data.str().c_str() );
+    log->Debug( FileMsg, "%s", data.str().c_str() );
 
     StatInfo *statInfo = new StatInfo();
     if( !statInfo->ParseServerResponse( data.str().c_str() ) )
     {
       log->Error( FileMsg, "Stat: ParseServerResponse failed." );
       delete statInfo;
-      return QueueTask( new XRootDStatus( stError, errErrorResponse, kXR_FSError ),
+      return QueueTask( new XRootDStatus( stError, errLocalError, kXR_FSError ),
                         0, handler );
     }
 
@@ -328,10 +321,8 @@ namespace XrdCl
     int read = 0;
     if( ( read = pread( fd, buffer, size, offset ) ) == -1 )
     {
-      log->Error( FileMsg, "Read: failed %s", strerror( errno ) );
-      XRootDStatus *error = new XRootDStatus( stError, errErrorResponse,
-                                              XProtocol::mapError( errno ),
-                                              strerror( errno ) );
+      log->Error( FileMsg, "Read: failed %s", XrdSysE2T( errno ) );
+      XRootDStatus *error = new XRootDStatus( stError, errLocalError, errno );
       return QueueTask( error, 0, handler );
     }
     ChunkInfo *chunk = new ChunkInfo( offset, read, buffer );
@@ -347,13 +338,53 @@ namespace XrdCl
     if( rc < 0 )
     {
       Log *log = DefaultEnv::GetLog();
-      log->Error( FileMsg, "Read: failed %s", strerror( errno ) );
-      return XRootDStatus( stError, errOSError, XProtocol::mapError( rc ),
-                           strerror( errno ) );
+      log->Error( FileMsg, "Read: failed %s", XrdSysE2T( errno ) );
+      return XRootDStatus( stError, errLocalError, errno );
     }
 
     return XRootDStatus();
 #endif
+  }
+
+
+  //------------------------------------------------------------------------
+  // ReadV
+  //------------------------------------------------------------------------
+  XRootDStatus LocalFileHandler::ReadV( uint64_t         offset,
+                                        struct iovec    *iov,
+                                        int              iovcnt,
+                                        ResponseHandler *handler,
+                                        uint16_t         timeout )
+  {
+    Log *log = DefaultEnv::GetLog();
+#if defined(__APPLE__)
+    ssize_t ret = lseek( fd, offset, SEEK_SET );
+    if( ret >= 0 )
+      ret = readv( fd, iov, iovcnt );
+#else
+    ssize_t ret = preadv( fd, iov, iovcnt, offset );
+#endif
+    if( ret == -1 )
+    {
+      log->Error( FileMsg, "ReadV: failed %s", XrdSysE2T( errno ) );
+      XRootDStatus *error = new XRootDStatus( stError, errLocalError, errno );
+      return QueueTask( error, 0, handler );
+    }
+    VectorReadInfo *info = new VectorReadInfo();
+    info->SetSize( ret );
+    uint64_t choff = offset;
+    uint32_t left  = ret;
+    for( int i = 0; i < iovcnt; ++i )
+    {
+      uint32_t chlen = iov[i].iov_len;
+      if( chlen > left ) chlen = left;
+      info->GetChunks().emplace_back( choff, chlen, iov[i].iov_base);
+      left  -= chlen;
+      choff += chlen;
+    }
+    AnyObject *resp = new AnyObject();
+    resp->Set( info );
+    return QueueTask( new XRootDStatus(), resp, handler );
   }
 
   //------------------------------------------------------------------------
@@ -371,10 +402,8 @@ namespace XrdCl
       if( ret < 0 )
       {
         Log *log = DefaultEnv::GetLog();
-        log->Error( FileMsg, "Write: failed %s", strerror( errno ) );
-        XRootDStatus *error = new XRootDStatus( stError, errErrorResponse,
-                                                XProtocol::mapError( errno ),
-                                                strerror( errno ) );
+        log->Error( FileMsg, "Write: failed %s", XrdSysE2T( errno ) );
+        XRootDStatus *error = new XRootDStatus( stError, errLocalError, errno );
         return QueueTask( error, 0, handler );
       }
       offset += ret;
@@ -391,9 +420,8 @@ namespace XrdCl
     if( rc < 0 )
     {
       Log *log = DefaultEnv::GetLog();
-      log->Error( FileMsg, "Write: failed %s", strerror( errno ) );
-      return XRootDStatus( stError, errOSError, XProtocol::mapError( rc ),
-                           strerror( errno ) );
+      log->Error( FileMsg, "Write: failed %s", XrdSysE2T( errno ) );
+      return XRootDStatus( stError, errLocalError, errno );
     }
 
     return XRootDStatus();
@@ -410,12 +438,13 @@ namespace XrdCl
     if( fsync( fd ) )
     {
       Log *log = DefaultEnv::GetLog();
-      log->Error( FileMsg, "Sync: failed %s", strerror( errno ) );
+      log->Error( FileMsg, "Sync: failed %s", XrdSysE2T( errno ) );
       XRootDStatus *error = new XRootDStatus( stError, errOSError,
                                               XProtocol::mapError( errno ),
-                                              strerror( errno ) );
+                                              XrdSysE2T( errno ) );
       return QueueTask( error, 0, handler );
     }
+    return QueueTask( new XRootDStatus(), 0, handler );
 #else
     AioCtx *ctx = new AioCtx( pHostList, handler );
     ctx->SetFsync( fd );
@@ -423,9 +452,8 @@ namespace XrdCl
     if( rc < 0 )
     {
       Log *log = DefaultEnv::GetLog();
-      log->Error( FileMsg, "Sync: failed %s", strerror( errno ) );
-      return XRootDStatus( stError, errOSError, XProtocol::mapError( rc ),
-                           strerror( errno ) );
+      log->Error( FileMsg, "Sync: failed %s", XrdSysE2T( errno ) );
+      return XRootDStatus( stError, errLocalError, errno );
     }
 #endif
     return XRootDStatus();
@@ -441,10 +469,8 @@ namespace XrdCl
     {
       Log *log = DefaultEnv::GetLog();
       log->Error( FileMsg, "Truncate: failed, file descriptor: %i, %s", fd,
-                  strerror( errno ) );
-      XRootDStatus *error = new XRootDStatus( stError, errErrorResponse,
-                                              XProtocol::mapError( errno ),
-                                              strerror( errno ) );
+                  XrdSysE2T( errno ) );
+      XRootDStatus *error = new XRootDStatus( stError, errLocalError, errno );
       return QueueTask( error, 0, handler );
     }
 
@@ -472,10 +498,8 @@ namespace XrdCl
       {
         Log *log = DefaultEnv::GetLog();
         log->Error( FileMsg, "VectorRead: failed, file descriptor: %i, %s",
-                    fd, strerror( errno ) );
-        XRootDStatus *error = new XRootDStatus( stError, errErrorResponse,
-                                                XProtocol::mapError( errno ),
-                                                strerror( errno ) );
+                    fd, XrdSysE2T( errno ) );
+        XRootDStatus *error = new XRootDStatus( stError, errLocalError, errno );
         return QueueTask( error, 0, handler );
       }
       totalSize += bytesRead;
@@ -506,10 +530,8 @@ namespace XrdCl
       {
         Log *log = DefaultEnv::GetLog();
         log->Error( FileMsg, "VectorWrite: failed, file descriptor: %i, %s",
-                    fd, strerror( errno ) );
-        XRootDStatus *error = new XRootDStatus( stError, errErrorResponse,
-                                                XProtocol::mapError( errno ),
-                                                strerror( errno ) );
+                    fd, XrdSysE2T( errno ) );
+        XRootDStatus *error = new XRootDStatus( stError, errLocalError, errno );
         return QueueTask( error, 0, handler );
       }
     }
@@ -549,10 +571,8 @@ namespace XrdCl
       if( ret < 0 )
       {
         Log *log = DefaultEnv::GetLog();
-        log->Error( FileMsg, "WriteV: failed %s", strerror( errno ) );
-        XRootDStatus *error = new XRootDStatus( stError, errErrorResponse,
-                                                XProtocol::mapError( errno ),
-                                                strerror( errno ) );
+        log->Error( FileMsg, "WriteV: failed %s", XrdSysE2T( errno ) );
+        XRootDStatus *error = new XRootDStatus( stError, errLocalError, errno );
         return QueueTask( error, 0, handler );
       }
 
@@ -596,6 +616,147 @@ namespace XrdCl
   }
 
   //------------------------------------------------------------------------
+  // Set extended attributes - async
+  //------------------------------------------------------------------------
+  XRootDStatus LocalFileHandler::SetXAttr( const std::vector<xattr_t> &attrs,
+                                           ResponseHandler            *handler,
+                                           uint16_t                    timeout )
+  {
+    XrdSysXAttr *xattr = XrdSysFAttr::Xat;
+    std::vector<XAttrStatus> response;
+
+    auto itr = attrs.begin();
+    for( ; itr != attrs.end(); ++itr )
+    {
+      std::string name  = std::get<xattr_name>( *itr );
+      std::string value = std::get<xattr_value>( *itr );
+      int err = xattr->Set( name.c_str(), value.c_str(), value.size(), 0, fd );
+      XRootDStatus status = err < 0 ? XRootDStatus( stError, errLocalError, -err ) :
+                                  XRootDStatus();
+
+      response.push_back( XAttrStatus( name, status ) );
+    }
+
+    AnyObject *resp = new AnyObject();
+    resp->Set( new std::vector<XAttrStatus>( std::move( response ) ) );
+
+    return QueueTask( new XRootDStatus(), resp, handler );
+  }
+
+  //------------------------------------------------------------------------
+  // Get extended attributes - async
+  //------------------------------------------------------------------------
+  XRootDStatus LocalFileHandler::GetXAttr( const std::vector<std::string> &attrs,
+                                           ResponseHandler                *handler,
+                                           uint16_t                        timeout )
+  {
+    XrdSysXAttr *xattr = XrdSysFAttr::Xat;
+    std::vector<XAttr> response;
+
+    auto itr = attrs.begin();
+    for( ; itr != attrs.end(); ++itr )
+    {
+      std::string name  = *itr;
+      std::unique_ptr<char[]> buffer;
+
+      int size = xattr->Get( name.c_str(), 0, 0, 0, fd );
+      if( size < 0 )
+      {
+        XRootDStatus status( stError, errLocalError, -size );
+        response.push_back( XAttr( *itr, "", status ) );
+        continue;
+      }
+      buffer.reset( new char[size] );
+      int ret = xattr->Get( name.c_str(), buffer.get(), size, 0, fd );
+
+      XRootDStatus status;
+      std::string  value;
+
+      if( ret >= 0 )
+        value.append( buffer.get(), ret );
+      else if( ret < 0 )
+        status = XRootDStatus( stError, errLocalError, -ret );
+
+      response.push_back( XAttr( *itr, value, status ) );
+    }
+
+    AnyObject *resp = new AnyObject();
+    resp->Set( new std::vector<XAttr>( std::move( response ) ) );
+
+    return QueueTask( new XRootDStatus(), resp, handler );
+  }
+
+  //------------------------------------------------------------------------
+  // Delete extended attributes - async
+  //------------------------------------------------------------------------
+  XRootDStatus LocalFileHandler::DelXAttr( const std::vector<std::string> &attrs,
+                                           ResponseHandler                *handler,
+                                           uint16_t                        timeout )
+  {
+    XrdSysXAttr *xattr = XrdSysFAttr::Xat;
+    std::vector<XAttrStatus> response;
+
+    auto itr = attrs.begin();
+    for( ; itr != attrs.end(); ++itr )
+    {
+      std::string name = *itr;
+      int err = xattr->Del( name.c_str(), 0, fd );
+      XRootDStatus status = err < 0 ? XRootDStatus( stError, errLocalError, -err ) :
+                                      XRootDStatus();
+
+      response.push_back( XAttrStatus( name, status ) );
+    }
+
+    AnyObject *resp = new AnyObject();
+    resp->Set( new std::vector<XAttrStatus>( std::move( response ) ) );
+
+    return QueueTask( new XRootDStatus(), resp, handler );
+  }
+
+  //------------------------------------------------------------------------
+  // List extended attributes - async
+  //------------------------------------------------------------------------
+  XRootDStatus LocalFileHandler::ListXAttr( ResponseHandler  *handler,
+                                            uint16_t          timeout )
+  {
+    XrdSysXAttr *xattr = XrdSysFAttr::Xat;
+    std::vector<XAttr> response;
+
+    XrdSysXAttr::AList *alist = 0;
+    int err = xattr->List( &alist, 0, fd, 1 );
+
+    if( err < 0 )
+    {
+      XRootDStatus *status = new XRootDStatus( stError, XProtocol::mapError( -err ) );
+      return QueueTask( status, 0, handler );
+    }
+
+    XrdSysXAttr::AList *ptr = alist;
+    while( ptr )
+    {
+      std::string name( ptr->Name, ptr->Nlen );
+      int vlen = ptr->Vlen;
+      ptr = ptr->Next;
+
+      std::unique_ptr<char[]> buffer( new char[vlen] );
+      int ret = xattr->Get( name.c_str(),
+                            buffer.get(), vlen, 0, fd );
+
+      std::string value = ret >= 0 ? std::string( buffer.get(), ret ) :
+                                     std::string();
+      XRootDStatus status = ret >= 0 ? XRootDStatus() :
+                                       XRootDStatus( stError, errLocalError, -ret );
+      response.push_back( XAttr( name, value, status ) );
+    }
+    xattr->Free( alist );
+
+    AnyObject *resp = new AnyObject();
+    resp->Set( new std::vector<XAttr>( std::move( response ) ) );
+
+    return QueueTask( new XRootDStatus(), resp, handler );
+  }
+
+  //------------------------------------------------------------------------
   // QueueTask - queues error/success tasks for all operations.
   // Must always return stOK.
   // Is always creating the same HostList containing only localhost.
@@ -605,17 +766,16 @@ namespace XrdCl
   {
     // if it is simply the sync handler we can release the semaphore
     // and return there is no need to execute this in the thread-pool
-    SyncResponseHandler *syncHandler =
-        dynamic_cast<SyncResponseHandler*>( handler );
-    if( syncHandler )
-    {
+    if (SyncResponseHandler *syncHandler = dynamic_cast<SyncResponseHandler*>(handler)) {
       syncHandler->HandleResponse( st, resp );
       return XRootDStatus();
     }
 
-    HostList *hosts = pHostList.empty() ? 0 : new HostList( pHostList );
-    LocalFileTask *task = new LocalFileTask( st, resp, hosts, handler );
-    jmngr->QueueJob( task );
+    if (auto postmaster = DefaultEnv::GetPostMaster()) {
+      HostList *hosts = pHostList.empty() ? 0 : new HostList( pHostList );
+      LocalFileTask *task = new LocalFileTask( st, resp, hosts, handler );
+      postmaster->GetJobManager()->QueueJob( task );
+    }
     return XRootDStatus();
   }
 
@@ -634,9 +794,7 @@ namespace XrdCl
       int rc = lstat( tmp.c_str(), &st );
       if( rc == 0 ) break;
       if( errno != ENOENT )
-        return XRootDStatus( stError, errErrorResponse,
-                             XProtocol::mapError( errno ),
-                             strerror( errno ) );
+        return XRootDStatus( stError, errLocalError, errno );
       pos = path.rfind( '/', pos - 1 );
     }
 
@@ -647,9 +805,7 @@ namespace XrdCl
       if( mkdir( tmp.c_str(), 0755 ) )
       {
         if( errno != EEXIST )
-          return XRootDStatus( stError, errErrorResponse,
-                               XProtocol::mapError( errno ),
-                               strerror( errno ) );
+          return XRootDStatus( stError, errLocalError, errno );
       }
       pos = path.find( '/', pos + 1 );
     }
@@ -688,13 +844,13 @@ namespace XrdCl
     if( flags & kXR_delete )
       openflags |= O_CREAT | O_TRUNC;
 
-    if( flags & kXR_mkdir )
+    if( flags & (kXR_mkpath | kXR_async) )
     {
       XRootDStatus st = MkdirPath( path );
       if( !st.IsOK() )
       {
         log->Error( FileMsg, "Open MkdirPath failed %s: %s", path.c_str(),
-                    strerror( st.errNo ) );
+                    XrdSysE2T( st.errNo ) );
         return st;
       }
 
@@ -703,16 +859,15 @@ namespace XrdCl
     // Open File
     //---------------------------------------------------------------------
     if( mode == Access::Mode::None)
-      mode = 0600;
-    fd = open( path.c_str(), openflags, mode );
+      mode = 0644;
+    fd = XrdSysFD_Open( path.c_str(), openflags, mode );
     if( fd == -1 )
     {
       log->Error( FileMsg, "Open: open failed: %s: %s", path.c_str(),
-                  strerror( errno ) );
+                  XrdSysE2T( errno ) );
 
-      return XRootDStatus( stError, errErrorResponse,
-                           XProtocol::mapError( errno ),
-                           strerror( errno ) );
+      return XRootDStatus( stError, errLocalError,
+                           XProtocol::mapError( errno ) );
     }
     //---------------------------------------------------------------------
     // Stat File and cache statInfo in openInfo
@@ -721,9 +876,8 @@ namespace XrdCl
     if( fstat( fd, &ssp ) == -1 )
     {
       log->Error( FileMsg, "Open: stat failed." );
-      return XRootDStatus( stError, errErrorResponse,
-                           XProtocol::mapError( errno ),
-                           strerror( errno ) );
+      return XRootDStatus( stError, errLocalError,
+                           XProtocol::mapError( errno ) );
     }
 
     std::ostringstream data;
@@ -735,7 +889,7 @@ namespace XrdCl
     {
       log->Error( FileMsg, "Open: ParseServerResponse failed." );
       delete statInfo;
-      return XRootDStatus( stError, errErrorResponse, kXR_FSError );
+      return XRootDStatus( stError, errLocalError, kXR_FSError );
     }
 
     // add the URL to hosts list
@@ -746,6 +900,98 @@ namespace XrdCl
     OpenInfo *openInfo = new OpenInfo( (uint8_t*)&ufd, 1, statInfo );
     resp = new AnyObject();
     resp->Set( openInfo );
+    return XRootDStatus();
+  }
+
+  //------------------------------------------------------------------------
+  // Parses kXR_fattr request and calls respective XAttr operation
+  //------------------------------------------------------------------------
+  XRootDStatus LocalFileHandler::XAttrImpl( kXR_char          code,
+                                            kXR_char          numattr,
+                                            size_t         bodylen,
+                                            char             *body,
+                                            ResponseHandler  *handler )
+  {
+    // shift body by 1 to omit the empty path
+    if( bodylen > 0 )
+    {
+      ++body;
+      --bodylen;
+    }
+
+    switch( code )
+    {
+      case kXR_fattrGet:
+      case kXR_fattrDel:
+      {
+        std::vector<std::string> attrs;
+        // parse namevec
+        for( kXR_char i = 0; i < numattr; ++i )
+        {
+          if( bodylen < sizeof( kXR_unt16 ) ) return XRootDStatus( stError, errDataError );
+          // shift by RC size
+          body    += sizeof( kXR_unt16 );
+          bodylen -= sizeof( kXR_unt16 );
+          // get the size of attribute name
+          size_t len = strlen( body );
+          if( len > bodylen ) return XRootDStatus( stError, errDataError );
+          attrs.push_back( std::string( body, len ) );
+          body    += len + 1; // +1 for the null terminating the string
+          bodylen -= len + 1; // +1 for the null terminating the string
+        }
+
+        if( code == kXR_fattrGet )
+          return GetXAttr( attrs, handler );
+
+        return DelXAttr( attrs, handler );
+      }
+
+      case kXR_fattrSet:
+      {
+        std::vector<xattr_t> attrs;
+        // parse namevec
+        for( kXR_char i = 0; i < numattr; ++i )
+        {
+          if( bodylen < sizeof( kXR_unt16 ) ) return XRootDStatus( stError, errDataError );
+          // shift by RC size
+          body    += sizeof( kXR_unt16 );
+          bodylen -= sizeof( kXR_unt16 );
+          // get the size of attribute name
+          char *name = 0;
+          body = ClientFattrRequest::NVecRead( body, name );
+          attrs.push_back( std::make_tuple( std::string( name ), std::string() ) );
+          bodylen -= strlen( name ) + 1; // +1 for the null terminating the string
+          free( name );
+        }
+        // parse valuevec
+        for( kXR_char i = 0; i < numattr; ++i )
+        {
+          // get value length
+          if( bodylen < sizeof( kXR_int32 ) ) return XRootDStatus( stError, errDataError );
+          kXR_int32 len = 0;
+          body = ClientFattrRequest::VVecRead( body, len );
+          bodylen -= sizeof( kXR_int32 );
+          // get value
+          if( size_t( len ) > bodylen ) return XRootDStatus( stError, errDataError );
+          char *value = 0;
+          body = ClientFattrRequest::VVecRead( body, len, value );
+          bodylen -= len;
+          std::get<xattr_value>( attrs[i] ) = value;
+          free( value );
+        }
+
+        return SetXAttr( attrs, handler );
+      }
+
+      case kXR_fattrList:
+      {
+        return ListXAttr( handler );
+      }
+
+      default:
+        return XRootDStatus( stError, errInvalidArgs );
+    }
+
     return XRootDStatus();
   }
 
@@ -778,6 +1024,19 @@ namespace XrdCl
 
       case kXR_read:
       {
+        if( msg->GetVirtReqID() == kXR_virtReadv )
+        {
+          auto &chunkList = *sendParams.chunkList;
+          struct iovec iov[chunkList.size()];
+          for( size_t i = 0; i < chunkList.size() ; ++i )
+          {
+            iov[i].iov_base = chunkList[i].buffer;
+            iov[i].iov_len  = chunkList[i].length;
+          }
+          return ReadV( chunkList.front().offset, iov, chunkList.size(),
+                        handler, sendParams.timeout );
+        }
+
         return Read( req->read.offset, req->read.rlen,
                      sendParams.chunkList->front().buffer,
                      handler, sendParams.timeout );
@@ -818,6 +1077,12 @@ namespace XrdCl
       {
         return VectorRead( *sendParams.chunkList, 0,
                            handler, sendParams.timeout );
+      }
+
+      case kXR_fattr:
+      {
+        return XAttrImpl( req->fattr.subcode, req->fattr.numattr, req->fattr.dlen,
+                          msg->GetBuffer( sizeof(ClientRequestHdr ) ), handler );
       }
 
       default:

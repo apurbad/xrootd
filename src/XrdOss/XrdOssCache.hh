@@ -30,9 +30,10 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <time.h>
+#include <ctime>
 #include <sys/stat.h>
 #include "XrdOuc/XrdOucDLlist.hh"
+#include "XrdOss/XrdOssVS.hh"
 #include "XrdSys/XrdSysError.hh"
 #include "XrdSys/XrdSysPthread.hh"
 
@@ -47,7 +48,7 @@
 #define FS_BLKSZ f_frsize
 #define FS_FFREE f_favail
 #endif
-#ifdef __linux__
+#if defined(__linux__) || defined(__GNU__) || (defined(__FreeBSD_kernel__) && defined(__GLIBC__))
 #include <sys/vfs.h>
 #define FS_Stat(a,b) statfs(a,b)
 #define STATFS_t struct statfs
@@ -111,9 +112,12 @@ long long           size;
 long long           frsz;
 dev_t               fsid;
 const char         *path;
+const char         *pact;
+const char         *devN;
 time_t              updt;
 int                 stat;
-unsigned int        seen;
+unsigned short      bdevID;
+unsigned short      partID;
 
        XrdOssCache_FSData(const char *, STATFS_t &, dev_t);
       ~XrdOssCache_FSData() {if (path) free((void *)path);}
@@ -143,8 +147,11 @@ XrdOssCache_Group  *fsgroup;
 static int          Add(const char *Path);
 static long long    freeSpace(long long         &Size,  const char *path=0);
 static long long    freeSpace(XrdOssCache_Space &Space, const char *path);
-static int          getSpace( XrdOssCache_Space &Space, const char *sname);
-static int          getSpace( XrdOssCache_Space &Space, XrdOssCache_Group *fsg);
+
+static int          getSpace( XrdOssCache_Space &Space, const char *sname,
+                              XrdOssVSPart **vsPart=0);
+static int          getSpace( XrdOssCache_Space &Space, XrdOssCache_Group *fsg,
+                              XrdOssVSPart **vsPart=0);
 
        XrdOssCache_FS(      int  &retc,
                       const char *fsg,
@@ -153,6 +160,17 @@ static int          getSpace( XrdOssCache_Space &Space, XrdOssCache_Group *fsg);
       ~XrdOssCache_FS() {if (group) free((void *)group);
                          if (path)  free((void *)path);
                         }
+};
+
+/******************************************************************************/
+/*                      X r d O s s C a c h e _ F S A P                       */
+/******************************************************************************/
+  
+struct XrdOssCache_FSAP
+{
+XrdOssCache_FSData  *fsP;   // Pointer to partition
+const char         **apVec; // Allocation root paths in this partition (nil end)
+int                  apNum;
 };
 
 /******************************************************************************/
@@ -165,19 +183,25 @@ class XrdOssCache_Group
 {
 public:
 
-XrdOssCache_Group *next;
-char              *group;
-XrdOssCache_FS    *curr;
-long long          Usage;
-long long          Quota;
-int                GRPid;
-static long long   PubQuota;
+XrdOssCache_Group   *next;
+char                *group;
+XrdOssCache_FS      *curr;
+XrdOssCache_FSAP    *fsVec; // Partitions where space may be allocated
+long long            Usage;
+long long            Quota;
+int                  GRPid;
+short                fsNum;
+short                rsvd;
+static
+XrdOssCache_Group   *PubGroup;
+static long long     PubQuota;
 
 static XrdOssCache_Group *fsgroups;
 
        XrdOssCache_Group(const char *grp, XrdOssCache_FS *fsp=0) 
-                        : next(0), group(strdup(grp)), curr(fsp), Usage(0),
-                          Quota(-1), GRPid(-1) {}
+                        : next(0), group(strdup(grp)), curr(fsp), fsVec(0),
+                          Usage(0), Quota(-1), GRPid(-1), fsNum(0), rsvd(0)
+                        {if (!strcmp("public", grp)) PubGroup = this;}
       ~XrdOssCache_Group() {if (group) free((void *)group);}
 };
   
@@ -215,13 +239,18 @@ struct allocInfo
 
 static int             Alloc(allocInfo &aInfo);
 
+static void            DevInfo(struct stat &buf, bool limits=false);
+
 static XrdOssCache_FS *Find(const char *Path, int lklen=0);
 
-static int             Init(const char *UDir, const char *Qfile, int isSOL);
+static int             Init(const char *UDir, const char *Qfile,
+                            int isSOL, int usync=0);
 
 static int             Init(long long aMin, int ovhd, int aFuzz);
 
 static void            List(const char *lname, XrdSysError &Eroute);
+
+static void            MapDevs(bool dBug=false);
 
 static char           *Parse(const char *token, char *cbuff, int cblen);
 
@@ -243,6 +272,7 @@ static XrdOssCache_FSData *fsdata;   // -> Filesystem data
 static int                 fsCount;  // Number of file systems
 
 private:
+static bool MapDM(const char *ldm, char *buff, int blen);
 
 static long long           minAlloc;
 static double              fuzAlloc;

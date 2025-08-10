@@ -1,10 +1,10 @@
 
-#include <regex>
 #include <cstring>
 #include <string>
 #include <iostream>
+#include <sstream>
 
-#include "uuid.h"
+#include <uuid/uuid.h>
 #include "json.h"
 #include "macaroons.h"
 
@@ -14,6 +14,8 @@
 #include "XrdSec/XrdSecEntity.hh"
 
 #include "XrdMacaroonsHandler.hh"
+
+#include "XrdOuc/XrdOucTUtils.hh"
 
 using namespace Macaroons;
 
@@ -51,6 +53,27 @@ char *unquote(const char *str) {
 
 }
 
+
+std::string Macaroons::NormalizeSlashes(const std::string &input)
+{
+    std::string output;
+      // In most cases, the output should be "about as large"
+      // as the input
+    output.reserve(input.size());
+    char prior_chr = '\0';
+    size_t output_idx = 0;
+    for (size_t idx = 0; idx < input.size(); idx++) {
+        char chr = input[idx];
+        if (prior_chr == '/' && chr == '/') {
+            output_idx++;
+            continue;
+        }
+        output += input[output_idx];
+        prior_chr = chr;
+        output_idx++;
+    }
+    return output;
+}
 
 static
 ssize_t determine_validity(const std::string& input)
@@ -117,9 +140,15 @@ Handler::GenerateID(const std::string &resource,
     uuid_unparse(uu, uuid_buf);
     std::string result(uuid_buf);
 
+// The following code shoul have been strictly for debugging purposes. This
+// added code skips it unless debug logging has been enabled. Due to the code
+// structure, indentation is a bit of a struggle as this is a minimal fix.
+//
+if (m_log->getMsgMask() & LogMask::Debug)
+   {
     std::stringstream ss;
     ss << "ID=" << result << ", ";
-    ss << "resource=" << resource << ", ";
+    ss << "resource=" << NormalizeSlashes(resource) << ", ";
     if (entity.prot[0] != '\0') {ss << "protocol=" << entity.prot << ", ";}
     if (entity.name) {ss << "name=" << entity.name << ", ";}
     if (entity.host) {ss << "host=" << entity.host << ", ";}
@@ -138,7 +167,8 @@ Handler::GenerateID(const std::string &resource,
 
     ss << "expires=" << before;
 
-    m_log->Emsg("MacaroonGen", ss.str().c_str());
+    m_log->Emsg("MacaroonGen", ss.str().c_str());  // Mask::Debug
+   }
     return result;
 }
 
@@ -174,7 +204,7 @@ int Handler::ProcessOAuthConfig(XrdHttpExtReq &req) {
     {
         return req.SendSimpleResp(405, NULL, NULL, "Only GET is valid for oauth config.", 0);
     }
-    auto header = req.headers.find("Host");
+    auto header = XrdOucTUtils::caseInsensitiveFind(req.headers,"host");
     if (header == req.headers.end())
     {
         return req.SendSimpleResp(400, NULL, NULL, "Host header is required.", 0);
@@ -207,7 +237,7 @@ int Handler::ProcessTokenRequest(XrdHttpExtReq &req)
     {
         return req.SendSimpleResp(405, NULL, NULL, "Only POST is valid for token request.", 0);
     }
-    auto header = req.headers.find("Content-Type");
+    auto header = XrdOucTUtils::caseInsensitiveFind(req.headers,"content-type");
     if (header == req.headers.end())
     {
         return req.SendSimpleResp(400, NULL, NULL, "Content-Type missing; not a valid macaroon request?", 0);
@@ -299,11 +329,13 @@ int Handler::ProcessTokenRequest(XrdHttpExtReq &req)
         }
         else if (value != path)
         {
+         if (m_log->getMsgMask() & LogMask::Error) {
             std::stringstream ss;
             ss << "Encountered requested scope request for authorization " << key
                << " with resource path " << value << "; however, prior request had path "
                << path;
-            m_log->Emsg("MacaroonRequest", ss.str().c_str());
+            m_log->Emsg("MacaroonRequest", ss.str().c_str()); // Mask::Error
+            }
             return req.SendSimpleResp(500, NULL, NULL, "Server only supports all scopes having the same path", 0);
         }
         other_caveats.push_back(key);
@@ -338,7 +370,7 @@ int Handler::ProcessReq(XrdHttpExtReq &req)
         return ProcessTokenRequest(req);
     }
 
-    auto header = req.headers.find("Content-Type");
+    auto header = XrdOucTUtils::caseInsensitiveFind(req.headers,"content-type");
     if (header == req.headers.end())
     {
         return req.SendSimpleResp(400, NULL, NULL, "Content-Type missing; not a valid macaroon request?", 0);
@@ -347,7 +379,7 @@ int Handler::ProcessReq(XrdHttpExtReq &req)
     {
         return req.SendSimpleResp(400, NULL, NULL, "Content-Type must be set to `application/macaroon-request' to request a macaroon", 0);
     }
-    header = req.headers.find("Content-Length");
+    header = XrdOucTUtils::caseInsensitiveFind(req.headers,"content-length");
     if (header == req.headers.end())
     {
         return req.SendSimpleResp(400, NULL, NULL, "Content-Length missing; not a valid POST", 0);
@@ -513,6 +545,10 @@ Handler::GenerateMacaroonResponse(XrdHttpExtReq &req, const std::string &resourc
         }
     }
 
+    // Note we don't call `NormalizeSlashes` here; for backward compatibility reasons, we ensure the
+    // token issued is identical to what was working with prior versions of XRootD.  This allows for a
+    // mix of old/new versions in a single cluster to interoperate.  In a few years, it might be reasonable
+    // to invoke it here as well.
     std::string path_caveat = "path:" + resource;
     struct macaroon *mac_with_path = macaroon_add_first_party_caveat(mac_with_activities,
                                                  reinterpret_cast<const unsigned char*>(path_caveat.c_str()),
@@ -534,10 +570,10 @@ Handler::GenerateMacaroonResponse(XrdHttpExtReq &req, const std::string &resourc
 
     size_t size_hint = macaroon_serialize_size_hint(mac_with_date);
 
-    std::vector<char> macaroon_resp; macaroon_resp.reserve(size_hint);
+    std::vector<char> macaroon_resp; macaroon_resp.resize(size_hint);
     if (macaroon_serialize(mac_with_date, &macaroon_resp[0], size_hint, &mac_err))
     {
-        printf("Returned macaroon_serialize code: %lu\n", (unsigned long)size_hint);
+        printf("Returned macaroon_serialize code: %zu\n", size_hint);
         return req.SendSimpleResp(500, NULL, NULL, "Internal error serializing macaroon", 0);
     }
     macaroon_destroy(mac_with_date);

@@ -18,6 +18,8 @@
 
 #include "XrdCl/XrdClSIDManager.hh"
 
+#include <algorithm>
+
 namespace XrdCl
 {
   //----------------------------------------------------------------------------
@@ -48,6 +50,7 @@ namespace XrdCl
     }
 
     memcpy( sid, &allocSID, 2 );
+    pAllocTime[allocSID] = time(0);
     return Status();
   }
 
@@ -60,6 +63,7 @@ namespace XrdCl
     uint16_t relSID = 0;
     memcpy( &relSID, sid, 2 );
     pFreeSIDs.push_back( relSID );
+    pAllocTime.erase( relSID );
   }
 
   //----------------------------------------------------------------------------
@@ -71,6 +75,20 @@ namespace XrdCl
     uint16_t tiSID = 0;
     memcpy( &tiSID, sid, 2 );
     pTimeOutSIDs.insert( tiSID );
+    pAllocTime.erase( tiSID );
+  }
+
+  //----------------------------------------------------------------------------
+  // Check if any SID was allocated at or before a given time
+  //----------------------------------------------------------------------------
+  bool SIDManager::IsAnySIDOldAs( const time_t tlim ) const
+  {
+    XrdSysMutexHelper scopedLock( pMutex );
+    return std::any_of( pAllocTime.begin(), pAllocTime.end(),
+                        [tlim](const auto& p)
+    {
+      return p.second <= tlim;
+    } );
   }
 
   //----------------------------------------------------------------------------
@@ -118,5 +136,69 @@ namespace XrdCl
   {
     XrdSysMutexHelper scopedLock( pMutex );
     return pSIDCeiling - pFreeSIDs.size() - pTimeOutSIDs.size() - 1;
+  }
+
+  //----------------------------------------------------------------------------
+  // Returns a pointer to the SIDManager object
+  //----------------------------------------------------------------------------
+  std::shared_ptr<SIDManager> SIDMgrPool::GetSIDMgr( const URL &url )
+  {
+    //--------------------------------------------------------------------------
+    // Look for an instance of SID manager in the pool
+    //--------------------------------------------------------------------------
+    XrdSysMutexHelper lck1( mtx );
+    SIDManager *mgr = 0;
+    auto itr = pool.find( url.GetChannelId() );
+    if( itr == pool.end() )
+    {
+      mgr = new SIDManager();
+      pool[url.GetChannelId()] = mgr;
+    }
+    else mgr = itr->second;
+
+    //--------------------------------------------------------------------------
+    // Update the reference counter
+    //--------------------------------------------------------------------------
+    XrdSysMutexHelper lck2( mgr->pMutex );
+    ++mgr->pRefCount;
+
+    //--------------------------------------------------------------------------
+    // Create a shared pointer that will recycle the SID manager
+    //--------------------------------------------------------------------------
+    RecycleSidMgr deleter;
+    std::shared_ptr<SIDManager> ptr( mgr, deleter );
+
+    return ptr;
+  }
+
+  void SIDMgrPool::Recycle( SIDManager *mgr )
+  {
+    //--------------------------------------------------------------------------
+    // Lock the pool, we need to do it in the same order as in 'GetSIDMgr'
+    //--------------------------------------------------------------------------
+    XrdSysMutexHelper lck1( mtx );
+
+    //--------------------------------------------------------------------------
+    // Lock the SID manager object
+    //--------------------------------------------------------------------------
+    XrdSysMutexHelper lck2( mgr->pMutex );
+    --mgr->pRefCount;
+
+    if( !mgr->pRefCount )
+    {
+      //------------------------------------------------------------------------
+      // Remove the SID manager from the pool
+      //------------------------------------------------------------------------
+      auto itr = pool.begin();
+      for( ; itr != pool.end() ; ++itr )
+        if( itr->second == mgr )
+        {
+          pool.erase( itr );
+          break;
+        }
+
+      lck2.UnLock();
+      delete mgr;
+    }
   }
 }

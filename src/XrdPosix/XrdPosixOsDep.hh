@@ -72,4 +72,8 @@
 #define	ELIBACC EFTYPE
 #endif
 
+#if defined(__GNU__) || (defined(__FreeBSD_kernel__) && defined(__GLIBC__))
+#define ELIBACC EFTYPE
+#endif
+
 #endif

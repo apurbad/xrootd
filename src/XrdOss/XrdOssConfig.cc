@@ -30,11 +30,12 @@
 /******************************************************************************/
 
 #include <unistd.h>
-#include <ctype.h>
+#include <cctype>
 #include <dirent.h>
 #include <fcntl.h>
+#include <string>
 #include <strings.h>
-#include <stdio.h>
+#include <cstdio>
 #include <sys/param.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
@@ -61,7 +62,9 @@
 #include "XrdOuc/XrdOucPinLoader.hh"
 #include "XrdOuc/XrdOucProg.hh"
 #include "XrdOuc/XrdOucStream.hh"
+#include "XrdOuc/XrdOucString.hh"
 #include "XrdOuc/XrdOucUtils.hh"
+#include "XrdSys/XrdSysE2T.hh"
 #include "XrdSys/XrdSysHeaders.hh"
 #include "XrdSys/XrdSysPthread.hh"
 #include "XrdSys/XrdSysPlatform.hh"
@@ -72,11 +75,9 @@
   
 extern XrdOssSys   *XrdOssSS;
 
-extern XrdOucTrace  OssTrace;
+extern XrdSysTrace  OssTrace;
 
 XrdOucPListAnchor  *XrdOssRPList;
-
-int                *XrdOssRunMode = 0;
 
 /******************************************************************************/
 /*                            E r r o r   T e x t                             */
@@ -194,14 +195,14 @@ XrdOssSys::XrdOssSys()
    ConfigFN      = 0;
    QFile         = 0;
    UDir          = 0;
+   USync         = 0;
    Solitary      = 0;
    DPList        = 0;
    lenDP         = 0;
-   runOld        = 0;
-   XrdOssRunMode = &runOld;
    numCG = numDP = 0;
    xfrFdir       = 0;
    xfrFdln       = 0;
+   pfcMode       = false;
    RSSProg       = 0;
    StageProg     = 0;
    prPBits       = (long long)sysconf(_SC_PAGESIZE);
@@ -215,6 +216,7 @@ XrdOssSys::XrdOssSys()
    STT_Lib       = 0;
    STT_Parms     = 0;
    STT_Func      = 0;
+   STT_Fund      = 0;
    STT_PreOp     = 0;
    STT_DoN2N     = 1;
    STT_V2        = 0;
@@ -279,6 +281,10 @@ int XrdOssSys::Configure(const char *configfn, XrdSysError &Eroute,
           }
    if (FDFence < 0 || FDFence >= FDLimit) FDFence = FDLimit >> 1;
 
+// Configure devices
+//
+   XrdOssCache::MapDevs(OssTrace.What != 0);
+
 // Process the configuration file
 //
    NoGo = ConfigProc(Eroute);
@@ -290,12 +296,22 @@ int XrdOssSys::Configure(const char *configfn, XrdSysError &Eroute,
        if (STT_Lib && !NoGo) NoGo |= ConfigStatLib(Eroute, envP);
       }
 
+// If the export list is empty, add at least "/tmp" to it otherwise we will
+// fail to correctly track space.
+//
+   if (RPList.First() == 0)
+      RPList.Insert(new XrdOucPList("/tmp", (unsigned long long)0));
+
 // Establish usage tracking and quotas, if need be. Note that if we are not
 // a true data server, those services will be initialized but then disabled.
 //
    Solitary = ((val = getenv("XRDREDIRECT")) && !strcmp(val, "Q"));
-   if (Solitary) Eroute.Say("++++++ Configuring standalone mode . . .");
-   NoGo |= XrdOssCache::Init(UDir, QFile, Solitary)
+   pfcMode  = (envP && (val = envP->Get("oss.runmode")) && !strcmp(val,"pfc"));
+  {const char *m1 = (Solitary ? "standalone " : 0);
+   const char *m2 = (pfcMode  ? "pfc " : 0);
+   if (m1 || m2) Eroute.Say("++++++ Configuring ", m1, m2, "mode . . .");
+  }
+   NoGo |= XrdOssCache::Init(UDir, QFile, Solitary, USync)
           |XrdOssCache::Init(minalloc, ovhalloc, fuzalloc);
 
 // Configure the MSS interface including staging
@@ -310,6 +326,10 @@ int XrdOssSys::Configure(const char *configfn, XrdSysError &Eroute,
 //
    if (!NoGo) ConfigMio(Eroute);
 
+// Provide support for the PFC. This also resolve cache attribute conflicts.
+//
+   if (!NoGo) ConfigCache(Eroute);
+
 // Establish the actual default path settings (modified by the above)
 //
    RPList.Set(DirFlags);
@@ -322,29 +342,34 @@ int XrdOssSys::Configure(const char *configfn, XrdSysError &Eroute,
    if ( OptFlags & XrdOss_CacheFS ) 
        if (!NoGo) {
            NoGo = XrdOssPath::InitPrefix();
-           if (NoGo) Eroute.Emsg("Config", "cache file prefix initialization failed");
+           if (NoGo) Eroute.Emsg("Config", "space initialization failed");
        }
 
 // Configure statiscal reporting
 //
    if (!NoGo) ConfigStats(Eroute);
 
-// Start up the cache scan thread unless specifically told not to. Some programs
+// Start up the space scan thread unless specifically told not to. Some programs
 // like the cmsd manually handle space updates.
 //
    if (!(val = getenv("XRDOSSCSCAN")) || strcmp(val, "off"))
       {if ((retc = XrdSysThread::Run(&tid, XrdOssCacheScan,
-                                    (void *)&cscanint, 0, "cache scan")))
-          Eroute.Emsg("Config", retc, "create cache scan thread");
+                                    (void *)&cscanint, 0, "space scan")))
+          Eroute.Emsg("Config", retc, "create space scan thread");
       }
 
 // Display the final config if we can continue
 //
    if (!NoGo) Config_Display(Eroute);
 
+// Do final reset of paths if we are in proxy file cache mode
+//
+   if (pfcMode && !NoGo) ConfigCache(Eroute, true);
+
 // Export the real path list (for frm et. al.)
 //
    XrdOssRPList = &RPList;
+   if (envP) envP->PutPtr("XrdOssRPList*", &RPList);
 
 // All done, close the stream and return the return code.
 //
@@ -388,7 +413,7 @@ void XrdOssSys::Config_Display(XrdSysError &Eroute)
 
      snprintf(buff, sizeof(buff), "Config effective %s oss configuration:\n"
                                   "       oss.alloc        %lld %d %d\n"
-                                  "       oss.cachescan    %d\n"
+                                  "       oss.spacescan    %d\n"
                                   "       oss.fdlimit      %d %d\n"
                                   "       oss.maxsize      %lld\n"
                                   "%s%s%s"
@@ -397,7 +422,6 @@ void XrdOssSys::Config_Display(XrdSysError &Eroute)
                                   "%s%s%s%s%s"
                                   "%s%s%s"
                                   "%s%s%s"
-                                  "%s"
                                   "       oss.trace        %x\n"
                                   "       oss.xfr          %d deny %d keep %d",
              cloc,
@@ -411,7 +435,6 @@ void XrdOssSys::Config_Display(XrdSysError &Eroute)
                                                     StageCreate, "creates ", ""),
              XrdOssConfig_Val(StageMsg,   stagemsg),
              XrdOssConfig_Val(RSSCmd,     rsscmd),
-             (runOld           ? "       oss.runmodeold\n" : ""),
              OssTrace.What,
              xfrthreads, xfrhold, xfrkeep);
 
@@ -438,6 +461,57 @@ void XrdOssSys::Config_Display(XrdSysError &Eroute)
 /******************************************************************************/
 /*                     P r i v a t e   F u n c t i o n s                      */
 /******************************************************************************/
+/******************************************************************************/
+/*                           C o n f i g C a c h e                            */
+/******************************************************************************/
+  
+void XrdOssSys::ConfigCache(XrdSysError &Eroute, bool pass2)
+{
+     const unsigned long long conFlags = 
+                    XRDEXP_NOCHECK | XRDEXP_NODREAD |
+                    XRDEXP_MLOK    | XRDEXP_MKEEP   | XRDEXP_MMAP  |
+                    XRDEXP_MIG     | XRDEXP_MWMODE  | XRDEXP_PURGE |
+                    XRDEXP_RCREATE | XRDEXP_STAGE   | XRDEXP_STAGEMM;
+
+     XrdOucPList *fp = RPList.First();
+     unsigned long long oflag, pflag;
+
+// If this is pass 2 then if we are in pfcMode, then reset r/o flag to r/w
+// to allow the pfc to actually write into the cache paths.
+//
+   if (pass2)
+      {if (pfcMode)
+          {while(fp)
+                {pflag = fp->Flag();
+                 if (pflag & XRDEXP_PFCACHE) fp->Set(pflag & ~XRDEXP_NOTRW);
+                 fp = fp->Next();
+                }
+          }
+       return;
+      }
+
+// Run through all the paths and resolve any conflicts with a cache
+//
+   while(fp)
+        {oflag = pflag = fp->Flag();
+         if ((pflag & XRDEXP_PFCACHE)
+         ||  (pfcMode && !(pflag & XRDEXP_PFCACHE_X)))
+            {if (!(pflag & XRDEXP_NOTRW)) pflag |= XRDEXP_READONLY;
+             pflag &= ~conFlags;
+             pflag |=  XRDEXP_PFCACHE;
+             if (oflag != pflag) fp->Set(pflag);
+            }
+         fp = fp->Next();
+        }
+
+// Handle default settings
+//
+   if (DirFlags & XRDEXP_PFCACHE)
+      {DirFlags |=  XRDEXP_READONLY;
+       DirFlags &= ~conFlags;
+      }
+}
+  
 /******************************************************************************/
 /*                             C o n f i g M i o                              */
 /******************************************************************************/
@@ -552,6 +626,8 @@ int XrdOssSys::ConfigProc(XrdSysError &Eroute)
        return 1;
       }
    Config.Attach(cfgFD);
+   static const char *cvec[] = { "*** oss plugin config:", 0 };
+   Config.Capture(cvec);
 
 // Now start reading records until eof.
 //
@@ -562,7 +638,7 @@ int XrdOssSys::ConfigProc(XrdSysError &Eroute)
                  &&  xpath(Config, Eroute)) {Config.Echo(); NoGo = 1;}
         }
 
-// Now check if any errors occured during file i/o
+// Now check if any errors occurred during file i/o
 //
    if ((retc = Config.LastError()))
       NoGo = Eroute.Emsg("Config", retc, "read config file", ConfigFN);
@@ -586,9 +662,10 @@ void XrdOssSys::ConfigSpace(XrdSysError &Eroute)
 // space that can actually be modified in some way.
 //
    while(fp)
-        {if ((noCacheFS || (fp->Flag() & XRDEXP_INPLACE))
-         &&  ((fp->Flag() & (XRDEXP_STAGE | XRDEXP_PURGE))
-         ||  !(fp->Flag() & XRDEXP_NOTRW)))
+        {if ( ((noCacheFS || (fp->Flag() & XRDEXP_INPLACE)) &&
+               (fp->Flag() & (XRDEXP_STAGE | XRDEXP_PURGE)))
+         ||   !(fp->Flag() &  XRDEXP_NOTRW)
+         ||    (fp->Flag() &  XRDEXP_PFCACHE) )
             ConfigSpace(fp->Path());
          fp = fp->Next();
         }
@@ -657,13 +734,6 @@ void XrdOssSys::ConfigSpath(XrdSysError &Eroute, const char *Path,
           else     flags |=  XRDEXP_NODREAD;
       }
 
-// mig| (purge+r/w) -> lock file creation
-//
-   if ((flags & XRDEXP_MIG)
-   || ((flags & XRDEXP_PURGE) && !(flags & XRDEXP_NOTRW)))
-           flags |=  XRDEXP_MAKELF;
-      else flags &= ~XRDEXP_MAKELF;
-
 // If there is no mss then turn off all mss related optionss, otherwise check
 // if the options may leave the system in an inconsistent state
 //
@@ -697,12 +767,8 @@ int XrdOssSys::ConfigStage(XrdSysError &Eroute)
    flags = (RSSCmd ? 0 : XRDEXP_NOCHECK | XRDEXP_NODREAD);
    DirFlags = DirFlags | (flags & (~(DirFlags >> XRDEXP_MASKSHIFT)));
 
-// Indicate whether lock files are to be created. We create them for migratable
-// space and purgeable space that is writable.
+// Set default flags
 //
-   if ((DirFlags & XRDEXP_MIG)
-   || ((DirFlags & XRDEXP_PURGE) && !(DirFlags & XRDEXP_NOTRW)))
-      DirFlags |= XRDEXP_MAKELF;
    RPList.Default(DirFlags);
 
 // Reprocess the paths to set correct defaults
@@ -866,21 +932,30 @@ int XrdOssSys::ConfigStageC(XrdSysError &Eroute)
 int XrdOssSys::ConfigStatLib(XrdSysError &Eroute, XrdOucEnv *envP)
 {
    XrdOucPinLoader myLib(&Eroute, myVersion, "statlib", STT_Lib);
+   const char *stName2 = "?XrdOssStatInfoInit2";
 
-// Get the plugin and stat function
+// Get the plugin and stat function. Let's try version 2 first
 //
-   if (STT_V2)
-      {XrdOssStatInfoInit2_t siGet2;
-       if (!(siGet2=(XrdOssStatInfoInit2_t)myLib.Resolve("XrdOssStatInfoInit2"))
-       ||  !(STT_Fund = siGet2(this,Eroute.logger(),ConfigFN,STT_Parms,envP)))
+   XrdOssStatInfoInit2_t siGet2;
+   if (STT_V2) stName2++;
+   if ((siGet2=(XrdOssStatInfoInit2_t)myLib.Resolve(stName2)))
+      {if (!(STT_Fund = siGet2(this,Eroute.logger(),ConfigFN,STT_Parms,envP)))
           return 1;
        if (STT_DoARE) envP->PutPtr("XrdOssStatInfo2*", (void *)STT_Fund);
-      } else {
-       XrdOssStatInfoInit_t siGet;
-       if (!(siGet = (XrdOssStatInfoInit_t)myLib.Resolve("XrdOssStatInfoInit"))
-       ||  !(STT_Func = siGet (this,Eroute.logger(),ConfigFN,STT_Parms)))
-          return 1;
+       STT_V2 = 1;
+       return 0;
       }
+
+// If we are here but the -2 was specified on the config then we fail
+//
+   if (STT_V2) return 1;
+
+// OK, so we better find version 1 in the shared library
+//
+   XrdOssStatInfoInit_t siGet;
+   if (!(siGet = (XrdOssStatInfoInit_t)myLib.Resolve("XrdOssStatInfoInit"))
+   ||  !(STT_Func = siGet (this,Eroute.logger(),ConfigFN,STT_Parms)))
+      return 1;
 
 // Return success
 //
@@ -973,7 +1048,8 @@ int XrdOssSys::ConfigXeq(char *var, XrdOucStream &Config, XrdSysError &Eroute)
 
    TS_Xeq("alloc",         xalloc);
    TS_Xeq("cache",         xcache);
-   TS_Xeq("cachescan",     xcachescan);
+   TS_Xeq("cachescan",     xcachescan); // Backward compatibility
+   TS_Xeq("spacescan",     xcachescan);
    TS_Xeq("defaults",      xdefault);
    TS_Xeq("fdlimit",       xfdlimit);
    TS_Xeq("maxsize",       xmaxsz);
@@ -987,8 +1063,6 @@ int XrdOssSys::ConfigXeq(char *var, XrdOucStream &Config, XrdSysError &Eroute)
    TS_Xeq("trace",         xtrace);
    TS_Xeq("usage",         xusage);
    TS_Xeq("xfr",           xxfr);
-
-   TS_Set("runmodeold",    runOld, 1);
 
    // Check if var substitutions are prohibited (e.g., stagemsg). Note that
    // TS_String() returns upon success so be careful when adding new opts.
@@ -1053,7 +1127,7 @@ int XrdOssSys::ConfigXeq(char *var, XrdOucStream &Config, XrdSysError &Eroute)
              <headroom>  percentage of requested space to be added to the
                          free space amount (asterisk uses default).
              <fuzz>      the percentage difference between two free space
-                         quantities that may be ignored when selecting a cache
+                         quantities that may be ignored when selecting a space
                            0 - reduces to finding the largest free space
                          100 - reduces to simple round-robin allocation
 
@@ -1110,9 +1184,14 @@ int XrdOssSys::xcache(XrdOucStream &Config, XrdSysError &Eroute)
 // Skip out to process this entry and upon success indicate that it is
 // deprecated and "space" should be used instead if an XA-style space defined.
 //
-   if (!(rc = xspace(Config, Eroute, &isXA)) && isXA)
-      Eroute.Say("Config warning: 'oss.cache' is deprecated; "
-                                 "use 'oss.space' instead!");
+   if (!(rc = xspace(Config, Eroute, &isXA)))
+      {if (isXA) Eroute.Say("Config warning: 'oss.cache' is deprecated; "
+                            "use 'oss.space' instead!");
+          else  {Eroute.Say("Config failure: non-xa spaces are no longer "
+                            "supported!");
+                 rc = 1;
+                }
+      }
     return rc;
 }
 
@@ -1461,11 +1540,12 @@ int XrdOssSys::xprerd(XrdOucStream &Config, XrdSysError &Eroute)
 
 /* Function: xspace
 
-   Purpose:  To parse the directive: space <name> <path>
+   Purpose:  To parse the directive: space <name> <path> {chkmount <id> [nofail]
                                  or: space <name> {assign}default} <lfn> [...]
 
              <name>   logical name for the filesystem.
              <path>   path to the filesystem.
+             <id>     mountpoint name in order to be considered valid
 
    Output: 0 upon success or !0 upon failure.
 
@@ -1474,14 +1554,11 @@ int XrdOssSys::xprerd(XrdOucStream &Config, XrdSysError &Eroute)
 
 int XrdOssSys::xspace(XrdOucStream &Config, XrdSysError &Eroute, int *isCD)
 {
-   char *val, *pfxdir, *sfxdir;
-   char grp[XrdOssSpace::minSNbsz], dn[XrdOssSpace::minSNbsz];
-   char fn[MAXPATHLEN+1];
-   int i, k, rc, pfxln, isxa = 0, cnum = 0;
-   struct dirent *dp;
-   struct stat buff;
-   DIR *DFD;
-   bool isAsgn;
+   XrdOucString grp, fn, mn;
+   OssSpaceConfig sInfo(grp, fn, mn);
+   char *val;
+   int  k;
+   bool isAsgn, isStar;
 
 // Get the space name
 //
@@ -1489,22 +1566,32 @@ int XrdOssSys::xspace(XrdOucStream &Config, XrdSysError &Eroute, int *isCD)
       {Eroute.Emsg("Config", "space name not specified"); return 1;}
    if ((int)strlen(val) > XrdOssSpace::maxSNlen)
       {Eroute.Emsg("Config","excessively long space name - ",val); return 1;}
-   strcpy(grp, val);
+   grp = val;
 
 // Get the path to the space
 //
-   if (!(val = Config.GetWord()))
+   if (!(val = Config.GetWord()) || !(*val))
       {Eroute.Emsg("Config", "space path not specified"); return 1;}
 
 // Check if assignment
 //
    if (((isAsgn = !strcmp("assign",val)) || ! strcmp("default",val)) && !isCD)
-      return xspace(Config, Eroute, grp, isAsgn);
+      return xspace(Config, Eroute, grp.c_str(), isAsgn);
 
-   k = strlen(val);
-   if (k >= (int)(sizeof(fn)-1) || val[0] != '/' || k < 2)
+// Preprocess this path and validate it
+//
+   k = strlen(val)-1;
+   if ((isStar = val[k] == '*')) val[k--] = 0;
+      else while(k > 0 && val[k] == '/') val[k--] = 0;
+
+   if (k >= MAXPATHLEN || val[0] != '/' || (k < 2 && !isStar))
       {Eroute.Emsg("Config", "invalid space path - ", val); return 1;}
-   strcpy(fn, val);
+   fn = val;
+
+// Sanitize the path as we are sensitive to proper placement of slashes
+//
+   do {k = fn.replace("/./", "/");} while(k);
+   do {k = fn.replace("//",  "/");} while(k);
 
 // Additional options (for now) are only available to the old-style cache
 // directive. So, ignore any unless we entered via the directive.
@@ -1513,38 +1600,67 @@ int XrdOssSys::xspace(XrdOucStream &Config, XrdSysError &Eroute, int *isCD)
       {if ((val = Config.GetWord()))
           {if (strcmp("xa", val))
               {Eroute.Emsg("Config","invalid cache option - ",val); return 1;}
-              else *isCD = isxa = 1;
-          } else   *isCD = 0;
-      } else isxa = 1;
-
-// Check if any directory in the parent can be used for space
-//
-   if (fn[k-1] != '*')
-      {for (i = k-1; i; i--) if (fn[i] != '/') break;
-       fn[i+1] = '/'; fn[i+2] = '\0';
-       return !xspaceBuild(grp, fn, isxa, Eroute);
+              else *isCD = 1;
+          } else  {*isCD = 0; sInfo.isXA = false;}
+      } else {
+       if ((val = Config.GetWord()) && !strcmp("chkmount", val))
+          {if (!(val = Config.GetWord()))
+              {Eroute.Emsg("Config","chkmount ID not specified"); return 1;}
+           if ((int)strlen(val) > XrdOssSpace::maxSNlen)
+              {Eroute.Emsg("Config","excessively long mount name - ",val);
+               return 1;
+              }
+           mn = val;
+           sInfo.chkMnt = true;
+           if ((val = Config.GetWord()))
+              {if (!strcmp("nofail", val)) sInfo.noFail = true;
+                  else {Eroute.Emsg("Config","invalid space option - ",val);
+                        return 1;
+                       }
+              }
+          }
       }
 
-// We now need to build a space for each directory
+// Check if this directory in the parent is only to be used for the space
 //
-   for (i = k-1; i; i--) if (fn[i] == '/') break;
-   i++; strcpy(dn, &fn[i]); fn[i] = '\0';
-   sfxdir = &fn[i]; pfxdir = dn; pfxln = strlen(dn)-1;
-   if (!(DFD = opendir(fn)))
-      {Eroute.Emsg("Config", errno, "open space directory", fn); return 1;}
+   if (!isStar)
+      {if (!fn.endswith('/')) fn += '/';
+       return !xspaceBuild(sInfo, Eroute);
+      }
+
+// We now need to build a space for each directory in the parent
+//
+   struct dirent *dp;
+   struct stat    Stat;
+   XrdOucString   pfx, basepath(fn);
+   DIR  *dirP;
+   int   dFD, rc, snum = 0;
+   bool  chkPfx, failed = false;
+
+   if (basepath.endswith('/')) chkPfx = false;
+      else {int pos = basepath.rfind('/');
+            pfx = &basepath[pos+1];
+            basepath.keep(0, pos+1);
+            chkPfx = true;
+           }
+
+   if ((dFD=open(basepath.c_str(),O_DIRECTORY)) < 0 || !(dirP=fdopendir(dFD)))
+      {Eroute.Emsg("Config",errno,"open space directory",fn.c_str()); return 1;}
 
    errno = 0;
-   while((dp = readdir(DFD)))
+   while((dp = readdir(dirP)))
         {if (!strcmp(dp->d_name, ".") || !strcmp(dp->d_name, "..")
-         || (pfxln && strncmp(dp->d_name, pfxdir, pfxln)))
-            continue;
-         strcpy(sfxdir, dp->d_name);
-         if (stat(fn, &buff)) break;
-         if ((buff.st_mode & S_IFMT) == S_IFDIR)
-            {val = sfxdir + strlen(sfxdir) - 1;
-            if (*val++ != '/') {*val++ = '/'; *val = '\0';}
-            if (xspaceBuild(grp, fn, isxa, Eroute)) cnum++;
-               else {closedir(DFD); return 1;}
+         || (chkPfx && strncmp(dp->d_name,pfx.c_str(),pfx.length()))) continue;
+
+         if (fstatat(dFD, dp->d_name, &Stat, AT_SYMLINK_NOFOLLOW))
+            {basepath += dp->d_name;
+             break;
+            }
+
+         if ((Stat.st_mode & S_IFMT) == S_IFDIR)
+            {fn = basepath; fn += dp->d_name; fn += '/';
+             if (!xspaceBuild(sInfo, Eroute)) failed = true;
+             snum++;
             }
          errno = 0;
         }
@@ -1552,11 +1668,13 @@ int XrdOssSys::xspace(XrdOucStream &Config, XrdSysError &Eroute, int *isCD)
 // Make sure we built all space successfully and have at least one space
 //
    if ((rc = errno))
-      Eroute.Emsg("Config", errno, "process space directory", fn);
-      else if (!cnum) Eroute.Say("Config warning: no space directories found in ",val);
+      Eroute.Emsg("Config", errno, "process space directory", fn.c_str());
+      else if (!snum)
+              Eroute.Say("Config warning: no space directories found in ",
+                         fn.c_str());
 
-   closedir(DFD);
-   return rc != 0;
+   closedir(dirP);
+   return rc != 0 || failed;
 }
 
 /******************************************************************************/
@@ -1589,15 +1707,39 @@ do{if ((pl = SPList.Match(path))) pl->Set(path, grp);
 
 /******************************************************************************/
 
-int XrdOssSys::xspaceBuild(char *grp, char *fn, int isxa, XrdSysError &Eroute)
+int XrdOssSys::xspaceBuild(OssSpaceConfig &sInfo, XrdSysError &Eroute)
 {
-    XrdOssCache_FS::FSOpts fopts = (isxa ? XrdOssCache_FS::isXA
-                                         : XrdOssCache_FS::None);
-    XrdOssCache_FS *fsp;
+    XrdOssCache_FS::FSOpts fopts = (sInfo.isXA ? XrdOssCache_FS::isXA
+                                               : XrdOssCache_FS::None);
     int rc = 0;
-    if (!(fsp = new XrdOssCache_FS(rc, grp, fn, fopts))) rc = ENOMEM;
+
+// Check if we need to verify the mount. Note: sPath must end with a '/'!
+//
+   if (sInfo.chkMnt)
+      {XrdOucString mFile(sInfo.mName), mPath(sInfo.sPath);
+       struct stat Stat;
+       mPath.erasefromend(1);
+       mFile += '.';
+       mFile += rindex(mPath.c_str(), '/')+1;
+       mPath += '/'; mPath += mFile;
+       if (stat(mPath.c_str(), &Stat))
+          {char buff[2048];
+           snprintf(buff, sizeof(buff), "%s@%s; ",
+                          mFile.c_str(), sInfo.sPath.c_str());
+           Eroute.Say((sInfo.noFail ? "Config warning:" : "Config failure:"),
+                      " Unable to verify mount point ", buff, XrdSysE2T(errno));
+           return (sInfo.noFail ? 1 : 0);
+          }
+      }
+
+// Add the space to the configuration
+
+    XrdOssCache_FS *fsp = new XrdOssCache_FS(rc, sInfo.sName.c_str(),
+                                                 sInfo.sPath.c_str(), fopts);
     if (rc)
-       {Eroute.Emsg("Config", rc, "create space", fn);
+       {char buff[256];
+        snprintf(buff, sizeof(buff), "create %s space at", sInfo.sName.c_str());
+        Eroute.Emsg("Config", rc, buff, sInfo.sPath.c_str());
         if (fsp) delete fsp;
         return 0;
        }
@@ -1670,7 +1812,7 @@ int XrdOssSys::xstg(XrdOucStream &Config, XrdSysError &Eroute)
 
    Purpose:  To parse the directive: statlib <Options> <path> [<parms>]
 
-   Options:  -2        use version 2 initialization interface.
+   Options:  -2        use version 2 initialization interface (deprecated).
              -arevents forward add/remove events (server role cmsd only)
              -non2n    do not apply name2name prior to calling plug-in.
              -preopen  issue the stat() prior to opening the file.
@@ -1774,10 +1916,12 @@ int XrdOssSys::xtrace(XrdOucStream &Config, XrdSysError &Eroute)
 
    Purpose:  To parse the directive: usage <parms>
 
-             <parms>: [nolog | log <path>] [noquotafile | quotafile <qfile>]
+             <parms>: [nolog | log <path> [sync <num>]]
+                      [noquotafile | quotafile <qfile>]
 
              nolog    does not save usage info across restarts
              log      saves usages information in the <path> directory
+             sync     sync the usage file to disk every <num> changes.
              qfile    where the quota file resides.
 
    Output: 0 upon success or !0 upon failure.
@@ -1786,6 +1930,7 @@ int XrdOssSys::xtrace(XrdOucStream &Config, XrdSysError &Eroute)
 int XrdOssSys::xusage(XrdOucStream &Config, XrdSysError &Eroute)
 {
     char *val;
+    int usval;
 
     if (!(val = Config.GetWord()))
        {Eroute.Emsg("Config", "usage option not specified"); return 1;}
@@ -1804,6 +1949,15 @@ int XrdOssSys::xusage(XrdOucStream &Config, XrdSysError &Eroute)
                        return 1;
                       }
                    UDir = strdup(val);
+                   if (!(val = Config.GetWord()) || strcmp("sync", val))
+                      continue;
+                   if (!(val = Config.GetWord()))
+                      {Eroute.Emsg("Config", "log sync value not specified");
+                       return 1;
+                      }
+                    if (XrdOuca2x::a2i(Eroute,"sync value",val,&usval,1,32767))
+                       return 1;
+                    USync = usval;
                   }
           else if (!strcmp("noquotafile",val))
                   {if (QFile) {free(QFile); QFile= 0;}}
@@ -1838,7 +1992,7 @@ int XrdOssSys::xusage(XrdOucStream &Config, XrdSysError &Eroute)
              fdir      the base directory where '.fail' files are to be written
              <threads> number of threads for staging (* uses default).
 
-The following are deprecated and allowed for backward compatability:
+The following are deprecated and allowed for backward compatibility:
 
              <speed>   average speed in bytes/second (* uses default).
              <ovhd>    minimum seconds of overhead (* uses default).
@@ -1933,30 +2087,33 @@ int XrdOssSys::xxfr(XrdOucStream &Config, XrdSysError &Eroute)
 void XrdOssSys::List_Path(const char *pfx, const char *pname,
                           unsigned long long flags, XrdSysError &Eroute)
 {
-     char buff[4096], *rwmode;
+     std::string ss;
+     const char *rwmode;
 
-     if (flags & XRDEXP_FORCERO) rwmode = (char *)" forcero";
-        else if (flags & XRDEXP_READONLY) rwmode = (char *)" r/o ";
-                else rwmode = (char *)" r/w ";
-                                 //   0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5
-     snprintf(buff, sizeof(buff), "%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s",
-              pfx, pname,                                           // 0
-              rwmode,                                               // 1
-              (flags & XRDEXP_INPLACE  ? " inplace" : ""),          // 2
-              (flags & XRDEXP_LOCAL    ? " local"   : ""),          // 3
-              (flags & XRDEXP_GLBLRO   ? " globalro": ""),          // 4
-              (flags & XRDEXP_NOCHECK  ? " nocheck" : " check"),    // 5
-              (flags & XRDEXP_NODREAD  ? " nodread" : " dread"),    // 6
-              (flags & XRDEXP_MIG      ? " mig"     : " nomig"),    // 7
-     (!(flags & XRDEXP_MMAP)           ? ""         :               // 8
-              (flags & XRDEXP_MKEEP    ? " mkeep"   : " nomkeep")),
-     (!(flags & XRDEXP_MMAP)           ? ""         :               // 9
-              (flags & XRDEXP_MLOK     ? " mlock"   : " nomlock")),
-              (flags & XRDEXP_MMAP     ? " mmap"    : ""),          // 10
-              (flags & XRDEXP_RCREATE  ? " rcreate" : " norcreate"),// 11
-              (flags & XRDEXP_PURGE    ? " purge"   : " nopurge"),  // 12
-              (flags & XRDEXP_STAGE    ? " stage"   : " nostage"),  // 13
-              (flags & XRDEXP_NOXATTR  ? " noxattr" : " xattr")     // 14
-              );
-     Eroute.Say(buff); 
+     if (flags & XRDEXP_FORCERO) rwmode = " forcero";
+        else if (flags & XRDEXP_READONLY) rwmode = " r/o";
+                else rwmode = " r/w";
+
+     if (flags & XRDEXP_INPLACE) ss += " inplace";
+     if (flags & XRDEXP_LOCAL)   ss += " local";
+     if (flags & XRDEXP_GLBLRO)  ss += " globalro";
+
+     if (!(flags & XRDEXP_PFCACHE))
+        {if (flags & XRDEXP_PFCACHE_X) ss += " nocache";
+         ss += (flags & XRDEXP_NOCHECK  ? " nocheck" : " check");
+         ss += (flags & XRDEXP_NODREAD  ? " nodread" : " dread");
+         ss += (flags & XRDEXP_MIG      ? " mig"     : " nomig");
+         ss += (flags & XRDEXP_PURGE    ? " purge"   : " nopurge");
+         ss += (flags & XRDEXP_RCREATE  ? " rcreate" : " norcreate");
+         ss += (flags & XRDEXP_STAGE    ? " stage"   : " nostage");
+        } else ss += " cache";
+
+
+     if (flags & XRDEXP_MMAP)
+        {ss += " mmap";
+         ss += (flags & XRDEXP_MKEEP    ? " mkeep"   : " nomkeep");
+         ss += (flags & XRDEXP_MLOK     ? " mlock"   : " nomlock");
+        }
+
+     Eroute.Say(pfx, pname, rwmode, ss.c_str());
 }

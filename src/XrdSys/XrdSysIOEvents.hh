@@ -31,7 +31,7 @@
 /******************************************************************************/
   
 #include <poll.h>
-#include <time.h>
+#include <ctime>
 #include <sys/types.h>
 
 #include "XrdSys/XrdSysPthread.hh"
@@ -312,7 +312,7 @@ inline  int  GetFD() {return chFD;}
 //! @param cbP   Pointer to the callback object (see above). The callback
 //!              object must not be deleted while associated to a channel.
 //!              A callback object must exist in order for the channel to be
-//!              enabled. Use SetCallBack() if you defered setting it here.
+//!              enabled. Use SetCallBack() if you deferred setting it here.
 //! @param cbArg The argument to be passed to the callback object.
 //-----------------------------------------------------------------------------
 
@@ -350,8 +350,8 @@ char           chStat;      // Channel status below (!0 -> in callback mode)
 enum Status   {isClear = 0, isCBMode, isDead};
 char           inTOQ;       // True if the channel is in the timeout queue
 char           inPSet;      // FD is in the actual poll set
-char           reMod;       // Modify issued while defered, re-issue needed
-short          chFault;     // Defered error, 0 if all is well
+char           reMod;       // Modify issued while deferred, re-issue needed
+short          chFault;     // Deferred error, 0 if all is well
 
 void           Reset(Poller *thePoller, int fd, int eNum=0);
 };
@@ -511,6 +511,8 @@ CPP_ATOMIC_TYPE(bool) wakePend;   // Wakeup is effectively pending (don't send)
 bool            chDead;     // True if channel deleted by callback
 
 static time_t   maxTime;    // Maximum time allowed
+
+static pid_t    parentPID;  // register parent process PID
 
 private:
 

@@ -32,11 +32,12 @@
 /******************************************************************************/
   
 #include <unistd.h>
-#include <errno.h>
+#include <cerrno>
 #include <fcntl.h>
 #include <signal.h>
+#include <cstdint>
 #include <strings.h>
-#include <stdio.h>
+#include <cstdio>
 #include <sys/file.h>
 #include <sys/param.h>
 #include <sys/stat.h>
@@ -44,28 +45,39 @@
 #ifdef __solaris__
 #include <sys/vnode.h>
 #endif
+#include <vector>
 
 #include "XrdVersion.hh"
 
-#include "XrdFfs/XrdFfsPosix.hh"
 #include "XrdNet/XrdNetSecurity.hh"
 #include "XrdPss/XrdPss.hh"
 #include "XrdPss/XrdPssTrace.hh"
 #include "XrdPss/XrdPssUrlInfo.hh"
+#include "XrdPss/XrdPssUtils.hh"
 #include "XrdPosix/XrdPosixConfig.hh"
+#include "XrdPosix/XrdPosixExtra.hh"
 #include "XrdPosix/XrdPosixInfo.hh"
 #include "XrdPosix/XrdPosixXrootd.hh"
+#include "XrdOfs/XrdOfsFSctl_PI.hh"
 
 #include "XrdOss/XrdOssError.hh"
 #include "XrdOuc/XrdOucEnv.hh"
 #include "XrdOuc/XrdOucExport.hh"
+#include "XrdOuc/XrdOucPgrwUtils.hh"
+#include "XrdOuc/XrdOucPrivateUtils.hh"
 #include "XrdSec/XrdSecEntity.hh"
+#include "XrdSecsss/XrdSecsssID.hh"
+#include "XrdSfs/XrdSfsInterface.hh"
 #include "XrdSys/XrdSysError.hh"
 #include "XrdSys/XrdSysHeaders.hh"
 #include "XrdSys/XrdSysPlatform.hh"
 
 #ifndef O_DIRECT
 #define O_DIRECT 0
+#endif
+
+#ifndef ENOATTR
+#define ENOATTR ENODATA
 #endif
 
 /******************************************************************************/
@@ -84,45 +96,62 @@ class XrdScheduler;
 
 namespace XrdProxy
 {
+thread_local XrdOucECMsg ecMsg("[pss]");
+
 static XrdPssSys   XrdProxySS;
-  
+
        XrdSysError eDest(0, "pss_");
 
        XrdScheduler *schedP = 0;
 
        XrdOucSid    *sidP   = 0;
 
-static const char *ofslclCGI = "ofs.lcl=1";
+       XrdOucEnv    *envP   = 0;
 
-static const char *osslclCGI = "oss.lcl=1";
+       XrdOfsFSctl_PI *cacheFSctl = nullptr;
 
-static const int   PBsz = 4096;
+       XrdSecsssID  *idMapper = 0;    // -> Auth ID mapper
+
+static const char   *ofslclCGI = "ofs.lcl=1";
+
+static const char   *osslclCGI = "oss.lcl=1";
+
+static const int     PBsz = 4096;
+
+       int           rpFD = -1;
+
+       bool          idMapAll = false;
+
+       bool          outProxy = false; // True means outgoing proxy
+
+       bool          xrdProxy = false; // True means dest using xroot protocol
 
        XrdSysTrace SysTrace("Pss",0);
 }
-
 using namespace XrdProxy;
 
 /******************************************************************************/
 /*                XrdOssGetSS (a.k.a. XrdOssGetStorageSystem)                 */
 /******************************************************************************/
 
-XrdVERSIONINFO(XrdOssGetStorageSystem,XrdPss);
+XrdVERSIONINFO(XrdOssGetStorageSystem2,XrdPss);
   
 // This function is called by the OFS layer to retrieve the Storage System
 // object. We return our proxy storage system object if configuration succeeded.
 //
 extern "C"
 {
-XrdOss *XrdOssGetStorageSystem(XrdOss       *native_oss,
-                               XrdSysLogger *Logger,
-                               const char   *config_fn,
-                               const char   *parms)
+XrdOss *XrdOssGetStorageSystem2(XrdOss       *native_oss,
+                                XrdSysLogger *Logger,
+                                const char   *cFN,
+                                const char   *parms,
+                                XrdOucEnv    *envp)
 {
 
 // Ignore the parms (we accept none for now) and call the init routine
 //
-   return (XrdProxySS.Init(Logger, config_fn) ? 0 : (XrdOss *)&XrdProxySS);
+   envP = envp;
+   return (XrdProxySS.Init(Logger, cFN, envP) ? 0 : (XrdOss *)&XrdProxySS);
 }
 }
  
@@ -133,8 +162,9 @@ XrdOss *XrdOssGetStorageSystem(XrdOss       *native_oss,
 /*                           C o n s t r u c t o r                            */
 /******************************************************************************/
   
-XrdPssSys::XrdPssSys() : LocalRoot(0), theN2N(0), DirFlags(0),
-                         myVersion(&XrdVERSIONINFOVAR(XrdOssGetStorageSystem))
+XrdPssSys::XrdPssSys() : HostArena(0), LocalRoot(0), theN2N(0), DirFlags(0),
+                         myVersion(&XrdVERSIONINFOVAR(XrdOssGetStorageSystem2)),
+                         myFeatures(XRDOSS_HASPRXY|XRDOSS_HASPGRW|XRDOSS_HASNOSF)
                          {}
 
 /******************************************************************************/
@@ -148,7 +178,7 @@ XrdPssSys::XrdPssSys() : LocalRoot(0), theN2N(0), DirFlags(0),
 
   Output:   Returns zero upon success otherwise (-errno).
 */
-int XrdPssSys::Init(XrdSysLogger *lp, const char *configfn)
+int XrdPssSys::Init(XrdSysLogger *lp, const char *cFN, XrdOucEnv *envP)
 {
    int NoGo;
    const char *tmp;
@@ -157,18 +187,24 @@ int XrdPssSys::Init(XrdSysLogger *lp, const char *configfn)
 //
    SysTrace.SetLogger(lp);
    eDest.logger(lp);
-   eDest.Say("Copr.  2018, Stanford University, Pss Version " XrdVSTRING);
+   eDest.Say("Copr.  2019, Stanford University, Pss Version " XrdVSTRING);
 
 // Initialize the subsystems
 //
-   tmp = ((NoGo=Configure(configfn)) ? "failed." : "completed.");
+   tmp = ((NoGo = Configure(cFN, envP)) ? "failed." : "completed.");
    eDest.Say("------ Proxy storage system initialization ", tmp);
+
+// Extract Pfc control, if it is there.
+//
+  if (!NoGo)
+      cacheFSctl = (XrdOfsFSctl_PI*)envP->GetPtr("XrdFSCtl_PC*");
+
 
 // All done.
 //
    return NoGo;
 }
-
+  
 /******************************************************************************/
 /*                                 C h m o d                                  */
 /******************************************************************************/
@@ -189,6 +225,26 @@ int XrdPssSys::Chmod(const char *path, mode_t mode, XrdOucEnv *eP)
 // We currently do not support chmod()
 //
    return -ENOTSUP;
+}
+
+/******************************************************************************/
+/*                               C o n n e c t                                */
+/******************************************************************************/
+
+void XrdPssSys::Connect(XrdOucEnv &theEnv)
+{
+   EPNAME("Connect");
+   const XrdSecEntity *client = theEnv.secEnv();
+
+// If we need to personify the client, set it up
+//
+   if (idMapper && client)
+      {const char *fmt = (client->ueid & 0xf0000000 ? "%x" : "U%x");
+       char uName[32];
+       snprintf(uName, sizeof(uName), fmt, client->ueid);
+       DEBUG(client->tident,"Registering as ID "<<uName);
+       idMapper->Register(uName, client, deferID);
+      }
 }
 
 /******************************************************************************/
@@ -218,6 +274,26 @@ int XrdPssSys::Create(const char *tident, const char *path, mode_t Mode,
 {
 
    return -ENOTSUP;
+}
+  
+/******************************************************************************/
+/*                                  D i s c                                   */
+/******************************************************************************/
+
+void XrdPssSys::Disc(XrdOucEnv &theEnv)
+{
+   EPNAME("Disc");
+   const XrdSecEntity *client = theEnv.secEnv();
+
+// If we personified a client, remove that persona.
+//
+   if (idMapper && client)
+      {const char *fmt = (client->ueid & 0xf0000000 ? "%x" : "U%x");
+       char uName[32];
+       snprintf(uName, sizeof(uName), fmt, client->ueid);
+       DEBUG(client->tident,"Unregistering as ID "<<uName);
+       idMapper->Register(uName, 0);
+      }
 }
 
 /******************************************************************************/
@@ -288,11 +364,14 @@ int XrdPssSys::Mkdir(const char *path, mode_t mode, int mkpath, XrdOucEnv *eP)
 
 // Some tracing
 //
-   DEBUG(uInfo.Tident(),"url="<<pbuff);
+  if(DEBUGON) {
+    auto urlObf = obfuscateAuth(pbuff);
+    DEBUG(uInfo.Tident(),"url="<<urlObf);
+  }
 
 // Simply return the proxied result here
 //
-   return (XrdPosixXrootd::Mkdir(pbuff, mode) ? -errno : XrdOssOK);
+   return (XrdPosixXrootd::Mkdir(pbuff, mode) ? Info(errno) : XrdOssOK);
 }
   
 /******************************************************************************/
@@ -332,8 +411,10 @@ int XrdPssSys::Remdir(const char *path, int Opts, XrdOucEnv *eP)
 
 // Do some tracing
 //
-   DEBUG(uInfo.Tident(),"url="<<pbuff);
-
+  if(DEBUGON) {
+    auto urlObf = obfuscateAuth(pbuff);
+    DEBUG(uInfo.Tident(),"url="<<urlObf);
+  }
 // Issue unlink and return result
 //
    return (XrdPosixXrootd::Rmdir(pbuff) ? -errno : XrdOssOK);
@@ -376,7 +457,12 @@ int XrdPssSys::Rename(const char *oldname, const char *newname,
 
 // Do some tracing
 //
-   DEBUG(uInfoOld.Tident(),"old url="<<oldName <<" new url=" <<newName);
+  if(DEBUGON) {
+    auto oldNameObf = obfuscateAuth(oldName);
+    auto newNameObf = obfuscateAuth(newName);
+    DEBUG(uInfoOld.Tident(),"old url="<<oldNameObf <<" new url=" <<newNameObf);
+  }
+
 
 // Execute the rename and return result
 //
@@ -417,9 +503,11 @@ int XrdPssSys::Stat(const char *path, struct stat *buff, int Opts, XrdOucEnv *eP
 //
    XrdPssUrlInfo uInfo(eP, path, Cgi);
 
-// Generate an ID if we need to
+// Generate an ID if we need to. We can use the server's identity unless that
+// has been prohibited because client ID mapping is taking place.
 //
-   if (sidP) uInfo.setID(sidP);
+   if (idMapAll) uInfo.setID();
+      else if (sidP) uInfo.setID(sidP);
 
 // Convert path to URL
 //
@@ -427,11 +515,32 @@ int XrdPssSys::Stat(const char *path, struct stat *buff, int Opts, XrdOucEnv *eP
 
 // Do some tracing
 //
-   DEBUG(uInfo.Tident(),"url="<<pbuff);
+  if(DEBUGON) {
+    auto urlObf = obfuscateAuth(pbuff);
+    DEBUG(uInfo.Tident(),"url="<<urlObf);
+  }
 
 // Return proxied stat
 //
    return (XrdPosixXrootd::Stat(pbuff, buff) ? -errno : XrdOssOK);
+}
+
+/******************************************************************************/
+/*                                 S t a t s                                  */
+/******************************************************************************/
+  
+/* Function: Return statistics.
+
+  Input:    buff        - Pointer to buffer for statistics data.
+            blen        - The length of the buffer.
+
+  Output:   When blen is not zero, null terminated statistics are placed
+            in buff and the length is returned. When blen is zero, the
+            maximum length needed is returned.
+*/
+int XrdPssSys::Stats(char *bp, int bl)
+{
+   return XrdPosixConfig::Stats("pss", bp, bl);
 }
 
 /******************************************************************************/
@@ -465,7 +574,10 @@ int XrdPssSys::Truncate(const char *path, unsigned long long flen,
 
 // Do some tracing
 //
-   DEBUG(uInfo.Tident(),"url="<<pbuff);
+  if(DEBUGON) {
+    auto urlObf = obfuscateAuth(pbuff);
+    DEBUG(uInfo.Tident(),"url="<<urlObf);
+  }
 
 // Return proxied truncate. We only do this on a single machine because the
 // redirector will forbid the trunc() if multiple copies exist.
@@ -510,7 +622,10 @@ int XrdPssSys::Unlink(const char *path, int Opts, XrdOucEnv *envP)
 
 // Do some tracing
 //
-   DEBUG(uInfo.Tident(),"url="<<pbuff);
+  if(DEBUGON) {
+    auto urlObf = obfuscateAuth(pbuff);
+    DEBUG(uInfo.Tident(),"url="<<urlObf);
+  }
 
 // Unlink the file and return result.
 //
@@ -558,7 +673,10 @@ int XrdPssDir::Opendir(const char *dir_path, XrdOucEnv &Env)
 
 // Do some tracing
 //
-   DEBUG(uInfo.Tident(),"url="<<pbuff);
+  if(DEBUGON) {
+    auto urlObf = obfuscateAuth(pbuff);
+    DEBUG(uInfo.Tident(),"url="<<urlObf);
+  }
 
 // Open the directory
 //
@@ -605,6 +723,18 @@ int XrdPssDir::Readdir(char *buff, int blen)
 }
 
 /******************************************************************************/
+/*                               S t a t R e t                                */
+/******************************************************************************/
+int XrdPssDir::StatRet(struct stat *buff)
+{
+   if (!myDir) return -XRDOSS_E8002;
+
+   auto rc = XrdPosixXrootd::StatRet(myDir, buff);
+   if (rc) return -rc;
+   return XrdOssOK;
+}
+
+/******************************************************************************/
 /*                                 C l o s e                                  */
 /******************************************************************************/
   
@@ -640,8 +770,6 @@ int XrdPssDir::Close(long long *retsz)
 /*                                  o p e n                                   */
 /******************************************************************************/
 
-#define IS_FWDPATH(x) (!strncmp("/xroot:/",x,8) || !strncmp("/root:/",x,7))
-
 /*
   Function: Open the file `path' in the mode indicated by `Mode'.
 
@@ -660,9 +788,13 @@ int XrdPssFile::Open(const char *path, int Oflag, mode_t Mode, XrdOucEnv &Env)
    char pbuff[PBsz];
    int  rc;
    bool tpcMode = (Oflag & O_NOFOLLOW) != 0;
-   bool rwMode  = (Oflag & (O_WRONLY | O_RDWR | O_APPEND)) != 0;
+   bool rwMode  = (Oflag & O_ACCMODE) != O_RDONLY;
    bool ucgiOK  = true;
    bool ioCache = (Oflag & O_DIRECT);
+
+// Record the security environment
+//
+   entity = Env.secEnv();
 
 // Turn off direct flag if set (we record it separately
 //
@@ -674,10 +806,35 @@ int XrdPssFile::Open(const char *path, int Oflag, mode_t Mode, XrdOucEnv &Env)
 
 // If we are opening this in r/w mode make sure we actually can
 //
-   if (rwMode && (popts & XRDEXP_NOTRW))
-      {if (popts & XRDEXP_FORCERO && !tpcMode) Oflag = O_RDONLY;
-          else return -EROFS;
+   if (rwMode)
+      {if (XrdPssSys::fileOrgn) return -EROFS;
+       if (popts & XRDEXP_NOTRW)
+          {if (popts & XRDEXP_FORCERO && !tpcMode) Oflag = O_RDONLY;
+              else return -EROFS;
+          }
       }
+
+   // check CGI cache-control paramters
+   if (cacheFSctl)
+   {
+      int elen;
+      char *envcgi = (char *)Env.Env(elen);
+
+      if (envcgi && strstr(envcgi, "only-if-cached"))
+      {
+         XrdOucErrInfo einfo;
+         XrdSfsFSctl myData;
+         myData.Arg1 = "cached";
+         myData.Arg1Len = 1;
+         myData.Arg2Len = 1;
+         const char *myArgs[1];
+         myArgs[0] = path;
+         myData.ArgP = myArgs;
+         int fsctlRes = cacheFSctl->FSctl(SFS_FSCTL_PLUGXC, myData, einfo);
+         if (fsctlRes == SFS_ERROR)
+            return -einfo.getErrInfo();
+      }
+   }
 
 // If this is a third party copy open, then strange rules apply. If this is an
 // outgoing proxy we let everything pass through as this may be a TPC request
@@ -689,8 +846,18 @@ int XrdPssFile::Open(const char *path, int Oflag, mode_t Mode, XrdOucEnv &Env)
 //
    if (tpcMode)
       {Oflag &= ~O_NOFOLLOW;
-       if (!XrdPssSys::outProxy || !IS_FWDPATH(path))
-          {if (rwMode) {tpcPath = strdup(path); return XrdOssOK;}
+       if (!XrdProxy::outProxy || !IS_FWDPATH(path))
+          {if (rwMode)
+              {tpcPath = strdup(path);
+               if (XrdPssSys::reProxy)
+                  {const char *rPath = Env.Get("tpc.reproxy");
+                   if (!rPath || *rPath != '/') return -ENOATTR;
+                   if (!(rPath = rindex(rPath, '/')) || *(rPath+1) == 0)
+                      return -EFAULT;
+                   rpInfo = new tprInfo(rPath+1);
+                  }
+               return XrdOssOK;
+              }
            ucgiOK = false;
           }
       }
@@ -698,7 +865,7 @@ int XrdPssFile::Open(const char *path, int Oflag, mode_t Mode, XrdOucEnv &Env)
 // Setup any required cgi information. Don't mess with it if it's an objectid
 // or if the we are an outgoing proxy server.
 //
-   if (!XrdPssSys::outProxy && *path == '/' && !(XRDEXP_STAGE & popts))
+   if (!XrdProxy::outProxy && *path == '/' && !(XRDEXP_STAGE & popts))
       Cgi = osslclCGI;
 
 // Construct the url info
@@ -713,7 +880,10 @@ int XrdPssFile::Open(const char *path, int Oflag, mode_t Mode, XrdOucEnv &Env)
 
 // Do some tracing
 //
-   DEBUG(uInfo.Tident(),"url="<<pbuff);
+  if(DEBUGON) {
+    auto urlObf = obfuscateAuth(pbuff);
+    DEBUG(uInfo.Tident(),"url="<<urlObf);
+  }
 
 // Try to open and if we failed, return an error
 //
@@ -721,6 +891,7 @@ int XrdPssFile::Open(const char *path, int Oflag, mode_t Mode, XrdOucEnv &Env)
       {if ((fd = XrdPosixXrootd::Open(pbuff,Oflag,Mode)) < 0) return -errno;
       } else {
        XrdPosixInfo Info;
+       Info.ffReady = XrdPssSys::dcaWorld;
        if (XrdPosixConfig::OpenFC(pbuff,Oflag,Mode,Info))
           {Env.Put("FileURL", Info.cacheURL);
            return -EDESTADDRREQ;
@@ -766,6 +937,120 @@ int XrdPssFile::Close(long long *retsz)
     rc = XrdPosixXrootd::Close(fd);
     fd = -1;
     return (rc == 0 ? XrdOssOK : -errno);
+}
+
+/******************************************************************************/
+/*                                p g R e a d                                 */
+/******************************************************************************/
+
+/*
+  Function:  Read file pages into a buffer and return corresponding checksums.
+
+  Input:   buffer  - pointer to buffer where the bytes are to be placed.
+           offset  - The offset where the read is to start.
+           rdlen   - The number of bytes to read.
+           csvec   - A vector to be filled with the corresponding CRC32C
+                     checksums for each page or page segment, if available.
+           opts    - Options as noted (see inherited class).
+
+   Output: returns Number of bytes that placed in buffer upon success and
+                   -errno upon failure.
+*/
+
+ssize_t XrdPssFile::pgRead(void     *buffer,
+                           off_t     offset,
+                           size_t    rdlen,
+                           uint32_t *csvec,
+                           uint64_t  opts)
+{
+   std::vector<uint32_t> vecCS;
+   uint64_t psxOpts;
+   ssize_t bytes;
+
+// Make sure file is open
+//
+   if (fd < 0) return (ssize_t)-XRDOSS_E8004;
+
+// Set options as needed
+//
+   psxOpts = (csvec ? XrdPosixExtra::forceCS : 0);
+
+// Issue the pgread
+//
+   if ((bytes = XrdPosixExtra::pgRead(fd,buffer,offset,rdlen,vecCS,psxOpts)) < 0)
+      return (ssize_t)-errno;
+
+// Copy out the checksum vector
+//
+   if (vecCS.size() && csvec)
+       memcpy(csvec, vecCS.data(), vecCS.size()*sizeof(uint32_t));
+
+// All done
+//
+   return bytes;
+}
+
+/******************************************************************************/
+/*                               p g W r i t e                                */
+/******************************************************************************/
+/*
+  Function: Write file pages into a file with corresponding checksums.
+
+  Input:  buffer  - pointer to buffer containing the bytes to write.
+          offset  - The offset where the write is to start.
+          wrlen   - The number of bytes to write.
+                    be the last write to the file at or above the offset.
+          csvec   - A vector which contains the corresponding CRC32 checksum
+                    for each page or page segment. If size is 0, then
+                    checksums are calculated. If not zero, the size must
+                    equal the required number of checksums for offset/wrlen.
+          opts    - Options as noted.
+
+  Output: Returns the number of bytes written upon success and -errno
+                  upon failure.
+*/
+
+ssize_t XrdPssFile::pgWrite(void     *buffer,
+                            off_t     offset,
+                            size_t    wrlen,
+                            uint32_t *csvec,
+                            uint64_t  opts)
+{
+   std::vector<uint32_t> vecCS;
+   ssize_t bytes;
+
+// Make sure we have an open file
+//
+   if (fd < 0) return (ssize_t)-XRDOSS_E8004;
+
+// Check if caller wants to verify the checksums before writing
+//
+   if (csvec && (opts & XrdOssDF::Verify))
+      {XrdOucPgrwUtils::dataInfo dInfo((const char*)buffer,csvec,offset,wrlen);
+       off_t bado;
+       int   badc;
+       if (!XrdOucPgrwUtils::csVer(dInfo, bado, badc)) return -EDOM;
+      }
+
+// Check if caller want checksum generated and possibly returned
+//
+   if ((opts & XrdOssDF::doCalc) || csvec == 0)
+      {XrdOucPgrwUtils::csCalc((const char *)buffer, offset, wrlen, vecCS);
+       if (csvec) memcpy(csvec, vecCS.data(), vecCS.size()*sizeof(uint32_t));
+      } else {
+       int n = XrdOucPgrwUtils::csNum(offset, wrlen);
+       vecCS.resize(n);
+       vecCS.assign(n, 0);
+       memcpy(vecCS.data(), csvec, n*sizeof(uint32_t));
+      }
+
+// Issue the pgwrite
+//
+   bytes = XrdPosixExtra::pgWrite(fd, buffer, offset, wrlen, vecCS);
+
+// Return result
+//
+   return (bytes < 0 ? (ssize_t)-errno : bytes);
 }
 
 /******************************************************************************/
@@ -901,14 +1186,77 @@ ssize_t XrdPssFile::Write(const void *buff, off_t offset, size_t blen)
 
 int XrdPssFile::Fstat(struct stat *buff)
 {
-    if (fd < 0)
-       {if (!tpcPath) return -XRDOSS_E8004;
-        if (XrdProxySS.Stat(tpcPath, buff))
-           memset(buff, 0, sizeof(struct stat));
-        return XrdOssOK;
-       }
+   EPNAME("fstat");
 
-    return (XrdPosixXrootd::Fstat(fd, buff) ? -errno : XrdOssOK);
+// If we have a file descriptor then return a stat for it
+//
+   if (fd >= 0) return (XrdPosixXrootd::Fstat(fd, buff) ? -errno : XrdOssOK);
+
+// Otherwise, if this is not a tpc of any kind, return an error
+//
+   if (!tpcPath) return -XRDOSS_E8004;
+
+// If this is a normal tpc then simply issue the stat against the origin
+//
+   if (!rpInfo)
+      {XrdOucEnv fstatEnv(0, 0, entity);
+       return XrdProxySS.Stat(tpcPath, buff, 0, &fstatEnv);
+      }
+
+// This is a reproxy tpc, if we have not yet dertermined the true dest, do so.
+//
+   struct stat Stat;
+
+   if (rpInfo->dstURL == 0
+   ||  !fstatat(rpFD, rpInfo->tprPath, &Stat, AT_SYMLINK_NOFOLLOW))
+      {char lnkbuff[2048]; int lnklen;
+       lnklen = readlinkat(rpFD, rpInfo->tprPath, lnkbuff, sizeof(lnkbuff)-1);
+       if (lnklen <= 0)
+          {int rc = 0;
+           if (lnklen < 0) {if (errno != ENOENT) rc = -errno;}
+               else rc = -EFAULT;
+           if (rc)
+              {unlinkat(rpFD, rpInfo->tprPath, 0);
+               return rc;
+              }
+          } else {
+            unlinkat(rpFD, rpInfo->tprPath, 0);
+            lnkbuff[lnklen] = 0;
+            if (rpInfo->dstURL) free(rpInfo->dstURL);
+            rpInfo->dstURL = strdup(lnkbuff);
+            rpInfo->fSize = 1;
+            DEBUG(tident,rpInfo->tprPath<<" maps "<<tpcPath<<" -> "<<lnkbuff);
+          }
+      }
+
+// At this point we may or may not have the final endpoint. An error here could
+// be due to write error recovery, so make allowance for that.
+//
+   if (rpInfo->dstURL)
+      {if (!XrdPosixXrootd::Stat(rpInfo->dstURL, buff))
+          {if (!(rpInfo->fSize = buff->st_size)) rpInfo->fSize = 1;
+           return XrdOssOK;
+          }
+       free(rpInfo->dstURL);
+       rpInfo->dstURL = 0;
+      }
+
+// We don't have the final endpoint. If we ever had it before, then punt.
+//
+   if (rpInfo->fSize)
+      {memset(buff, 0, sizeof(struct stat));
+       buff->st_size = rpInfo->fSize;
+       return XrdOssOK;
+      }
+
+// If we are here then maybe the reproxy option was the wrong config setting.
+// Give stat a try on the origin we'll retry resolution on the next stat.
+//
+   XrdOucEnv fstatEnv(0, 0, entity);
+
+   if (XrdProxySS.Stat(tpcPath, buff, 0, &fstatEnv))
+       memset(buff, 0, sizeof(struct stat));
+   return XrdOssOK;
 }
 
 /******************************************************************************/
@@ -957,44 +1305,18 @@ int XrdPssFile::Ftruncate(unsigned long long flen)
 
     return (XrdPosixXrootd::Ftruncate(fd, flen) ?  -errno : XrdOssOK);
 }
-
-/******************************************************************************/
-/*                               g e t M m a p                                */
-/******************************************************************************/
   
-/*
-  Function: Indicate whether or not file is memory mapped.
+/******************************************************************************/
+/*                      I n t e r n a l   M e t h o d s                       */
+/******************************************************************************/
 
-  Input:    addr      - Points to an address which will receive the location
-                        memory where the file is mapped. If the address is
-                        null, true is returned if a mapping exist.
-
-  Output:   Returns the size of the file if it is memory mapped (see above).
-            Otherwise, zero is returned and addr is set to zero.
-*/
-off_t XrdPssFile::getMmap(void **addr)   // Not Supported for proxies
+int XrdPssSys::Info(int rc)
 {
-   if (addr) *addr = 0;
-   return 0;
-}
-  
-/******************************************************************************/
-/*                          i s C o m p r e s s e d                           */
-/******************************************************************************/
-  
-/*
-  Function: Indicate whether or not file is compressed.
+   std::string psxMsg;
+   int n = XrdPosixXrootd::QueryError(psxMsg);
 
-  Input:    cxidp     - Points to a four byte buffer to hold the compression
-                        algorithm used if the file is compressed or null.
-
-  Output:   Returns the region size which is 0 if the file is not compressed.
-            If cxidp is not null, the algorithm is returned only if the file
-            is compressed.
-*/
-int XrdPssFile::isCompressed(char *cxidp)  // Not supported for proxies
-{
-    return 0;
+   XrdProxy::ecMsg.Set(n, psxMsg);
+   return -rc;
 }
   
 /******************************************************************************/
@@ -1041,10 +1363,10 @@ int XrdPssSys::P2OUT(char *pbuff, int pblen, XrdPssUrlInfo &uInfo)
 // Make sure the path is valid for an outgoing proxy
 //
    if (*path == '/') path++;
-   if ((pname = XrdPssSys::valProt(path, n, 1))) path += n;
+   if ((pname = XrdPssUtils::valProt(path, n, 1))) path += n;
       else {if (!hdrLen) return -ENOTSUP;
             n = snprintf(pbuff, pblen, hdrData, theID, thePath);
-            if (n >= pblen || !uInfo.addCGI(pbuff+n, pblen-n))
+            if (n >= pblen || !uInfo.addCGI(pbuff, pbuff+n, pblen-n))
                return -ENAMETOOLONG;
             return 0;
            }
@@ -1059,7 +1381,7 @@ int XrdPssSys::P2OUT(char *pbuff, int pblen, XrdPssUrlInfo &uInfo)
        if (Police[PolObj] && !P2DST(retc, hBuff, sizeof(hBuff), PolObj,
                                     path+(*path == '/' ? 1:0))) return 0;
        n = snprintf(pbuff, pblen, "%s%s%s", pname, theID, path);
-       if (n >= pblen || !uInfo.addCGI(pbuff+n, pblen-n))
+       if (n >= pblen || !uInfo.addCGI(pbuff, pbuff+n, pblen-n))
           return -ENAMETOOLONG;
        return 0;
       }
@@ -1071,13 +1393,16 @@ int XrdPssSys::P2OUT(char *pbuff, int pblen, XrdPssUrlInfo &uInfo)
    if (!(n = P2DST(retc, hBuff, sizeof(hBuff), PolPath, path))) return 0;
    path += n;
 
-// Create the new path
+// Create the new path. If the url already contains a userid then use it
+// instead or our internally generated one. We may need an option for this
+// as it may result in unintended side-effects but for now we do that.
 //
+   if (index(hBuff, '@')) theID= "";
    n = snprintf(pbuff,pblen,"%s%s%s/%s",pname,theID,hBuff,path);
 
 // Make sure the path will fit
 //
-   if (n >= pblen || !uInfo.addCGI(pbuff+n, pblen-n))
+   if (n >= pblen || !uInfo.addCGI(pbuff, pbuff+n, pblen-n))
       return -ENAMETOOLONG;
 
 // All done
@@ -1118,13 +1443,16 @@ int XrdPssSys::P2URL(char *pbuff, int pblen, XrdPssUrlInfo &uInfo, bool doN2N)
 // Format the header into the buffer and check if we overflowed. Note that we
 // defer substitution of the path as we need to know where the path is.
 //
-   pfxLen = snprintf(pbuff, pblen, hdrData, uInfo.getID(), path);
+   if (fileOrgn) pfxLen = snprintf(pbuff, pblen, hdrData, path);
+      else pfxLen = snprintf(pbuff, pblen, hdrData, uInfo.getID(), path);
    if (pfxLen >= pblen) return -ENAMETOOLONG;
 
 // Add any cgi information
 //
-   if (uInfo.hasCGI())
-      {if (!uInfo.addCGI(pbuff+pfxLen, pblen-pfxLen)) return -ENAMETOOLONG;}
+   if (!fileOrgn && uInfo.hasCGI())
+      {if (!uInfo.addCGI(pbuff, pbuff+pfxLen, pblen-pfxLen))
+          return -ENAMETOOLONG;
+      }
 
 // All done
 //

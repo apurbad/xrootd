@@ -28,27 +28,155 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <ctype.h>
-#include <errno.h>
+#include <cctype>
 #include <grp.h>
-#include <stdio.h>
+#include <cstdio>
+#include <list>
+#include <vector>
+#include <unordered_set>
+#include <algorithm>
+
+#include <regex.h>
 
 #ifdef WIN32
 #include <direct.h>
 #include "XrdSys/XrdWin32.hh"
 #else
 #include <fcntl.h>
+#include <math.h>
 #include <pwd.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #endif
+#include <map>
 #include "XrdNet/XrdNetUtils.hh"
+#include "XrdOuc/XrdOucCRC.hh"
 #include "XrdOuc/XrdOucEnv.hh"
+#include "XrdOuc/XrdOucSHA3.hh"
+#include "XrdOuc/XrdOucStream.hh"
+#include "XrdOuc/XrdOucString.hh"
 #include "XrdOuc/XrdOucUtils.hh"
+#include "XrdOuc/XrdOucPrivateUtils.hh"
+#include "XrdSys/XrdSysE2T.hh"
 #include "XrdSys/XrdSysError.hh"
 #include "XrdSys/XrdSysPlatform.hh"
-#include "XrdOuc/XrdOucStream.hh"
+#include "XrdSys/XrdSysPthread.hh"
+
+#ifndef ENODATA
+#define ENODATA ENOATTR
+#endif
+
+/******************************************************************************/
+/*                         L o c a l   M e t h o d s                          */
+/******************************************************************************/
   
+namespace
+{
+struct idInfo
+{      time_t  Expr;
+       char   *Name;
+
+       idInfo(const char *name, time_t keep)
+             : Expr(time(0)+keep), Name(strdup(name)) {}
+      ~idInfo() {free(Name);}
+};
+
+typedef std::map<unsigned int, struct idInfo*> idMap_t;
+
+idMap_t     gidMap;
+idMap_t     uidMap;
+XrdSysMutex idMutex;
+
+void AddID(idMap_t &idMap, unsigned int id, const char *name, time_t keepT)
+{
+   std::pair<idMap_t::iterator,bool> ret;
+   idInfo *infoP = new idInfo(name, keepT);
+
+   idMutex.Lock();
+   ret = idMap.insert(std::pair<unsigned int, struct idInfo*>(id, infoP));
+   if (ret.second == false) delete infoP;
+   idMutex.UnLock();
+}
+
+int LookUp(idMap_t &idMap, unsigned int id, char *buff, int blen)
+{
+   idMap_t::iterator it;
+   int luRet = 0;
+
+   idMutex.Lock();
+   it = idMap.find(id);
+   if (it != idMap.end())
+      {if (it->second->Expr <= time(0))
+          {delete it->second;
+           idMap.erase(it);
+          } else {
+           if (blen > 0) luRet = snprintf(buff, blen, "%s", it->second->Name);
+          }
+      }
+   idMutex.UnLock();
+   return luRet;
+}
+}
+
+/******************************************************************************/
+/*                               a r g L i s t                                */
+/******************************************************************************/
+
+int XrdOucUtils::argList(char *args, char **argV, int argC)
+{
+   char *aP = args;
+   int j;
+
+// Construct the argv array based on passed command line.
+//
+for (j = 0; j < argC; j++)
+    {while(*aP == ' ') aP++;
+     if (!(*aP)) break;
+
+     if (*aP == '"' || *aP == '\'')
+        {argV[j] = aP+1;
+         aP = index(aP+1, *aP);
+         if (!aP || (*(aP+1) != ' ' && *(aP+1)))
+            {if (!j) argV[0] = 0; return -EINVAL;}
+         *aP++ = '\0';
+        } else {
+         argV[j] = aP;
+         if ((aP = index(aP+1, ' '))) *aP++ = '\0';
+            else {j++; break;}
+        }
+
+    }
+
+// Make sure we did not overflow the vector
+//
+   if (j > argC-1) return -E2BIG;
+
+// End list with a null pointer and return the actual number of arguments
+//
+   argV[j] = 0;
+   return j;
+}
+  
+/******************************************************************************/
+/*                               b i n 2 h e x                                */
+/******************************************************************************/
+  
+char *XrdOucUtils::bin2hex(char *inbuff, int dlen, char *buff, int blen,
+                           bool sep)
+{
+    static const char hv[] = "0123456789abcdef";
+    char *outbuff = buff;
+    for (int i = 0; i < dlen && blen > 2; i++) {
+        *outbuff++ = hv[(inbuff[i] >> 4) & 0x0f];
+        *outbuff++ = hv[ inbuff[i]       & 0x0f];
+        blen -= 2;
+        if (sep && blen > 1 && ((i & 0x03) == 0x03 || i+1 == dlen))
+           {*outbuff++ = ' '; blen--;}
+        }
+     *outbuff = '\0';
+     return buff;
+}
+
 /******************************************************************************/
 /*                              e n d s W i t h                               */
 /******************************************************************************/
@@ -64,21 +192,20 @@ bool XrdOucUtils::endsWith(const char *text, const char *ending, int endlen)
 /*                                 e T e x t                                  */
 /******************************************************************************/
   
-// eText() returns the text associated with the error, making the first
-// character in the text lower case. The text buffer pointer is returned.
+// eText() returns the text associated with the error.
+// The text buffer pointer is returned.
 
-char *XrdOucUtils::eText(int rc, char *eBuff, int eBlen, int AsIs)
+char *XrdOucUtils::eText(int rc, char *eBuff, int eBlen)
 {
    const char *etP;
 
 // Get error text
 //
-   if (!(etP = strerror(rc)) || !(*etP)) etP = "reason unknown";
+   etP = XrdSysE2T(rc);
 
 // Copy the text and lower case the first letter
 //
    strlcpy(eBuff, etP, eBlen);
-   if (!AsIs) *eBuff = tolower(*eBuff);
 
 // All done
 //
@@ -98,7 +225,7 @@ char *XrdOucUtils::eText(int rc, char *eBuff, int eBlen, int AsIs)
 // Returning 1 if true (i.e., this machine is one of the named hosts in hostlist 
 // and is running one of the programs pgmlist and named by one of the names in 
 // namelist).
-// Return -1 (negative truth) if an error occured.
+// Return -1 (negative truth) if an error occurred.
 // Otherwise, returns false (0). Some combination of hostlist, pgm, and 
 // namelist, must be specified.
 
@@ -222,6 +349,42 @@ int XrdOucUtils::doIf(XrdSysError *eDest, XrdOucStream &Config,
 }
 
 /******************************************************************************/
+/*                               f i n d P g m                                */
+/******************************************************************************/
+
+bool XrdOucUtils::findPgm(const char *pgm, XrdOucString& path)
+{
+   struct stat Stat;
+
+// Check if only executable bit needs to be checked
+//
+   if (*pgm == '/')
+      {if (stat(pgm, &Stat) || !(Stat.st_mode & S_IXOTH)) return false;
+       path = pgm;
+       return true;
+      }
+
+// Make sure we have the paths to check
+//
+   const char *pEnv = getenv("PATH");
+   if (!pEnv) return false;
+
+// Setup to find th executable
+//
+   XrdOucString prog, pList(pEnv);
+   int from = 0;;
+   prog += '/'; prog += pgm;
+
+// Find it!
+//
+   while((from = pList.tokenize(path, from, ':')) != -1)
+        {path += prog;
+         if (!stat(path.c_str(), &Stat) && Stat.st_mode & S_IXOTH) return true;
+        }
+   return false;
+}
+  
+/******************************************************************************/
 /*                              f m t B y t e s                               */
 /******************************************************************************/
   
@@ -288,7 +451,147 @@ int XrdOucUtils::genPath(char *buff, int blen, const char *path, const char *psf
 }
 
 /******************************************************************************/
-/*                                G r o u p s                                 */
+/*                               g e t F i l e                                */
+/******************************************************************************/
+
+char *XrdOucUtils::getFile(const char *path, int &rc, int maxsz, bool notempty)
+{
+   struct stat Stat;
+   struct fdHelper
+         {int fd = -1;
+              fdHelper() {}
+             ~fdHelper() {if (fd >= 0) close(fd);}
+         } file;
+   char *buff;
+   int   flen;
+
+// Preset RC
+//
+   rc = 0;
+
+// Open the file in read mode
+//
+   if ((file.fd = open(path, O_RDONLY)) < 0) {rc = errno; return 0;}
+
+// Get the size of the file
+//
+   if (fstat(file.fd, &Stat)) {rc = errno; return 0;}
+
+// Check if the size exceeds the maximum allowed
+//
+   if (Stat.st_size > maxsz) {rc = EFBIG; return 0;}
+
+// Make sure the file is not empty if empty files are disallowed
+//
+   if (Stat.st_size == 0 && notempty) {rc = ENODATA; return 0;}
+
+// Allocate a buffer
+//
+   if ((buff = (char *)malloc(Stat.st_size+1)) == 0)
+      {rc = errno; return 0;}
+
+// Read the contents of the file into the buffer
+//
+   if (Stat.st_size)
+      {if ((flen = read(file.fd, buff, Stat.st_size)) < 0)
+          {rc = errno; free(buff); return 0;}
+      } else flen = 0;
+
+// Add null byte. recall the buffer is bigger by one byte
+//
+   buff[flen] = 0;
+
+// Return the size aand the buffer
+//
+   rc = flen;
+   return buff;
+}
+
+/******************************************************************************/
+/*                                g e t G I D                                 */
+/******************************************************************************/
+  
+bool XrdOucUtils::getGID(const char *gName, gid_t &gID)
+{
+   struct group Grp, *result;
+   char buff[65536];
+
+   getgrnam_r(gName, &Grp, buff, sizeof(buff), &result);
+   if (!result) return false;
+
+   gID = Grp.gr_gid;
+   return true;
+}
+
+/******************************************************************************/
+/*                                g e t U I D                                 */
+/******************************************************************************/
+  
+bool XrdOucUtils::getUID(const char *uName, uid_t &uID, gid_t *gID)
+{
+   struct passwd pwd, *result;
+   char buff[16384];
+
+   getpwnam_r(uName, &pwd, buff, sizeof(buff), &result);
+   if (!result) return false;
+
+   uID = pwd.pw_uid;
+   if (gID) *gID = pwd.pw_gid;
+
+   return true;
+}
+  
+/******************************************************************************/
+/*                               G i d N a m e                                */
+/******************************************************************************/
+  
+int XrdOucUtils::GidName(gid_t gID, char *gName, int gNsz, time_t keepT)
+{
+   static const int maxgBsz = 256*1024;
+   static const int addGsz  = 4096;
+   struct group  *gEnt, gStruct;
+   char gBuff[1024], *gBp = gBuff;
+   int glen = 0, gBsz = sizeof(gBuff), aOK = 1;
+   int n, retVal = 0;
+
+// Get ID from cache, if allowed
+//
+   if (keepT)
+      {int n = LookUp(gidMap, static_cast<unsigned int>(gID),gName,gNsz);
+       if (n > 0) return (n < gNsz ? n : 0);
+      }
+
+// Get the the group struct. If we don't have a large enough buffer, get a
+// larger one and try again up to the maximum buffer we will tolerate.
+//
+   while(( retVal = getgrgid_r(gID, &gStruct, gBp, gBsz, &gEnt) ) == ERANGE)
+        {if (gBsz >= maxgBsz) {aOK = 0; break;}
+         if (gBsz >  addGsz) free(gBp);
+         gBsz += addGsz;
+         if (!(gBp = (char *)malloc(gBsz))) {aOK = 0; break;}
+        }
+
+// Return a group name if all went well
+//
+   if (aOK && retVal == 0 && gEnt != NULL)
+      {if (keepT)
+          AddID(gidMap, static_cast<unsigned int>(gID), gEnt->gr_name, keepT);
+       glen = strlen(gEnt->gr_name);
+       if (glen >= gNsz) glen = 0;
+          else strcpy(gName, gEnt->gr_name);
+      } else {
+       n = snprintf(gName, gNsz, "%ud", static_cast<unsigned int>(gID));
+       if (n >= gNsz) glen = 0;
+      }
+
+// Free any allocated buffer and return result
+//
+   if (gBsz >  addGsz && gBp) free(gBp);
+   return glen;
+}
+
+/******************************************************************************/
+/*                             G r o u p N a m e                              */
 /******************************************************************************/
   
 int XrdOucUtils::GroupName(gid_t gID, char *gName, int gNsz)
@@ -325,24 +628,118 @@ int XrdOucUtils::GroupName(gid_t gID, char *gName, int gNsz)
 }
 
 /******************************************************************************/
+/*                                 H S i z e                                  */
+/******************************************************************************/
+
+const char *XrdOucUtils::HSize(size_t bytes, char* buff, int bsz)
+{
+
+// Do fast conversion of the quantity is less than 1K
+//
+   if (bytes < 1024)
+      {snprintf(buff, bsz, "%zu", bytes);
+       return buff;
+      }
+
+// Scale this down
+//
+   const char *suffix = " KMGTPEYZ";
+   double dBytes = static_cast<double>(bytes);
+
+do{dBytes /= 1024.0; suffix++;
+  }  while(dBytes >= 1024.0 && *(suffix+1));
+
+
+// Format and return result. Include fractions only if they meaningfully exist.
+//
+   double whole, frac = modf(dBytes, &whole);
+   if (frac >= .005) snprintf(buff, bsz, "%.02lf%c", dBytes, *suffix);
+      else snprintf(buff, bsz, "%g%c", whole, *suffix);
+   return buff;
+}
+  
+/******************************************************************************/
+/*                                i 2 b s t r                                 */
+/******************************************************************************/
+
+const char *XrdOucUtils::i2bstr(char *buff, int blen, int val, bool pad)
+{
+   char zo[2] = {'0', '1'};
+
+   if (blen < 2) return "";
+
+   buff[--blen] = 0;
+   if (!val) buff[blen--] = '0';
+      else while(val && blen >= 0)
+                {buff[blen--] = zo[val & 0x01];
+                 val >>= 1;
+                }
+
+   if (blen >= 0 && pad) while(blen >= 0) buff[blen--] = '0';
+
+   return &buff[blen+1];
+}
+  
+/******************************************************************************/
 /*                                 I d e n t                                  */
 /******************************************************************************/
 
+namespace
+{
+long long genSID(char *&urSID, const char *iHost, int         iPort,
+                               const char *iName, const char *iProg)
+{
+   static const XrdOucSHA3::MDLen mdLen = XrdOucSHA3::SHA3_512;
+   static const uint32_t fpOffs = 2, fpSize = 6;  // 48 bit finger print
+
+   const char *iSite = getenv("XRDSITE");
+   unsigned char mDigest[mdLen];
+   XrdOucString  myID;
+   union {uint64_t mdLL; unsigned char mdUC[8];}; // Works for fpSize only!
+
+// Construct our unique identification
+//
+   if (iSite) myID  = iSite;
+   myID += iHost;
+   myID += iPort;
+   if (iName) myID += iName;
+   myID += iProg;
+
+// Generate a SHA3 digest of this string.
+//
+   memset(mDigest, 0, sizeof(mDigest));
+   XrdOucSHA3::Calc(myID.c_str(), myID.length(), mDigest, mdLen);
+
+// Generate a CRC32C of the same string
+//
+   uint32_t crc32c = XrdOucCRC::Calc32C(myID.c_str(), myID.length());
+
+// We need a 48-bit fingerprint that has a very low probability of collision.
+// We accomplish this by convoluting the CRC32C checksum with the SHA3 checksum.
+//
+   uint64_t fpPos = crc32c % (((uint32_t)mdLen) - fpSize);
+   mdLL = 0;
+   memcpy(mdUC+fpOffs, mDigest+fpPos, fpSize);
+   long long fpVal = static_cast<long long>(ntohll(mdLL));
+
+// Generate the character version of our fingerprint and return the binary one.
+//
+   char fpBuff[64];
+   snprintf(fpBuff, sizeof(fpBuff), "%lld", fpVal);
+   urSID = strdup(fpBuff);
+   return fpVal;
+}
+}
+
 char *XrdOucUtils::Ident(long long  &mySID, char *iBuff, int iBlen,
                          const char *iHost, const char *iProg,
-                         const char *iName, int Port)
+                         const char *iName, int iPort)
 {
-   const char *sP;
-   char sName[64], uName[256];
-   long long urSID;
-   int  myPid;
-
-// Generate our server ID
-//
-   myPid   = static_cast<int>(getpid());
-   urSID   = static_cast<long long>(myPid)<<16ll | Port;
-   sprintf(sName, "%lld", urSID);
-   if (!(sP = getenv("XRDSITE"))) sP = "";
+   static char *theSIN;
+   static long long theSID = genSID(theSIN, iHost, iPort, iName, iProg);
+   const char *sP = getenv("XRDSITE");
+   char uName[256];
+   int myPid   = static_cast<int>(getpid());
 
 // Get our username
 //
@@ -351,13 +748,13 @@ char *XrdOucUtils::Ident(long long  &mySID, char *iBuff, int iBlen,
 
 // Create identification record
 //
-   snprintf(iBuff, iBlen, "%s.%d:%s@%s\n&pgm=%s&inst=%s&port=%d&site=%s",
-                          uName, myPid, sName, iHost, iProg, iName, Port, sP);
+   snprintf(iBuff,iBlen,"%s.%d:%s@%s\n&site=%s&port=%d&inst=%s&pgm=%s",
+            uName, myPid, theSIN, iHost, (sP ? sP : ""), iPort, iName, iProg);
 
-// Return a copy of the sid
+// Return a copy of the sid key
 //
-   h2nll(urSID, mySID);
-   return strdup(sName);
+   h2nll(theSID, mySID);
+   return strdup(theSIN);
 }
   
 /******************************************************************************/
@@ -484,7 +881,7 @@ int XrdOucUtils::Log10(unsigned long long n)
   
 void XrdOucUtils::makeHome(XrdSysError &eDest, const char *inst)
 {
-   char buff[1024];
+   char buff[2048];
 
    if (!inst || !getcwd(buff, sizeof(buff))) return;
 
@@ -503,11 +900,11 @@ void XrdOucUtils::makeHome(XrdSysError &eDest, const char *inst)
 bool XrdOucUtils::makeHome(XrdSysError &eDest, const char *inst,
                                                const char *path, mode_t mode)
 {
-   char cwDir[1024];
+   char cwDir[2048];
    const char *slash = "", *slash2 = "";
    int n, rc;
 
-// Provide backward compatability for instance name qualification
+// Provide backward compatibility for instance name qualification
 //
 
    if (!path || !(n = strlen(path)))
@@ -528,7 +925,7 @@ bool XrdOucUtils::makeHome(XrdSysError &eDest, const char *inst,
 
 // Create the path if it doesn't exist
 //
-   if ((rc = makePath(cwDir, mode)))
+   if ((rc = makePath(cwDir, mode, true)))
       {eDest.Emsg("Config", rc, "create home directory", cwDir);
        return false;
       }
@@ -549,14 +946,15 @@ bool XrdOucUtils::makeHome(XrdSysError &eDest, const char *inst,
 /*                              m a k e P a t h                               */
 /******************************************************************************/
   
-int XrdOucUtils::makePath(char *path, mode_t mode)
+int XrdOucUtils::makePath(char *path, mode_t mode, bool reset)
 {
     char *next_path = path+1;
     struct stat buf;
+    bool dochmod = false; // The 1st component stays as is
 
 // Typically, the path exists. So, do a quick check before launching into it
 //
-   if (!stat(path, &buf)) return 0;
+   if (!reset && !stat(path, &buf)) return 0;
 
 // Start creating directories starting with the root
 //
@@ -564,6 +962,8 @@ int XrdOucUtils::makePath(char *path, mode_t mode)
         {*next_path = '\0';
          if (MAKEDIR(path, mode))
             if (errno != EEXIST) return -errno;
+         if (dochmod) CHMOD(path, mode);
+         dochmod = reset;
          *next_path = '/';
          next_path = next_path+1;
         }
@@ -573,6 +973,97 @@ int XrdOucUtils::makePath(char *path, mode_t mode)
    return 0;
 }
  
+/******************************************************************************/
+/*                             m o d e 2 m a s k                              */
+/******************************************************************************/
+
+bool XrdOucUtils::mode2mask(const char *mode, mode_t &mask)
+{
+   mode_t mval[3] = {0}, mbit[3] = {0x04, 0x02, 0x01};
+   const char *mok = "rwx";
+   char mlet;
+
+// Accept octal mode
+//
+   if (isdigit(*mode))
+      {char *eP;
+       mask = strtol(mode, &eP, 8);
+       return *eP == 0;
+      }
+
+// Make sure we have the correct number of characters
+//
+   int n = strlen(mode);
+   if (!n || n > 9 || n/3*3 != n) return false;
+
+// Convert groups of three
+//
+   int k = 0;
+   do {for (int i = 0; i < 3; i++)
+           {mlet = *mode++;
+            if (mlet != '-')
+               {if (mlet != mok[i]) return false;
+                mval[k] |= mbit[i]; 
+               }
+           } 
+       } while(++k < 3 && *mode);
+
+// Combine the modes and return success
+//
+   mask = mval[0]<<6 | mval[1]<<3 | mval[2];
+   return true;
+}
+  
+/******************************************************************************/
+/*                              p a r s e L i b                               */
+/******************************************************************************/
+  
+bool XrdOucUtils::parseLib(XrdSysError &eDest, XrdOucStream &Config,
+                           const char *libName, char *&libPath, char **libParm)
+{
+    char *val, parms[2048];
+
+// Get the next token
+//
+   val = Config.GetWord();
+
+// We do not support stacking as the caller does not support stacking
+//
+   if (val && !strcmp("++", val))
+      {eDest.Say("Config warning: stacked plugins are not supported in "
+                 "this context; directive ignored!");
+       return true;
+      }
+
+// Now skip over any options
+//
+   while(val && *val && *val == '+') val = Config.GetWord();
+
+// Check if we actually have a path
+//
+   if (!val || !val[0])
+      {eDest.Emsg("Config", libName, "not specified"); return false;}
+
+// Record the path
+//
+   if (libPath) free(libPath);
+   libPath = strdup(val);
+
+// Handle optional parameter
+//
+   if (!libParm) return true;
+   if (*libParm) free(*libParm);
+   *libParm = 0;
+
+// Record any parms
+//
+   *parms = 0;
+   if (!Config.GetRest(parms, sizeof(parms)))
+      {eDest.Emsg("Config", libName, "parameters too long"); return false;}
+   if (*parms) *libParm = strdup(parms);
+   return true;
+}
+
 /******************************************************************************/
 /*                             p a r s e H o m e                              */
 /******************************************************************************/
@@ -615,7 +1106,7 @@ char *XrdOucUtils::parseHome(XrdSysError &eDest, XrdOucStream &Config, int &mode
 
 int XrdOucUtils::ReLink(const char *path, const char *target, mode_t mode)
 {
-   const mode_t AMode = S_IRWXU|S_IRWXG; // 770
+   const mode_t AMode = S_IRWXU;  // Only us as a default
    char pbuff[MAXPATHLEN+64];
    int n;
 
@@ -631,6 +1122,28 @@ int XrdOucUtils::ReLink(const char *path, const char *target, mode_t mode)
    makePath(pbuff, (mode ? mode : AMode));
    if (symlink(target, path)) return errno;
    return 0;
+}
+
+/******************************************************************************/
+/*                              S a n i t i z e                               */
+/******************************************************************************/
+
+void XrdOucUtils::Sanitize(char *str, char subc)
+{
+
+// Sanitize string according to POSIX.1-2008 stanadard using only the
+// Portable Filename Character Set: a-z A-Z 0-9 ._- with 1st char not being -
+//
+   if (*str)
+      {if (*str == '-') *str = subc;
+          else if (*str == ' ') *str = subc;
+       char *blank = rindex(str, ' ');
+       if (blank) while(*blank == ' ') *blank-- = 0;
+       while(*str)
+            {if (!isalnum(*str) && index("_-.", *str) == 0) *str = subc;
+             str++;
+            }
+      }
 }
 
 /******************************************************************************/
@@ -667,9 +1180,11 @@ char *XrdOucUtils::subLogfn(XrdSysError &eDest, const char *inst, char *logfn)
 
 void XrdOucUtils::toLower(char *str)
 {
+   unsigned char* ustr = (unsigned char*)str;  // Avoid undefined behaviour
+
 // Change each character to lower case
 //
-   while(*str) {*str = tolower(*str); str++;}
+   while(*ustr) {*ustr = tolower(*ustr); ustr++;}
 }
   
 /******************************************************************************/
@@ -789,6 +1304,45 @@ void XrdOucUtils::Undercover(XrdSysError &eDest, int noLog, int *pipeFD)
   for (myfd = 3; myfd < maxFiles; myfd++)
       if( (!pipeFD || myfd != pipeFD[1]) && myfd != logFD ) close(myfd);
 }
+  
+/******************************************************************************/
+/*                               U i d N a m e                                */
+/******************************************************************************/
+  
+int XrdOucUtils::UidName(uid_t uID, char *uName, int uNsz, time_t keepT)
+{
+   struct passwd *pEnt, pStruct;
+   char pBuff[1024];
+   int n, rc;
+
+// Get ID from cache, if allowed
+//
+   if (keepT)
+      {int n = LookUp(uidMap, static_cast<unsigned int>(uID),uName,uNsz);
+       if (n > 0) return (n < uNsz ? n : 0);
+      }
+
+// Try to obtain the username. We use this form to make sure we are using
+// the standards conforming version (compilation error otherwise).
+//
+   rc = getpwuid_r(uID, &pStruct, pBuff, sizeof(pBuff), &pEnt);
+   if (rc || !pEnt)
+      {n = snprintf(uName, uNsz, "%ud", static_cast<unsigned int>(uID));
+       return (n >= uNsz ? 0 : n);
+      }
+
+// Add entry to the cache if need be
+//
+   if (keepT)
+      AddID(uidMap, static_cast<unsigned int>(uID), pEnt->pw_name, keepT);
+
+// Return length of username or zero if it is too big
+//
+   n = strlen(pEnt->pw_name);
+   if (uNsz <= (int)strlen(pEnt->pw_name)) return 0;
+   strcpy(uName, pEnt->pw_name);
+   return n;
+}
 
 /******************************************************************************/
 /*                              U s e r N a m e                               */
@@ -815,6 +1369,39 @@ int XrdOucUtils::UserName(uid_t uID, char *uName, int uNsz)
 }
 
 /******************************************************************************/
+/*                               V a l P a t h                                */
+/******************************************************************************/
+
+const char *XrdOucUtils::ValPath(const char *path, mode_t allow, bool isdir)
+{
+   static const mode_t mMask = S_IRWXU | S_IRWXG | S_IRWXO;
+   struct stat buf;
+
+// Check if this really exists
+//
+   if (stat(path, &buf))
+      {if (errno == ENOENT) return "does not exist.";
+       return XrdSysE2T(errno);
+      }
+
+// Verify that this is the correct type of file
+//
+   if (isdir)
+      {if (!S_ISDIR(buf.st_mode)) return "is not a directory.";
+      } else {
+       if (!S_ISREG(buf.st_mode)) return "is not a file.";
+      }
+
+// Verify that the does not have excessive privileges
+//
+   if ((buf.st_mode & mMask) & ~allow) return "has excessive access rights.";
+
+// All went well
+//
+   return 0;
+}
+  
+/******************************************************************************/
 /*                               P i d F i l e                                */
 /******************************************************************************/
   
@@ -840,5 +1427,85 @@ bool XrdOucUtils::PidFile(XrdSysError &eDest, const char *path)
    close(fd);
    return true;
 }
-#endif
+/******************************************************************************/
+/*                               getModificationTime                          */
+/******************************************************************************/
+int XrdOucUtils::getModificationTime(const char *path, time_t &modificationTime) {
+    struct stat buf;
+    int statRet = ::stat(path,&buf);
+    if(!statRet) {
+        modificationTime = buf.st_mtime;
+    }
+    return statRet;
+}
 
+void XrdOucUtils::trim(std::string &str) {
+    // Trim leading non-letters
+    while( str.size() && !isgraph(str[0]) ) str.erase(str.begin());
+
+    // Trim trailing non-letters
+
+    while( str.size() && !isgraph(str[str.size()-1]) )
+        str.resize (str.size () - 1);
+}
+
+/**
+ * Returns a boolean indicating whether 'c' is a valid token character or not.
+ * See https://datatracker.ietf.org/doc/html/rfc6750#section-2.1 for details.
+ */
+
+static bool is_token_character(int c)
+{
+  if (isalnum(c))
+    return true;
+
+  static constexpr char token_chars[] = "-._~+/=:%";
+
+  for (char ch : token_chars)
+    if (c == ch)
+      return true;
+
+  return false;
+}
+
+/**
+ * This function obfuscates away authz= cgi elements and/or HTTP authorization
+ * headers from URL or other log line strings which might contain them.
+ *
+ * @param input the string to obfuscate
+ * @return the string with token values obfuscated
+ */
+
+std::string obfuscateAuth(const std::string& input)
+{
+  static const regex_t auth_regex = []() {
+    constexpr char re[] =
+      "(authz=|(transferheader)?(www-|proxy-)?auth(orization|enticate)[[:space:]]*:[[:space:]]*)"
+      "(Bearer([[:space:]]|%20)?(token([[:space:]]|%20)?)?)?";
+
+    regex_t regex;
+
+    if (regcomp(&regex, re, REG_EXTENDED | REG_ICASE) != 0)
+      throw std::runtime_error("Failed to compile regular expression");
+
+    return regex;
+  }();
+
+  regmatch_t match;
+  size_t offset = 0;
+  std::string redacted;
+  const char *const text = input.c_str();
+
+  while (regexec(&auth_regex, text + offset, 1, &match, 0) == 0) {
+    redacted.append(text + offset, match.rm_eo).append("REDACTED");
+
+    offset += match.rm_eo;
+
+    while (offset < input.size() && is_token_character(input[offset]))
+      ++offset;
+  }
+
+  return redacted.append(text + offset);
+}
+
+#endif

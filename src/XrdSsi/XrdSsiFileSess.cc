@@ -27,11 +27,10 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <errno.h>
 #include <fcntl.h>
 #include <stddef.h>
-#include <stdio.h>
-#include <string.h>
+#include <cstdio>
+#include <cstring>
 #include <arpa/inet.h>
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -47,7 +46,6 @@
 #include "XrdSec/XrdSecEntity.hh"
 
 #include "XrdSfs/XrdSfsAio.hh"
-#include "XrdSfs/XrdSfsXio.hh"
 
 #include "XrdSsi/XrdSsiEntity.hh"
 #include "XrdSsi/XrdSsiFileSess.hh"
@@ -60,6 +58,7 @@
 #include "XrdSsi/XrdSsiTrace.hh"
 #include "XrdSsi/XrdSsiUtils.hh"
 
+#include "XrdSys/XrdSysE2T.hh"
 #include "XrdSys/XrdSysError.hh"
   
 /******************************************************************************/
@@ -74,7 +73,9 @@ extern XrdSsiService    *Service;
 extern XrdSsiStats       Stats;
 extern XrdSysError       Log;
 extern int               respWT;
-};
+extern int               minRSZ;
+extern int               maxRSZ;
+}
 
 using namespace XrdSsi;
 
@@ -117,8 +118,6 @@ int             XrdSsiFileSess::freeMax  = 100;
 int             XrdSsiFileSess::freeAbs  = 200;
 
 bool            XrdSsiFileSess::authDNS  = false;
-
-int             XrdSsiFileSess::maxRSZ   = 0;
 
 /******************************************************************************/
 /*                                 A l l o c                                  */
@@ -361,7 +360,7 @@ void XrdSsiFileSess::Init(XrdOucErrInfo &einfo, const char *user, bool forReuse)
   
 bool XrdSsiFileSess::NewRequest(unsigned int     reqid,
                                 XrdOucBuffer    *oP,
-                                XrdSfsXioHandle *bR,
+                                XrdSfsXioHandle  bR,
                                 int              rSz)
 {
    XrdSsiFileReq *reqP;
@@ -459,7 +458,7 @@ int XrdSsiFileSess::open(const char         *path,      // In
                return eNum;
                break;
           default:
-               if (!eText || !(*eText)) eText = strerror(eNum);
+               if (!eText || !(*eText)) eText = XrdSysE2T(eNum);
                DEBUG(path <<" err " <<eNum <<' ' <<eText);
                eInfo->setErrInfo(eNum, eText);
                Stats.Bump(Stats.ReqPrepErrs);
@@ -638,7 +637,7 @@ int XrdSsiFileSess::truncate(XrdSfsFileOffset  flen)  // In
 // Process request (this can only be a cancel request)
 //
    if (reqXQ != XrdSsiRRInfo::Can)
-      return XrdSsiUtils::Emsg(epname, ENOSYS, "trunc", gigID, *eInfo);
+      return XrdSsiUtils::Emsg(epname, ENOTSUP, "trunc", gigID, *eInfo);
 
 // Perform the cancellation
 //
@@ -709,23 +708,19 @@ XrdSfsXferSize XrdSsiFileSess::write(XrdSfsFileOffset  offset,    // In
 // the request object, and then activate it for processing.
 //
    if (reqSize == blen && xioP)
-      {XrdSfsXioHandle *bRef;
-       XrdSfsXio::XioStatus xStat = xioP->Swap(buff, bRef);
-       if (xStat != XrdSfsXio::allOK)
-          {char etxt[16];
-           sprintf(etxt, "%d", xStat);
-           Log.Emsg(epname, "Xio.Swap() return error status of ", etxt);
-           return XrdSsiUtils::Emsg(epname, ENOMEM, "write", gigID, *eInfo);
-          }
-       if (!NewRequest(reqID, 0, bRef, reqPass))
-          return XrdSsiUtils::Emsg(epname, ENOMEM, "write", gigID, *eInfo);
-       return blen;
+      {XrdSfsXioHandle bRef = xioP->Claim(buff, reqSize, minRSZ);
+       if (!bRef)
+          {if (errno) Log.Emsg(epname,"Xio.Claim() failed;",XrdSysE2T(errno));}
+          else {if (!NewRequest(reqID, 0, bRef, reqPass))
+                   return XrdSsiUtils::Emsg(epname,ENOMEM,"write xio",gigID,*eInfo);
+                return blen;
+               }
       }
 
 // The full request is not present, so get a buffer to piece it together
 //
    if (!(oucBuff = BuffPool->Alloc(reqSize)))
-      return XrdSsiUtils::Emsg(epname, ENOMEM, "write", gigID, *eInfo);
+      return XrdSsiUtils::Emsg(epname, ENOMEM, "write alloc", gigID, *eInfo);
 
 // Setup to buffer this
 //
@@ -735,7 +730,7 @@ XrdSfsXferSize XrdSsiFileSess::write(XrdSfsFileOffset  offset,    // In
       {oucBuff->SetLen(reqSize);
 
        if (!NewRequest(reqID, oucBuff, 0, reqPass))
-          return XrdSsiUtils::Emsg(epname, ENOMEM, "write", gigID, *eInfo);
+          return XrdSsiUtils::Emsg(epname, ENOMEM, "write sfs", gigID, *eInfo);
        oucBuff = 0;
       } else oucBuff->SetLen(blen, blen);
    return blen;
@@ -787,11 +782,12 @@ XrdSfsXferSize XrdSsiFileSess::writeAdd(const char     *buff,      // In
        if (!NewRequest(rid, oucBuff, 0, reqSize))
           return XrdSsiUtils::Emsg(epname, ENOMEM, "write", gigID, *eInfo);
        oucBuff = 0;
+      } else {
+       dlen += blen;
+       oucBuff->SetLen(dlen, dlen);
       }
 
 // Return how much we appended
 //
-   dlen += blen;
-   oucBuff->SetLen(dlen, dlen);
    return blen;
 }

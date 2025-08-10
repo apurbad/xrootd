@@ -32,11 +32,11 @@
 /******************************************************************************/
   
 #include <unistd.h>
-#include <errno.h>
+#include <cerrno>
 #include <fcntl.h>
 #include <signal.h>
 #include <strings.h>
-#include <stdio.h>
+#include <cstdio>
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -78,13 +78,12 @@ XrdOssSys  *XrdOssSS = 0;
   
 XrdSysError OssEroute(0, "oss_");
 
-XrdOucTrace OssTrace(&OssEroute);
+XrdSysTrace OssTrace("oss");
 
 /******************************************************************************/
 /*           S t o r a g e   S y s t e m   I n s t a n t i a t o r            */
 /******************************************************************************/
 
-int       XrdOssSys::runOld  = 0;
 char      XrdOssSys::tryMmap = 0;
 char      XrdOssSys::chkMmap = 0;
 
@@ -104,12 +103,16 @@ XrdOss *XrdOssGetSS(XrdSysLogger *Logger, const char *config_fn,
    extern XrdSysError OssEroute;
    XrdOucPinLoader *myLib;
    XrdOss          *ossP;
-   XrdOss          *(*ep)(XrdOss *, XrdSysLogger *, const char *, const char *);
 
 // Verify that versions are compatible.
 //
    if (urVer.vNum != myOssSys.myVersion->vNum
    &&  !XrdSysPlugin::VerCmp(urVer, *(myOssSys.myVersion))) return 0;
+
+// Set logger for tracing and errors
+//
+   OssTrace.SetLogger(Logger);
+   OssEroute.logger(Logger);
 
 // If no library has been specified, return the default object
 //
@@ -120,19 +123,30 @@ XrdOss *XrdOssGetSS(XrdSysLogger *Logger, const char *config_fn,
 // Create a plugin object. Take into account the proxy library. Eventually,
 // we will need to support other core libraries. But, for now, this will do.
 //
-   OssEroute.logger(Logger);
    if (!(myLib = new XrdOucPinLoader(&OssEroute, myOssSys.myVersion,
                                      "osslib",   OssLib))) return 0;
-
-// Now get the entry point of the object creator
+// Declare the interface versions
 //
-   ep = (XrdOss *(*)(XrdOss *, XrdSysLogger *, const char *, const char *))
-                    (myLib->Resolve("XrdOssGetStorageSystem"));
-   if (!ep) return 0;
+   XrdOssGetStorageSystem_t  getOSS1;
+   const char               *epName1 = "XrdOssGetStorageSystem";
+   XrdOssGetStorageSystem2_t getOSS2;
+   const char               *epName2 ="?XrdOssGetStorageSystem2";
 
-// Get the Object now
+// First try finding version 2 of the initializer. If that fails try version 1.
+// In the process, we will get an oss object if we succeed at all.
 //
-   if ((ossP = ep((XrdOss *)&myOssSys, Logger, config_fn, OssParms)) && envP)
+   getOSS2 = (XrdOssGetStorageSystem2_t)myLib->Resolve(epName2);
+   if (getOSS2) ossP = getOSS2((XrdOss *)&myOssSys, Logger,   config_fn,
+                                                    OssParms, envP);
+      else {getOSS1 = (XrdOssGetStorageSystem_t)myLib->Resolve(epName1);
+            if (!getOSS1) return 0;
+            ossP = getOSS1((XrdOss *)&myOssSys, Logger, config_fn, OssParms);
+           }
+
+// Call the legacy EnvInfo() method and set what library we are using if it
+// differs from what we wre passed.
+//
+   if (ossP && envP)
       {ossP->EnvInfo(envP);
        if (envP && strcmp(OssLib, myLib->Path()))
           envP->Put("oss.lib", myLib->Path());
@@ -310,7 +324,16 @@ int XrdOssSys::Mkdir(const char *path, mode_t mode, int mkpath, XrdOucEnv *envP)
 //
    if (!mkdir(local_path, mode))  return XrdOssOK;
    if (mkpath && errno == ENOENT){return Mkpath(local_path, mode);}
-                                  return -errno;
+   if (errno != EEXIST)           return -errno;
+
+// Check if this is a duplicate request
+//
+   struct stat Stat;
+   static const mode_t accBits = (S_IRWXU|S_IRWXG|S_IRWXO);
+
+   if (!stat(local_path, &Stat) && S_ISDIR(Stat.st_mode)
+   && mode == (Stat.st_mode & accBits)) return XrdOssOK;
+   return -EEXIST;
 }
 
 /******************************************************************************/
@@ -483,8 +506,11 @@ int XrdOssDir::Opendir(const char *dir_path, XrdOucEnv &Env)
 
 // Get the processing flags for this directory
 //
-   pflags = XrdOssSS->PathOpts(dir_path);
-   ateof = 0;
+   unsigned long long pflags = XrdOssSS->PathOpts(dir_path);
+   if (pflags & XRDEXP_STAGE)   dOpts |= isStage;
+   if (pflags & XRDEXP_NODREAD) dOpts |= noDread;
+   if (pflags & XRDEXP_NOCHECK) dOpts |= noCheck;
+   ateof = false;
 
 // Generate local path
 //
@@ -494,12 +520,15 @@ int XrdOssDir::Opendir(const char *dir_path, XrdOucEnv &Env)
          else local_path = actual_path;
       else local_path = (char *)dir_path;
 
-// If this is a local filesystem request, open locally.
+// If this is a local filesystem request, open locally. We also obtian the
+// underlying file descriptor.
 //
-   if (!(pflags & XRDEXP_STAGE) || (pflags & XRDEXP_NODREAD))
+   if (!(dOpts & isStage) || (dOpts & noDread))
       {TRACE(Opendir, "lcl path " <<local_path <<" (" <<dir_path <<")");
-       if ((lclfd = opendir((char *)local_path))) {isopen = 1; return XrdOssOK;}
-       return -errno;
+       if (!(lclfd = XrdSysFD_OpenDir(local_path))) return -errno;
+       fd = dirfd(lclfd);
+       isopen = true;
+       return XrdOssOK;
       }
 
 // Generate remote path
@@ -517,18 +546,18 @@ int XrdOssDir::Opendir(const char *dir_path, XrdOucEnv &Env)
 // by making NODREAD mean to read the local directory only (which is not always
 // ideal). So, we keep the code below but comment it out for now.
 //
-// if ((pflags & XRDEXP_NODREAD) && !(pflags & XRDEXP_NOCHECK))
+// if ((dOpts & noDread) && !(dOpts & noCheck))
 //    {struct stat fstat;
 //     if ((retc = XrdOssSS->MSS_Stat(remote_path,&fstat))) return retc;
 //     if (!(S_ISDIR(fstat.st_mode))) return -ENOTDIR;
-//     isopen = 1;
+//     isopen = true;
 //     return XrdOssOK;
 //    }
 
 // Open the directory at the remote location.
 //
    if (!(mssfd = XrdOssSS->MSS_Opendir(remote_path, retc))) return retc;
-   isopen = 1;
+   isopen = true;
    return XrdOssOK;
 }
 
@@ -563,22 +592,26 @@ int XrdOssDir::Readdir(char *buff, int blen)
 //
    if (lclfd)
       {errno = 0;
-       if ((rp = readdir(lclfd)))
-          {strlcpy(buff, rp->d_name, blen);
+       while((rp = readdir(lclfd)))
+            {strlcpy(buff, rp->d_name, blen);
 #ifdef HAVE_FSTATAT
-           if (Stat && fstatat(dirFD, rp->d_name, Stat, 0)) return -errno;
+             if (Stat && fstatat(fd, rp->d_name, Stat, 0))
+                {if (errno != ENOENT) return -errno;
+                 errno = 0;
+                 continue;
+                }
 #endif
-           return XrdOssOK;
-          }
-       *buff = '\0'; ateof = 1;
+             return XrdOssOK;
+            }
+       *buff = '\0'; ateof = true;
        return -errno;
       }
 
 // Simulate the read operation, if need be.
 //
-   if (pflags & XRDEXP_NODREAD)
+   if (dOpts & noDread)
       {if (ateof) *buff = '\0';
-          else   {*buff = '.'; ateof = 1;}
+          else   {*buff = '.'; ateof = true;}
        return XrdOssOK;
       }
 
@@ -618,14 +651,6 @@ int XrdOssDir::StatRet(struct stat *buff)
    return -ENOTSUP;
 #endif
 
-// Now obtain the correct file descriptor which is special in Solaris
-//
-#ifdef __solaris__
-   dirFD = lclfd->dd_fd;
-#else
-   dirFD = dirfd(lclfd);
-#endif
-
 // All is well
 //
    Stat = buff;
@@ -647,15 +672,25 @@ int XrdOssDir::Close(long long *retsz)
 {
     int retc;
 
+// We do not support returing a size
+//
+   if (retsz) *retsz = 0;
+
 // Make sure this object is open
 //
     if (!isopen) return -XRDOSS_E8002;
 
 // Close whichever handle is open
 //
-    if (lclfd) {if (!(retc = closedir(lclfd))) lclfd = 0;}
-       else if (mssfd) { if (!(retc = XrdOssSS->MSS_Closedir(mssfd))) mssfd = 0;}
-               else retc = 0;
+    if (lclfd)
+       {if (!(retc = closedir(lclfd)))
+           {lclfd = 0;
+            isopen = false;
+           }
+       } else {
+        if (mssfd) { if (!(retc = XrdOssSS->MSS_Closedir(mssfd))) mssfd = 0;}
+           else retc = 0;
+       }
 
 // Indicate whether or not we really closed this object
 //
@@ -707,7 +742,7 @@ int XrdOssFile::Open(const char *path, int Oflag, mode_t Mode, XrdOucEnv &Env)
 
 // Check if this is a read/only filesystem
 //
-   if ((Oflag & (O_WRONLY | O_RDWR)) && (popts & XRDEXP_NOTRW))
+   if (((Oflag & O_ACCMODE) != O_RDONLY) && (popts & XRDEXP_NOTRW))
       {if (popts & XRDEXP_FORCERO) Oflag = O_RDONLY;
           else return OssEroute.Emsg("Open",-XRDOSS_E8005,"open r/w",path);
       }
@@ -730,7 +765,7 @@ int XrdOssFile::Open(const char *path, int Oflag, mode_t Mode, XrdOucEnv &Env)
       {do {retc = fstat(fd, &buf);} while(retc && errno == EINTR);
        if (!retc && !(buf.st_mode & S_IFREG))
           {close(fd); fd = (buf.st_mode & S_IFDIR ? -EISDIR : -ENOTBLK);}
-       if (Oflag & (O_WRONLY | O_RDWR))
+       if ((Oflag & O_ACCMODE) != O_RDONLY)
           {FSize = buf.st_size; cacheP = XrdOssCache::Find(local_path);}
           else {if (buf.st_mode & XRDSFS_POSCPEND && fd >= 0)
                    {close(fd); fd=-ETXTBSY;}
@@ -813,7 +848,7 @@ ssize_t XrdOssFile::Read(off_t offset, size_t blen)
 
      if (fd < 0) return (ssize_t)-XRDOSS_E8004;
 
-#if defined(__linux__)
+#if defined(__linux__) || (defined(__FreeBSD_kernel__) && defined(__GLIBC__))
      posix_fadvise(fd, offset, blen, POSIX_FADV_WILLNEED);
 #endif
 
@@ -879,7 +914,7 @@ ssize_t XrdOssFile::ReadV(XrdOucIOVec *readV, int n)
 
 // For platforms that support fadvise, pre-advise what we will be reading
 //
-#if defined(__linux__) && defined(HAVE_ATOMICS)
+#if (defined(__linux__) || (defined(__FreeBSD_kernel__) && defined(__GLIBC__))) && defined(HAVE_ATOMICS)
    EPNAME("ReadV");
    long long begOff, endOff, begLst = -1, endLst = -1;
    int nPR = n;
@@ -913,7 +948,7 @@ ssize_t XrdOssFile::ReadV(XrdOucIOVec *readV, int n)
         if (rdsz < 0 || rdsz != readV[i].size)
            {totBytes =  (rdsz < 0 ? -errno : -ESPIPE); break;}
         totBytes += rdsz;
-#if defined(__linux__) && defined(HAVE_ATOMICS)
+#if (defined(__linux__) || (defined(__FreeBSD_kernel__) && defined(__GLIBC__))) && defined(HAVE_ATOMICS)
         if (nPR < n && readV[nPR].size > 0)
            {begOff = XrdOssSS->prPMask &  readV[nPR].offset;
             endOff = XrdOssSS->prPBits | (readV[nPR].offset+readV[nPR].size);
@@ -931,7 +966,7 @@ ssize_t XrdOssFile::ReadV(XrdOucIOVec *readV, int n)
 
 // All done, return bytes read.
 //
-#if defined(__linux__) && defined(HAVE_ATOMICS)
+#if (defined(__linux__) || (defined(__FreeBSD_kernel__) && defined(__GLIBC__))) && defined(HAVE_ATOMICS)
    if (XrdOssSS->prDepth) AtomicDec((XrdOssSS->prActive));
 #endif
    return totBytes;
@@ -1017,6 +1052,58 @@ int XrdOssFile::Fchmod(mode_t Mode)
     return (fchmod(fd, Mode) ? -errno : XrdOssOK);
 }
   
+/******************************************************************************/
+/*                                  F c t l                                   */
+/******************************************************************************/
+/*
+  Function: Perform control operations on a file.
+
+  Input:    cmd       - The command.
+            alen      - length of arguments.
+            args      - Pointer to arguments.
+            resp      - Pointer to where response should be placed.
+
+  Output:   Returns XrdOssOK upon success and -errno upon failure.
+*/
+
+int XrdOssFile::Fctl(int cmd, int alen, const char *args, char **resp)
+{
+   const struct timeval *utArgs;
+
+   switch(cmd)
+         {case XrdOssDF::Fctl_utimes:
+               if (alen != sizeof(struct timeval)*2 || !args) return -EINVAL;
+               utArgs = (const struct timeval *)args;
+               if (futimes(fd, utArgs)) return -errno;
+               return XrdOssOK;
+               break;
+          default: break;
+         }
+   return -ENOTSUP;
+}
+  
+/******************************************************************************/
+/*                                 F l u s h                                  */
+/******************************************************************************/
+
+/*
+  Function: Flush file pages from the filesyste cache.
+
+  Output:   Returns XrdOssOK upon success and -errno upon failure.
+*/
+
+void XrdOssFile::Flush()
+{
+// This actually only works in Linux so we punt otherwise
+//
+#if defined(__linux__) || (defined(__FreeBSD_kernel__) && defined(__GLIBC__))
+   if (fd>= 0)
+      {fdatasync(fd);
+       posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+      }
+#endif
+}
+
 /******************************************************************************/
 /*                                 F s t a t                                  */
 /******************************************************************************/
@@ -1137,7 +1224,6 @@ int XrdOssFile::Open_ufs(const char *path, int Oflag, int Mode,
                          unsigned long long popts)
 {
     EPNAME("Open_ufs")
-    static const int isWritable = O_WRONLY|O_RDWR;
     int myfd, newfd;
 #ifndef NODEBUG
     char *ftype = (char *)" path=";
@@ -1163,7 +1249,7 @@ int XrdOssFile::Open_ufs(const char *path, int Oflag, int Mode,
 // while it is open. This is advisory so we can ignore any errors.
 //
    if (myfd >= 0
-   && (popts & XRDEXP_PURGE || (popts & XRDEXP_MIG && Oflag & isWritable)))
+   && (popts & XRDEXP_PURGE || (popts & XRDEXP_MIG && ((Oflag & O_ACCMODE) != O_RDONLY))))
       {FLOCK_t lock_args;
        bzero(&lock_args, sizeof(lock_args));
        lock_args.l_type = F_RDLCK;
@@ -1201,8 +1287,8 @@ int XrdOssFile::Open_ufs(const char *path, int Oflag, int Mode,
 
 // Trace the action.
 //
-    TRACE(Open, "fd=" <<myfd <<" flags=" <<std::hex <<Oflag <<" mode="
-                <<std::oct <<Mode <<std::dec <<ftype <<path);
+    TRACE(Open, "fd=" <<myfd <<" flags=" <<Xrd::hex1 <<Oflag <<" mode="
+                <<Xrd::oct1 <<Mode <<ftype <<path);
 
 // All done
 //

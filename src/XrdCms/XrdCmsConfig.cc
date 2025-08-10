@@ -32,11 +32,12 @@
    The methods in this file handle cmsd() initialization.
 */
   
+#include <string>
 #include <unistd.h>
-#include <ctype.h>
+#include <cctype>
 #include <fcntl.h>
 #include <strings.h>
-#include <stdio.h>
+#include <cstdio>
 #include <sys/param.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
@@ -44,6 +45,7 @@
 #include <dirent.h>
 
 #include "XrdVersion.hh"
+#include "Xrd/XrdProtocol.hh"
 #include "Xrd/XrdScheduler.hh"
 #include "Xrd/XrdSendQ.hh"
 
@@ -107,7 +109,7 @@ namespace XrdCms
 
        XrdSysError      Say(0, "");
 
-       XrdOucTrace      Trace(&Say);
+       XrdSysTrace      Trace("cms");
 
        XrdScheduler    *Sched = 0;
 };
@@ -183,15 +185,51 @@ private:
 /*                               d e f i n e s                                */
 /******************************************************************************/
 
+#define TS_Lib(x, y, z) if (!strcmp(x, var)) \
+     return (XrdOucUtils::parseLib(*eDest, CFile, x, y, z) ? 0 : 1);
+
 #define TS_String(x,m) if (!strcmp(x,var)) {free(m); m = strdup(val); return 0;}
 
 #define TS_Xeq(x,m)    if (!strcmp(x,var)) return m(eDest, CFile);
 #define TS_Xer(x,m,v)  if (!strcmp(x,var)) return m(eDest, CFile, v);
 
-#define TS_Set(x,v)    if (!strcmp(x,var)) {v=1; CFile.Echo(); return 0;}
+#define TS_Set(x,v)    if (!strcmp(x,var)) {v=1; CFile.Echo(true); return 0;}
 
-#define TS_unSet(x,v)  if (!strcmp(x,var)) {v=0; CFile.Echo(); return 0;}
+#define TS_unSet(x,v)  if (!strcmp(x,var)) {v=0; CFile.Echo(true); return 0;}
 
+/******************************************************************************/
+/*                            C o n f i g u r e 0                             */
+/******************************************************************************/
+  
+int XrdCmsConfig::Configure0(XrdProtocol_Config *pi)
+{
+
+// Initialize the error message handler and get starting values
+//
+   Say.logger(pi->eDest->logger(0));
+   Trace.SetLogger(pi->eDest->logger(0));
+   myName    = strdup(pi->myName);
+   PortTCP   = (pi->Port < 0 ? 0 : pi->Port);
+   myInsName = strdup(pi->myInst);
+   myProg    = strdup(pi->myProg);
+   Sched     = pi->Sched;
+   if (pi->AdmPath) AdminPath = strdup(pi->AdmPath);
+      else AdminPath = XrdOucUtils::genPath("/tmp/",
+                                    XrdOucUtils::InstName(myInsName,0));
+   AdminMode = pi->AdmMode;
+   if (pi->DebugON) Trace.What = TRACE_ALL;
+   xrdEnv    = pi->theEnv;
+
+// Create an xrootd compatabile environment
+//
+   theEnv.PutPtr("XrdScheduler*", Sched);
+   if (pi->theEnv) theEnv.PutPtr("xrdEnv*", pi->theEnv);
+
+// All done
+//
+   return 0;
+}
+  
 /******************************************************************************/
 /*                            C o n f i g u r e 1                             */
 /******************************************************************************/
@@ -211,14 +249,6 @@ int XrdCmsConfig::Configure1(int argc, char **argv, char *cfn)
    char c, buff[512];
    extern int opterr, optopt;
 
-// Prohibit this program from executing as superuser
-//
-   if (geteuid() == 0)
-      {Say.Emsg("Config", "Security reasons prohibit cmsd running as "
-                  "superuser; cmsd is terminating.");
-       _exit(8);
-      }
-
 // Process the options
 //
    opterr = 0; optind = 1;
@@ -228,7 +258,7 @@ int XrdCmsConfig::Configure1(int argc, char **argv, char *cfn)
        {
        case 'i': immed = 1;
                  break;
-       case 'w': immed = -1;   // Backward compatability only
+       case 'w': immed = -1;   // Backward compatibility only
                  break;
        default:  buff[0] = '-'; buff[1] = optopt; buff[2] = '\0';
                  Say.Say("Config warning: unrecognized option, ",buff,", ignored.");
@@ -341,6 +371,21 @@ int XrdCmsConfig::Configure1(int argc, char **argv, char *cfn)
    if (isProxy) baseFS.Init(XrdCmsBaseFS::DFSys | XrdCmsBaseFS::Immed |
                (baseFS.Local() ? XrdCmsBaseFS::Cntrl : 0), 0, 0);
 
+// If we are a server and some scheduling parameters were specified but
+// nothing to feed them, give a warning.
+//
+   if (isServer)
+      {if (P_cpu|P_io|P_load|P_mem|P_pag)
+          {if (!prfLib && !perfpgm)
+              Say.Say("Config warning: metric scheduling requested without a "
+                      "metrics supplier!");
+          } else {
+           if ( prfLib ||  perfpgm)
+              Say.Say("Config warning: metrics supplier specified without "
+                      "any scheduling metrics!");
+          }
+      }
+
 // Determine how we ended and return status
 //
    sprintf(buff, " phase 1 %s initialization %s.", myRole,
@@ -365,6 +410,11 @@ int XrdCmsConfig::Configure2()
    int Who, NoGo = 0;
    char *p, buff[512];
    std::string envData;
+
+// Add our host name to the env
+//
+   envData += "myHN=";
+   envData += myName;
 
 // Print herald
 //
@@ -393,9 +443,10 @@ int XrdCmsConfig::Configure2()
       Say.Say("Config warning: adminpath resides in /tmp and may be unstable!");
 
 
-// Establish the path to be used for admin functions
+// Establish the path to be used for admin functions. It has already been
+// qualified by the instance name.
 //
-   p = XrdOucUtils::genPath(AdminPath,XrdOucUtils::InstName(myInsName,0),".olb");
+   p = XrdOucUtils::genPath(AdminPath, (const char *)0, ".olb");
    free(AdminPath);
    AdminPath = p;
 
@@ -411,7 +462,7 @@ int XrdCmsConfig::Configure2()
           else {if (QTRACE(Debug))
                    Say.Say("Config ", "Global System Identification: ", mySID);
                 if (Config.mySite)
-                   {envData += "site=";
+                   {envData += "&site=";
                     envData += mySite;
                    }
                }
@@ -453,9 +504,9 @@ int XrdCmsConfig::Configure2()
        else        Who = 0;
     CmsState.Set(SUPCount, Who, AdminPath);
 
-// Create the pid file
+// At this point we will add to the existing manifest file
 //
-   if (!NoGo) NoGo |= PidFile();
+   if (!NoGo) NoGo |= Manifest();
 
 // All done, check for success or failure
 //
@@ -507,12 +558,11 @@ int XrdCmsConfig::ConfigXeq(char *var, XrdOucStream &CFile, XrdSysError *eDest)
    TS_Xeq("fsxeq",         xfsxq);   // Server,  non-dynamic
    TS_Xeq("localroot",     xlclrt);  // Any,     non-dynamic
    TS_Xeq("manager",       xmang);   // Server,  non-dynamic
-   TS_Xeq("namelib",       xnml);    // Server,  non-dynamic
-   TS_Xeq("vnid",          xvnid);   // Server,  non-dynamic
+   TS_Xeq("mode",          xmode);   // Manager, non-dynamic
+   TS_Lib("namelib", N2N_Lib, &N2N_Parms);
    TS_Xeq("nbsendq",       xnbsq);   // Any      non-dynamic
-   TS_Xeq("osslib",        xolib);   // Any,     non-dynamic
+   TS_Lib("osslib",  ossLib,  &ossParms);
    TS_Xeq("perf",          xperf);   // Server,  non-dynamic
-   TS_Xeq("pidpath",       xpidf);   // Any,     non-dynamic
    TS_Xeq("prep",          xprep);   // Any,     non-dynamic
    TS_Xeq("prepmsg",       xprepm);  // Any,     non-dynamic
    TS_Xeq("remoteroot",    xrmtrt);  // Any,     non-dynamic
@@ -521,6 +571,7 @@ int XrdCmsConfig::ConfigXeq(char *var, XrdOucStream &CFile, XrdSysError *eDest)
    TS_Xeq("seclib",        xsecl);   // Server,  non-dynamic
    TS_Xeq("subcluster",    xsubc);   // Manager, non-dynamic
    TS_Xeq("superport",     xsupp);   // Super,   non-dynamic
+   TS_Xeq("vnid",          xvnid);   // Server,  non-dynamic
    TS_Set("wait",          doWait);  // Server,  non-dynamic (backward compat)
    TS_unSet("nowait",      doWait);  // Server,  non-dynamic
    TS_Xer("whitelist",     xblk,true);//Manager, non-dynamic
@@ -533,9 +584,14 @@ int XrdCmsConfig::ConfigXeq(char *var, XrdOucStream &CFile, XrdSysError *eDest)
 
    // No match found, complain.
    //
-   eDest->Say("Config warning: ignoring unknown directive '", var, "'.");
-   CFile.Echo();
-   return 0;
+   if (!strcmp(var, "pidpath"))
+      {Say.Say("Config warning: 'cms.pidpath' no longer "
+               "supported; use 'all.pidpath'.");
+      } else {
+       Say.Say("Config warning: ignoring unknown directive '", var, "'.");
+      }
+    CFile.Echo(false);
+    return 0;
 }
 
 /******************************************************************************/
@@ -693,11 +749,12 @@ void XrdCmsConfig::ConfigDefaults(void)
    DiskHWMP = 5;
    DiskAsk  = 12;         // 15 Seconds between space calibrations.
    DiskWT   = 0;          // Do not defer when out of space
-   DiskSS   = 0;          // Not a staging server
-   DiskOK   = 0;          // Does not have any disk
+   DiskSS   = false;      // Not a staging server
+   DiskOK   = false;      // Does not have any disk
+   forceRO  = false;      // Allow redirects for writing
    myPaths  = (char *)""; // Default is 'r /'
    ConfigFN = 0;
-   sched_RR = sched_Pack = sched_Level = 0; sched_Force = 1;
+   sched_RR = sched_Pack = sched_AffPC = sched_Level = sched_LoadR = 0; sched_Force = 1;
    isManager= 0;
    isMeta   = 0;
    isPeer   = 0;
@@ -728,12 +785,12 @@ void XrdCmsConfig::ConfigDefaults(void)
    ifList    =0;
    perfint  = 3*60;
    perfpgm  = 0;
-   AdminPath= strdup("/tmp/");
+   xrdEnv   = 0;
+   AdminPath= 0;
    AdminMode= 0700;
    AdminSock= 0;
    AnoteSock= 0;
    RedirSock= 0;
-   pidPath  = strdup("/tmp");
    Police   = 0;
    cachelife= 8*60*60;
    emptylife= 0;
@@ -753,6 +810,8 @@ void XrdCmsConfig::ConfigDefaults(void)
    SecLib      = 0;
    ossLib      = 0;
    ossParms    = 0;
+   prfLib      = 0;
+   prfParms    = 0;
    ossFS       = 0;
    myVInfo     = &myVer;
    adsPort     = 0;
@@ -864,23 +923,21 @@ int XrdCmsConfig::ConfigProc(int getrole)
                   }
            }
            else if (!strncmp(var, "cms.", 4)
-                ||  !strncmp(var, "olb.", 4)      // Backward compatability
+                ||  !strncmp(var, "olb.", 4)      // Backward compatibility
                 ||  !strcmp(var, "ofs.osslib")
                 ||  !strcmp(var, "oss.defaults")
                 ||  !strcmp(var, "oss.localroot")
                 ||  !strcmp(var, "oss.remoteroot")
                 ||  !strcmp(var, "oss.namelib")
-                ||  !strcmp(var, "all.adminpath")
                 ||  !strcmp(var, "all.export")
                 ||  !strcmp(var, "all.manager")
-                ||  !strcmp(var, "all.pidpath")
                 ||  !strcmp(var, "all.role")
                 ||  !strcmp(var, "all.seclib")
                 ||  !strcmp(var, "all.subcluster"))
                    {if (ConfigXeq(var+4, CFile, 0)) {CFile.Echo(); NoGo = 1;}}
-                   else if (!strcmp(var, "oss.stagecmd")) DiskSS = 1;
+                   else if (!strcmp(var, "oss.stagecmd")) DiskSS = true;
 
-// Now check if any errors occured during file i/o
+// Now check if any errors occurred during file i/o
 //
    if ((retc = CFile.LastError()))
       NoGo = Say.Emsg("Config", retc, "read config file", ConfigFN);
@@ -911,7 +968,7 @@ int XrdCmsConfig::isExec(XrdSysError *eDest, const char *ptype, char *prog)
 // Make sure the program is executable by us
 //
    if (access(prog, X_OK))
-      {sprintf(buff, "find %s execuatble", ptype);
+      {sprintf(buff, "find %s executable", ptype);
        eDest->Emsg("Config", errno, buff, prog);
        *mp = pp;
        return 0;
@@ -924,12 +981,51 @@ int XrdCmsConfig::isExec(XrdSysError *eDest, const char *ptype, char *prog)
 }
 
 /******************************************************************************/
+/*                              M a n i f e s t                               */
+/******************************************************************************/
+  
+int XrdCmsConfig::Manifest()
+{
+    int xfd;
+    const char *clID, *xop = 0;
+    char *envFN;
+
+// Get the exiting manifest file from he environment. If none, return.
+//
+   if (!xrdEnv || !(envFN = xrdEnv->Get("envFile"))) return 0;
+
+    if ((clID = index(mySID, ' '))) clID++;
+       else clID = mySID;
+
+    if ((xfd = open(envFN, O_WRONLY|O_APPEND)) < 0) xop = "open";
+       else {bool bad = false;
+             if (LocalRoot)
+                bad =  write(xfd,(void *)"&pfx=",5)  < 0
+                    || write(xfd,(void *)LocalRoot,strlen(LocalRoot)) < 0;
+             if (!bad && AdminPath)
+                bad =  write(xfd,(void *)"&ap=", 4)  < 0
+                    || write(xfd,(void *)AdminPath,strlen(AdminPath)) < 0;
+             if (!bad) bad =  write(xfd,(void *)"&cn=", 4)            < 0
+                           || write(xfd,(void *)clID, strlen(clID))   < 0;
+             if (bad) xop = "append to";
+             close(xfd);
+            }
+
+     if (xop) Say.Emsg("Config", errno, xop, envFN);
+
+     return xop != 0;
+}
+
+/******************************************************************************/
 /*                                M e r g e P                                 */
 /******************************************************************************/
   
 int XrdCmsConfig::MergeP()
 {
    static const unsigned long long stage4MM = XRDEXP_STAGEMM & ~XRDEXP_STAGE;
+   static const unsigned long long stageAny = XRDEXP_PFCACHE |  XRDEXP_STAGE;
+   static const unsigned long long readOnly = XRDEXP_PFCACHE |  XRDEXP_NOTRW;
+
    XrdOucPList *plp = PexpList.First();
    XrdCmsPList *pp;
    XrdCmsPInfo opinfo, npinfo;
@@ -944,12 +1040,12 @@ int XrdCmsConfig::MergeP()
    while(plp)
         {Opts = plp->Flag();
          if (!(Opts & XRDEXP_LOCAL))
-            {npinfo.rwvec = (Opts & (XRDEXP_GLBLRO | XRDEXP_NOTRW) ? 0 : 1);
-             if (export2MM) npinfo.ssvec = (Opts &  stage4MM       ? 1 : 0);
-                else        npinfo.ssvec = (Opts &  XRDEXP_STAGE   ? 1 : 0);
+            {npinfo.rwvec = (Opts & (XRDEXP_GLBLRO | readOnly) ? 0 : 1);
+             if (export2MM) npinfo.ssvec = (Opts &  stage4MM   ? 1 : 0);
+                else        npinfo.ssvec = (Opts &  stageAny   ? 1 : 0);
              if (!PathList.Add(plp->Path(), &npinfo))
                 Say.Emsg("Config","Ignoring duplicate export path",plp->Path());
-                else if (npinfo.ssvec) DiskSS = 1;
+                else if (npinfo.ssvec) DiskSS = true;
             }
           plp = plp->Next();
          }
@@ -988,58 +1084,6 @@ int XrdCmsConfig::MergeP()
 //
    if (DiskSS) CmsState.Update(XrdCmsState::Counts, 0, 1);
    return NoGo;
-}
-
-/******************************************************************************/
-/*                               P i d F i l e                                */
-/******************************************************************************/
-  
-int XrdCmsConfig::PidFile()
-{
-    int rc, xfd;
-    const char *clID;
-    char buff[1024];
-    char pidFN[1200], *ppath=XrdOucUtils::genPath(pidPath,
-                             XrdOucUtils::InstName(myInsName,0));
-    const char *xop = 0;
-
-    if ((rc = XrdOucUtils::makePath(ppath, XrdOucUtils::pathMode)))
-       {Say.Emsg("Config", rc, "create pid file path", ppath);
-        free(ppath);
-        return 1;
-       }
-
-    if ((clID = index(mySID, ' '))) clID++;
-       else clID = mySID;
-
-         if (isManager && isServer)
-            snprintf(pidFN, sizeof(pidFN), "%s/cmsd.super.pid", ppath);
-    else if (isServer)
-            snprintf(pidFN, sizeof(pidFN), "%s/cmsd.pid", ppath);
-    else    snprintf(pidFN, sizeof(pidFN), "%s/cmsd.mangr.pid", ppath);
-
-    if ((xfd = open(pidFN, O_WRONLY|O_CREAT|O_TRUNC,0644)) < 0) xop = "open";
-       else {if ((write(xfd,buff,snprintf(buff,sizeof(buff),"%d",
-                            static_cast<int>(getpid()))) < 0)
-             || (LocalRoot && 
-                           (write(xfd,(void *)"\n&pfx=",6)  < 0 ||
-                            write(xfd,(void *)LocalRoot,strlen(LocalRoot)) < 0
-                )          )
-             || (AdminPath && 
-                           (write(xfd,(void *)"\n&ap=", 5)  < 0 ||
-                            write(xfd,(void *)AdminPath,strlen(AdminPath)) < 0
-                )          )
-             ||             write(xfd,(void *)"\n&cn=", 5)  < 0
-             ||             write(xfd,(void *)clID,     strlen(clID))      < 0
-                ) xop = "write";
-             close(xfd);
-            }
-
-     if (xop) Say.Emsg("Config", errno, xop, pidFN);
-        else XrdOucEnv::Export("XRDCMSPIDFN", pidFN);
-
-     free(ppath);
-     return xop != 0;
 }
 
 /******************************************************************************/
@@ -1163,7 +1207,7 @@ int XrdCmsConfig::setupServer()
    if (isManager || isPeer) return 0;
    SUPCount = 0; SUPLevel = 0;
    if (isProxy) return 0;
-   DiskOK = 1; 
+   DiskOK = true;
 
 // If this is a staging server then set up the Prepq object
 //
@@ -1231,7 +1275,7 @@ char *XrdCmsConfig::setupSid()
   
 void XrdCmsConfig::Usage(int rc)
 {
-cerr <<"\nUsage: cmsd [xrdopts] [-i] [-m] [-s] -c <cfile>" <<endl;
+std::cerr <<"\nUsage: cmsd [xrdopts] [-i] [-m] [-s] -c <cfile>" <<std::endl;
 exit(rc);
 }
   
@@ -1378,7 +1422,8 @@ int XrdCmsConfig::xapath(XrdSysError *eDest, XrdOucStream &CFile)
 // Record the path
 //
    if (AdminPath) free(AdminPath);
-   AdminPath = pval;
+   AdminPath = XrdOucUtils::genPath(pval,XrdOucUtils::InstName(myInsName,0));
+   free(pval);
    AdminMode = mode;
    return 0;
 }
@@ -2034,6 +2079,41 @@ int XrdCmsConfig::xmang(XrdSysError *eDest, XrdOucStream &CFile)
 }
   
 /******************************************************************************/
+/*                                 x m o d e                                  */
+/******************************************************************************/
+
+/* Function: xmode
+
+   Purpose:  To parse the directive: mode  {r/o | readonly | r/w | readwrite}
+
+             r/o    Only allows read operations, readonly is a synonym.
+             r/w    Allows read and write operations, readwrite is a synonym.
+                    This mode is the default.
+
+   Type: Manager only, non-dynamic.
+
+   Output: 0 upon success or !0 upon failure.
+*/
+
+int XrdCmsConfig::xmode(XrdSysError *eDest, XrdOucStream &CFile)
+{
+    char *val;
+
+    if (!isManager) return CFile.noEcho();
+
+    if (!(val = CFile.GetWord()))
+       {eDest->Emsg("Config", "mode type not specified"); return 1;}
+
+    if (!strcmp(val, "r/o") || !strcmp(val, "readonly")) forceRO = true;
+       else if (!strcmp(val,"r/w") || !strcmp(val,"readwrite")) forceRO = false;
+               else {eDest->Emsg("Config", "invalid mode type -", val);
+                     return 1;
+                    }
+
+    return 0;
+}
+  
+/******************************************************************************/
 /*                                 x n b s q                                  */
 /******************************************************************************/
 
@@ -2095,76 +2175,6 @@ int XrdCmsConfig::xnbsq(XrdSysError *eDest, XrdOucStream &CFile)
         }
    return 0;
 }
-  
-/******************************************************************************/
-/*                                  x n m l                                   */
-/******************************************************************************/
-
-/* Function: xnml
-
-   Purpose:  To parse the directive: namelib <path> [<parms>]
-
-             <path>    the path of the filesystem library to be used.
-             <parms>   optional parms to be passed
-
-  Output: 0 upon success or !0 upon failure.
-*/
-
-int XrdCmsConfig::xnml(XrdSysError *eDest, XrdOucStream &CFile)
-{
-    char *val, parms[1024];
-
-// Get the path
-//
-   if (!(val = CFile.GetWord()) || !val[0])
-      {eDest->Emsg("Config", "namelib not specified"); return 1;}
-
-// Record the path
-//
-   if (N2N_Lib) free(N2N_Lib);
-   N2N_Lib = strdup(val);
-
-// Record any parms
-//
-   if (!CFile.GetRest(parms, sizeof(parms)))
-      {eDest->Emsg("Config", "namelib parameters too long"); return 1;}
-   if (N2N_Parms) free(N2N_Parms);
-   N2N_Parms = (*parms ? strdup(parms) : 0);
-   return 0;
-}
-  
-/******************************************************************************/
-/*                                 x o l i b                                  */
-/******************************************************************************/
-
-/* Function: xolib
-
-   Purpose:  To parse the directive: osslib <path>
-
-             <path>    the path of the filesystem library to be used.
-
-  Output: 0 upon success or !0 upon failure.
-*/
-
-int XrdCmsConfig::xolib(XrdSysError *eDest, XrdOucStream &CFile)
-{
-    char *val, parms[1024];
-
-// Get the path
-//
-   if (!(val = CFile.GetWord()) || !val[0])
-      {eDest->Emsg("Config", "osslib not specified"); return 1;}
-   if (ossLib) free(ossLib);
-   ossLib = strdup(val);
-
-// Record any parms
-//
-   if (!CFile.GetRest(parms, sizeof(parms)))
-      {eDest->Emsg("Config", "osslib parameters too long"); return 1;}
-   if (ossParms) free(ossParms);
-   ossParms = (*parms ? strdup(parms) : 0);
-   return 0;
-}
 
 /******************************************************************************/
 /*                                 x p e r f                                  */
@@ -2172,38 +2182,51 @@ int XrdCmsConfig::xolib(XrdSysError *eDest, XrdOucStream &CFile)
 
 /* Function: xperf
 
-   Purpose:  To parse the directive: perf [key <num>] [int <sec>] [pgm <pgm>]
+   Purpose:  To parse the directive: perf [xrootd] [int <sec>]
+                                          [lib <lib> [<parms>] | pgm <pgm>]
 
          int <time>    estimated time (seconds, M, H) between reports by <pgm>
-         key <num>     This is no longer documented but kept for compatability.
+         lib <lib>     the shared library holding the XrdCmsPerf object that
+                       reports perf values. It must be the last option.
          pgm <pgm>     program to start that will write perf values to standard
                        out. It must be the last option.
+         xrootd        This directive only applies to the cms xrootd plugin.
 
    Type: Server only, non-dynamic.
 
    Output: 0 upon success or !0 upon failure. Ignored by manager.
 */
 int XrdCmsConfig::xperf(XrdSysError *eDest, XrdOucStream &CFile)
-{   int   ival = 3*60;
-    char *pgm=0, *val, rest[2048];
+{   char *pgm=0, *val, rest[2048];
 
     if (!isServer) return CFile.noEcho();
 
     if (!(val = CFile.GetWord()))
        {eDest->Emsg("Config", "perf options not specified"); return 1;}
 
+    if (!strcmp("xrootd", val)) return CFile.noEcho();
+    perfint = 3*60;
+
     do {     if (!strcmp("int", val))
                 {if (!(val = CFile.GetWord()))
                     {eDest->Emsg("Config", "perf int value not specified");
                      return 1;
                     }
-                 if (XrdOuca2x::a2tm(*eDest,"perf int",val,&ival,0)) return 1;
+                 if (XrdOuca2x::a2tm(*eDest,"perf int",val,&perfint,0)) return 1;
+                }
+        else if (!strcmp("lib",  val))
+                {if (perfpgm) {free(perfpgm); perfpgm = 0;}
+                 return (XrdOucUtils::parseLib(*eDest,CFile,"perf lib",
+                                      prfLib, &prfParms) ? 0 : 1);
+                 break;
                 }
         else if (!strcmp("pgm",  val))
                 {if (!CFile.GetRest(rest, sizeof(rest)))
-                    {eDest->Emsg("Config", "perf pgm parameters too long"); return 1;}
+                    {eDest->Emsg("Config", "perf pgm parameters too long");
+                     return 1;
+                    }
                  if (!*rest)
-                    {eDest->Emsg("Config", "perf prog value not specified");
+                    {eDest->Emsg("Config", "perf pgm value not specified");
                      return 1;
                     }
                  pgm = rest;
@@ -2215,45 +2238,15 @@ int XrdCmsConfig::xperf(XrdSysError *eDest, XrdOucStream &CFile)
 // Make sure that the perf program is here
 //
    if (perfpgm) {free(perfpgm); perfpgm = 0;}
+   if (prfLib)  {free(prfLib);  prfLib = 0;}
+   if (prfParms){free(prfParms);prfParms = 0;}
    if (pgm) {if (!isExec(eDest, "perf", pgm)) return 1;
                 else perfpgm = strdup(pgm);
             }
 
-// Set remaining values
+// All done.
 //
-    perfint = ival;
     return 0;
-}
-
-  
-/******************************************************************************/
-/*                                 x p i d f                                  */
-/******************************************************************************/
-
-/* Function: xpidf
-
-   Purpose:  To parse the directive: pidpath <path>
-
-             <path>    the path where the pid file is to be created.
-
-  Output: 0 upon success or !0 upon failure.
-*/
-
-int XrdCmsConfig::xpidf(XrdSysError *eDest, XrdOucStream &CFile)
-{
-    char *val;
-
-// Get the path
-//
-   val = CFile.GetWord();
-   if (!val || !val[0])
-      {eDest->Emsg("Config", "pidpath not specified"); return 1;}
-
-// Record the path
-//
-   if (pidPath) free(pidPath);
-   pidPath = strdup(val);
-   return 0;
 }
   
 /******************************************************************************/
@@ -2621,7 +2614,7 @@ int XrdCmsConfig::xrole(XrdSysError *eDest, XrdOucStream &CFile)
           default: eDest->Emsg("Config", "invalid role -", Tok1, Tok2); rc = 1;
          }
 
-// Release storage and return if an error occured
+// Release storage and return if an error occurred
 //
    free(Tok1);
    if (Tok2) free(Tok2);
@@ -2658,6 +2651,7 @@ int XrdCmsConfig::xrole(XrdSysError *eDest, XrdOucStream &CFile)
                                        [maxretries <n>[@<host>:<port>]]
                                        [nomultisrc[@<host>:<port>]]
                 [affinity [default] {none | weak | strong | strict}]
+                [affpath {all | first m | last n}]
 
              <p>      is the percentage to include in the load as a value
                       between 0 and 100. For fuzz this is the largest
@@ -2693,6 +2687,7 @@ int XrdCmsConfig::xsched(XrdSysError *eDest, XrdOucStream &CFile)
         {"maxload",  100, &MaxLoad},
         {"refreset", -1,  &RefReset},
         {"affinity", -2,  0},
+        {"affpath",  -3,  0},
         {"tryhname",   1, &V_hntry}
        };
     int numopts = sizeof(scopts)/sizeof(struct schedopts);
@@ -2703,13 +2698,17 @@ int XrdCmsConfig::xsched(XrdSysError *eDest, XrdOucStream &CFile)
     while (val)
           {for (i = 0; i < numopts; i++)
                if (!strcmp(val, scopts[i].opname))
-                  {if (scopts[i].maxv != -3 && !(val = CFile.GetWord()))
+                  {if (!(val = CFile.GetWord()))
                       {eDest->Emsg("Config", "sched ", scopts[i].opname,
                                    "argument not specified.");
                        return 1;
                       }
                    if (scopts[i].maxv == -2)
                       {if (!xschedm(val, eDest, CFile)) return 1;
+                       break;
+                      }
+                   if (scopts[i].maxv == -3)
+                      {if (!xschedp(val, eDest, CFile)) return 1;
                        break;
                       }
                    if (scopts[i].maxv < 0)
@@ -2766,8 +2765,40 @@ int XrdCmsConfig::xschedm(char *val, XrdSysError *eDest, XrdOucStream &CFile)
        return 1;
       }
 
+   if (!strcmp(val, "randomized"))
+      {sched_LoadR = 1;
+       return 1;
+      }
+
    eDest->Emsg("Config", "Invalid sched affinity -", val);
    return 0;
+}
+
+/******************************************************************************/
+
+int XrdCmsConfig::xschedp(char *val, XrdSysError *eDest, XrdOucStream &CFile)
+{
+   int afpsign, afpval;
+
+   if (!strcmp(val, "all"))
+      {sched_AffPC = 0;
+       return 1;
+      }
+
+   if (!strcmp(val, "first")) afpsign = 1;
+      else if (!strcmp(val, "last")) afpsign = -1;
+              else {eDest->Emsg("Config", "sched affpath option invalid -", val);
+                    return 0;
+                   }
+
+   if (!(val = CFile.GetWord()))
+      {eDest->Emsg("Config", "sched affpath argument not specified"); return 0;}
+
+   if (XrdOuca2x::a2i(*eDest,"sched affpath value", val, &afpval, 1, 255))
+      return 0;
+
+   sched_AffPC = static_cast<char>(afpval*afpsign);
+   return 1;
 }
 
 /******************************************************************************/
@@ -2885,23 +2916,14 @@ bool XrdCmsConfig::xschedy(char *val, XrdSysError *eDest, char *&host,
 
 int XrdCmsConfig::xsecl(XrdSysError *eDest, XrdOucStream &CFile)
 {
-    char *val;
 
 // If we are a server, ignore this option
 //
    if (!isManager) return CFile.noEcho();
 
-// Get path
+// Return parse result
 //
-   val = CFile.GetWord();
-   if (!val || !val[0])
-      {eDest->Emsg("Config", "seclib path not specified"); return 1;}
-
-// Assign new path
-//
-   if (SecLib) free(SecLib);
-   SecLib = strdup(val);
-   return 0;
+   return (XrdOucUtils::parseLib(*eDest,CFile,"seclib",SecLib,0) ? 0 : 1);
 }
   
 /******************************************************************************/
@@ -3098,7 +3120,7 @@ int XrdCmsConfig::xsubc(XrdSysError *eDest, XrdOucStream &CFile)
    Purpose:  To parse the directive: superport <tcpnum>
                                                [if [<hlst>] [named <nlst>]]
 
-             <tcpnum>   number of the tcp port for incomming requests
+             <tcpnum>   number of the tcp port for incoming requests
              <hlst>     list of applicable host patterns
              <nlst>     list of applicable instance names.
 
@@ -3157,6 +3179,7 @@ int XrdCmsConfig::xtrace(XrdSysError *eDest, XrdOucStream &CFile)
         {"files",    TRACE_Files},
         {"forward",  TRACE_Forward},
         {"redirect", TRACE_Redirect},
+        {"space",    TRACE_Space},
         {"stage",    TRACE_Stage}
        };
     int i, neg, trval = 0, numopts = sizeof(tropts)/sizeof(struct traceopts);

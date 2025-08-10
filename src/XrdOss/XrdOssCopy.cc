@@ -28,11 +28,11 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <errno.h>
+#include <cerrno>
 #include <fcntl.h>
-#include <string.h>
-#include <time.h>
-#include <stdio.h>
+#include <cstring>
+#include <ctime>
+#include <cstdio>
 #include <unistd.h>
 #include <utime.h>
 #include <sys/mman.h>
@@ -50,7 +50,7 @@
   
 extern XrdSysError OssEroute;
 
-extern XrdOucTrace OssTrace;
+extern XrdSysTrace OssTrace;
 
 /******************************************************************************/
 /* Public:                          C o p y                                   */
@@ -109,6 +109,8 @@ off_t XrdOssCopy::Copy(const char *inFn, const char *outFn, int outFD)
         {if ((inBuff = (char *)mmap(0, ioSize, PROT_READ, 
 #if defined(__FreeBSD__)
                        MAP_RESERVED0040|MAP_PRIVATE, In.FD, Offset)) == MAP_FAILED)
+#elif defined(__GNU__)
+                       MAP_PRIVATE, In.FD, Offset)) == MAP_FAILED)
 #else
                        MAP_NORESERVE|MAP_PRIVATE, In.FD, Offset)) == MAP_FAILED)
 #endif

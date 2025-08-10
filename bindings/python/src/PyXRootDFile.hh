@@ -57,7 +57,10 @@ namespace PyXRootD
       static PyObject* IsOpen( File *self, PyObject *args, PyObject *kwds );
       static PyObject* GetProperty( File *self, PyObject *args, PyObject *kwds );
       static PyObject* SetProperty( File *self, PyObject *args, PyObject *kwds );
-
+      static PyObject* SetXAttr( File *self, PyObject *args, PyObject *kwds );
+      static PyObject* GetXAttr( File *self, PyObject *args, PyObject *kwds );
+      static PyObject* DelXAttr( File *self, PyObject *args, PyObject *kwds );
+      static PyObject* ListXAttr( File *self, PyObject *args, PyObject *kwds );
     public:
       PyObject_HEAD
       XrdCl::File                *file;
@@ -121,7 +124,7 @@ namespace PyXRootD
     //--------------------------------------------------------------------------
     // Raise StopIteration if the line we just read is empty
     //--------------------------------------------------------------------------
-    if ( PyBytes_Size( line ) == 0 ) {
+    if ( PyUnicode_GET_LENGTH( line ) == 0 ) {
       PyErr_SetNone( PyExc_StopIteration );
       return NULL;
     }
@@ -187,6 +190,14 @@ namespace PyXRootD
        (PyCFunction) PyXRootD::File::GetProperty,         METH_VARARGS | METH_KEYWORDS, NULL },
     { "set_property",
        (PyCFunction) PyXRootD::File::SetProperty,         METH_VARARGS | METH_KEYWORDS, NULL },
+    { "set_xattr",
+       (PyCFunction) PyXRootD::File::SetXAttr,            METH_VARARGS | METH_KEYWORDS, NULL },
+    { "get_xattr",
+       (PyCFunction) PyXRootD::File::GetXAttr,            METH_VARARGS | METH_KEYWORDS, NULL },
+    { "del_xattr",
+       (PyCFunction) PyXRootD::File::DelXAttr,            METH_VARARGS | METH_KEYWORDS, NULL },
+    { "list_xattr",
+       (PyCFunction) PyXRootD::File::ListXAttr,           METH_VARARGS | METH_KEYWORDS, NULL },
     {"__enter__",
        (PyCFunction) File_enter,                          METH_NOARGS,   NULL},
     {"__exit__",
@@ -226,8 +237,7 @@ namespace PyXRootD
     0,                                          /* tp_getattro */
     0,                                          /* tp_setattro */
     0,                                          /* tp_as_buffer */
-    Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE
-    | Py_TPFLAGS_HAVE_ITER,                     /* tp_flags */
+    Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE,   /* tp_flags */
     file_type_doc,                              /* tp_doc */
     0,                                          /* tp_traverse */
     0,                                          /* tp_clear */

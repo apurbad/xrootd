@@ -33,7 +33,7 @@ class XrdOucEnv;
 class XrdOucStream;
 class XrdSsiCluster;
 class XrdSsiServer;
-class XrdVersionInfo;
+struct XrdVersionInfo;
 
 class XrdSsiSfsConfig
 {
@@ -49,7 +49,7 @@ int              myPort;
 bool             isServer;
 bool             isCms;
 
-bool             Configure(const char *cFN);
+bool             Configure(const char *cFN, XrdOucEnv *envP);
 
 bool             Configure(XrdOucEnv *envP);
 
@@ -65,7 +65,6 @@ char         *CmsLib;         //    ->Cms Library
 char         *CmsParms;       //    ->Cms Library Parameters
 char         *SvcLib;         //    ->Svc Library
 char         *SvcParms;       //    ->Svc Library Parameters
-int           maxRSZ;         // Maximum request size
 int           roleID;
 
 int           ConfigCms(XrdOucEnv *envP);

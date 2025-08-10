@@ -38,20 +38,22 @@
   
 //! The following are supported operations
 
-enum Access_Operation  {AOP_Any      = 0,  //!< Special for getting privs
-                        AOP_Chmod    = 1,  //!< chmod()
-                        AOP_Chown    = 2,  //!< chown()
-                        AOP_Create   = 3,  //!< open() with create
-                        AOP_Delete   = 4,  //!< rm() or rmdir()
-                        AOP_Insert   = 5,  //!< mv() for target
-                        AOP_Lock     = 6,  //!< n/a
-                        AOP_Mkdir    = 7,  //!< mkdir()
-                        AOP_Read     = 8,  //!< open() r/o, prepare()
-                        AOP_Readdir  = 9,  //!< opendir()
-                        AOP_Rename   = 10, //!< mv() for source
-                        AOP_Stat     = 11, //!< exists(), stat()
-                        AOP_Update   = 12, //!< open() r/w or append
-                        AOP_LastOp   = 12  //   For limits testing
+enum Access_Operation  {AOP_Any         = 0,  //!< Special for getting privs
+                        AOP_Chmod       = 1,  //!< chmod()
+                        AOP_Chown       = 2,  //!< chown()
+                        AOP_Create      = 3,  //!< open() with create
+                        AOP_Delete      = 4,  //!< rm() or rmdir()
+                        AOP_Insert      = 5,  //!< mv() for target
+                        AOP_Lock        = 6,  //!< n/a
+                        AOP_Mkdir       = 7,  //!< mkdir()
+                        AOP_Read        = 8,  //!< open() r/o, prepare()
+                        AOP_Readdir     = 9,  //!< opendir()
+                        AOP_Rename      = 10, //!< mv() for source
+                        AOP_Stat        = 11, //!< exists(), stat()
+                        AOP_Update      = 12, //!< open() r/w or append
+                        AOP_Excl_Create = 13, //!< open() with O_EXCL|O_CREAT
+                        AOP_Excl_Insert = 14, //!< mv() where destination doesn't exist.
+                        AOP_LastOp      = 14  //   For limits testing
                        };
 
 /******************************************************************************/
@@ -60,6 +62,7 @@ enum Access_Operation  {AOP_Any      = 0,  //!< Special for getting privs
   
 class XrdOucEnv;
 class XrdSecEntity;
+class XrdSysLogger;
 
 class XrdAccAuthorize
 {
@@ -147,20 +150,76 @@ virtual                  ~XrdAccAuthorize() {}
 //! XrdAccAuthorizeObject() is an extern "C" function that is called to obtain
 //! an instance of the auth object that will be used for all subsequent
 //! authorization decisions. It must be defined in the plug-in shared library.
+//! A second version which is used preferentially if it exists should be
+//! used if accessto theenvironmental pointer s needed.
 //! All the following extern symbols must be defined at file level!
 //!
 //! @param lp   -> XrdSysLogger to be tied to an XrdSysError object for messages
 //! @param cfn  -> The name of the configuration file
 //! @param parm -> Parameters specified on the authlib directive. If none it 
 //!                is zero.
+//! @param envP -> Pointer to environment only available for version 2.
 //!
 //! @return Success: A pointer to the authorization object.
 //!         Failure: Null pointer which causes initialization to fail.
 //------------------------------------------------------------------------------
 
+typedef XrdAccAuthorize *(*XrdAccAuthorizeObject_t)(XrdSysLogger *lp,
+                                                    const char   *cfn,
+                                                    const char   *parm);
+
+
 /*! extern "C" XrdAccAuthorize *XrdAccAuthorizeObject(XrdSysLogger *lp,
                                                       const char   *cfn,
                                                       const char   *parm) {...}
+*/
+
+// Alternatively:
+
+typedef XrdAccAuthorize *(*XrdAccAuthorizeObject2_t)(XrdSysLogger *lp,
+                                                     const char   *cfn,
+                                                     const char   *parm,
+                                                     XrdOucEnv    *envP);
+
+
+/*! extern "C" XrdAccAuthorize *XrdAccAuthorizeObject2(XrdSysLogger *lp,
+                                                       const char   *cfn,
+                                                       const char   *parm,
+                                                       XrdOucEnv    *envP) {...}
+*/
+  
+//------------------------------------------------------------------------------
+//! Add an authorization object as a wrapper to the existing object.
+//!
+//! XrdAccAuthorizeObjAdd() is an extern "C" function that is called to obtain
+//! an instance of the auth object that should wrap the existing object. The
+//! wrapper becomes the actual authorization object. The wrapper must be
+//! in the plug-in shared library, it is passed additional parameters.
+//! All the following extern symbols must be defined at file level!
+//!
+//! @param lp   -> XrdSysLogger to be tied to an XrdSysError object for messages
+//! @param cfn  -> The name of the configuration file
+//! @param parm -> Parameters specified on the authlib directive. If none it 
+//!                is zero.
+//! @param envP -> Environmental information and may be nil.
+//! @param accP -> to the existing authorization object.
+//!
+//! @return Success: A pointer to the authorization object.
+//!         Failure: Null pointer which causes initialization to fail.
+//------------------------------------------------------------------------------
+
+typedef XrdAccAuthorize *(*XrdAccAuthorizeObjAdd_t)(XrdSysLogger *lp,
+                                                    const char   *cfn,
+                                                    const char   *parm,
+                                                    XrdOucEnv    *envP,
+                                                 XrdAccAuthorize *accP);
+
+
+/*! extern "C" XrdAccAuthorize *XrdAccAuthorizeObjAdd(XrdSysLogger *lp,
+                                                      const char   *cfn,
+                                                      const char   *parm,
+                                                      XrdOucEnv    *envP,
+                                                   XrdAccAuthorize *accP) {...}
 */
   
 //------------------------------------------------------------------------------

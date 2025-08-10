@@ -25,20 +25,17 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-// this file is automatically updated by the genversion.sh script
-// if you touch anything make sure that it still works
-
 #ifndef __XRD_VERSION_H__
 #define __XRD_VERSION_H__
 
-#define XrdVERSION  "unknown"
+#define XrdVERSION  "@XRootD_VERSION_STRING@"
 
 // Numeric representation of the version tag
 // The format for the released code is: xyyzz, where: x is the major version,
 // y is the minor version and zz is the bugfix revision number
 // For the non-released code the value is 1000000
 #define XrdVNUMUNK  1000000
-#define XrdVNUMBER  1000000
+#define XrdVNUMBER  @XRootD_VERSION_NUMBER@
 
 #if XrdDEBUG
 #define XrdVSTRING XrdVERSION "_dbg"
@@ -52,7 +49,7 @@
 // dylibs becomes part of he actual filename (MacOS format).
 //
 #ifndef XRDPLUGIN_SOVERSION
-#define XRDPLUGIN_SOVERSION "4"
+#define XRDPLUGIN_SOVERSION "@XRootD_VERSION_MAJOR@"
 #endif
 
 #define XrdDEFAULTPORT 1094;
@@ -67,7 +64,7 @@
 // "strings <objectfile> | grep '@V:'".
 //
 struct XrdVersionInfo {int vNum; const char vOpt; const char vPfx[3];\
-                                 const char vStr[40];};
+                                 const char vStr[64];};
 
 // Macro to define the suffix to use when generating the extern version symbol.
 // This is used by SysPlugin. We cannot use it here as cpp does not expand the

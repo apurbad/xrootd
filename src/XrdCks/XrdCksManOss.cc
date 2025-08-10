@@ -28,11 +28,11 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <errno.h>
+#include <cerrno>
 #include <fcntl.h>
-#include <string.h>
-#include <time.h>
-#include <stdio.h>
+#include <cstring>
+#include <ctime>
+#include <cstdio>
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -43,6 +43,7 @@
 #include "XrdOss/XrdOss.hh"
 #include "XrdOuc/XrdOucEnv.hh"
 #include "XrdSys/XrdSysError.hh"
+#include "XrdSys/XrdSysPlatform.hh"
 
 /******************************************************************************/
 /*                         L o c a l   S t a t i c s                          */
@@ -152,6 +153,7 @@ int XrdCksManOss::Calc(const char *Pfn, time_t &MTime, XrdCksCalc *csP)
          calcSize -= ioSize; Offset += ioSize;
          if (calcSize < (size_t)ioSize) ioSize = calcSize;
         }
+   free(buffP);
 
 // Issue error message if we have an error
 //

@@ -27,9 +27,9 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <errno.h>
-#include <stdio.h>
-#include <string.h>
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
   
 #include "XrdSsi/XrdSsiResource.hh"
 #include "XrdSsi/XrdSsiRRAgent.hh"
@@ -38,6 +38,10 @@
 #include "XrdSsi/XrdSsiSessReal.hh"
 #include "XrdSsi/XrdSsiTrace.hh"
 #include "XrdSsi/XrdSsiUtils.hh"
+
+#ifndef ENOSR
+#define ENOSR ENOSPC
+#endif
   
 /******************************************************************************/
 /*                     S t a t i c s   &   G l o b a l s                      */
@@ -240,6 +244,7 @@ void XrdSsiServReal::Recycle(XrdSsiSessReal *sObj, bool reuse)
    EPNAME("Recycle");
    static const char *tident = 0;
    const char *resKey;
+   bool doDel;
 
 // Clear all pending events (likely not needed)
 //
@@ -255,7 +260,13 @@ void XrdSsiServReal::Recycle(XrdSsiSessReal *sObj, bool reuse)
    actvSes--;
    DEBUG("Sess " <<sObj->GetSID() <<"# reuse=" <<reuse <<" free=" <<freeCnt
                 <<" active=" <<actvSes);
-   if (!reuse || freeCnt >= freeMax) {myMutex.UnLock(); delete sObj;}
+
+   doDel = ((actvSes == 0 && doStop) || !reuse || freeCnt >= freeMax);
+
+   DEBUG("reuse=" <<reuse <<" del=" <<doDel
+         <<"; sessions: free=" <<freeCnt <<" active=" <<actvSes);
+
+   if (doDel) {myMutex.UnLock(); delete sObj;}
       else {sObj->nextSess = freeSes;
             freeSes = sObj;
             freeCnt++;
@@ -291,7 +302,9 @@ bool XrdSsiServReal::ResReuse(XrdSsiRequest  &reqRef,
 // Entry found, check if this session can actually be reused
 //
    sesP = it->second;
-   if (resRef.rOpts & XrdSsiResource::Discard || !sesP->Run(&reqRef))
+   bool doDiscard = (resRef.rOpts & XrdSsiResource::Discard) != 0
+                  || XrdSsiRRAgent::isaRetry(&reqRef);
+   if (doDiscard || !sesP->Run(&reqRef))
       {resCache.erase(it);
        sesP->UnHold();
        return false;
@@ -306,12 +319,17 @@ bool XrdSsiServReal::ResReuse(XrdSsiRequest  &reqRef,
 /*                                  S t o p                                   */
 /******************************************************************************/
   
-bool XrdSsiServReal::Stop()
+bool XrdSsiServReal::Stop(bool immed)
 {
 // Make sure we are clean
 //
    myMutex.Lock();
-   if (actvSes) {myMutex.UnLock(); return false;}
+   if (actvSes)
+      {if (immed) {myMutex.UnLock(); return false;}
+       doStop = true;
+       myMutex.UnLock();
+       return true;
+      }
    myMutex.UnLock();
    delete this;
    return true;

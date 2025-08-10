@@ -23,7 +23,7 @@
 #include <string>
 #include <utility>
 #include <vector>
-#include <stdint.h>
+#include <cstdint>
 #include <pthread.h>
 
 namespace XrdClTests {
@@ -149,7 +149,7 @@ class Server
     ~Server();
 
     //--------------------------------------------------------------------------
-    //! Listen for incomming connections and handle clients
+    //! Listen for incoming connections and handle clients
     //!
     //! @param port    port to listen on
     //! @param accept  number of clients to accept
@@ -184,6 +184,11 @@ class Server
     //--------------------------------------------------------------------------
     int HandleConnections();
 
+    //--------------------------------------------------------------------------
+    //! Get port where server is running
+    //--------------------------------------------------------------------------
+    int GetPort() const;
+
   private:
 
     TransferMap                 pSent;
@@ -193,7 +198,7 @@ class Server
     int                         pListenSocket;
     ClientHandlerFactory       *pHandlerFactory;
     ProtocolFamily              pProtocolFamily;
-
+    int                         pPort;
 };
 
 }

@@ -30,8 +30,8 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <stdlib.h>
-#include <string.h>
+#include <cstdlib>
+#include <cstring>
 
 //------------------------------------------------------------------------------
 //! The XrdNetIF class handles host interfaces. It is used to obtain the
@@ -224,7 +224,7 @@ inline bool HasDest(ifType ifT=PublicV6)
 //------------------------------------------------------------------------------
 //! Determine if an endpoint is this domain based on hostname.
 //!
-//! @param  epAddr   Pointer to the endpoint NetAddrInfo object.
+//! @param  epaddr   Pointer to the endpoint NetAddrInfo object.
 //!
 //! @result true     The endpoint is in this domain.
 //! @result false    Either the endpoint is not in this domain, is a private
@@ -297,8 +297,6 @@ static void Privatize(ifType &x) {x = ifType(x | PrivateIF);}
 //! Set the default assigned port number.
 //!
 //! @param  pnum     The port number.
-//!
-//! @return The previous port number.
 //------------------------------------------------------------------------------
 
 static void PortDefault(int pnum=1094);
@@ -338,6 +336,8 @@ static void Routing(netType nettype);
 //!                  >0 -> Use the number passed.
 //! @param  nettype  Determines how undefined interfaces are resolved. See
 //!                  the netType definition.
+//! @param  xName    the known registered host name should ip address
+//!                  translation fail.
 //!
 //! @return Success: True.
 //!         Failure: False and if eText is supplied, the error message,
@@ -345,7 +345,7 @@ static void Routing(netType nettype);
 //------------------------------------------------------------------------------
 
        bool SetIF(XrdNetAddrInfo *src, const char *ifList, int port=0,
-                  netType nettype=netDefault);
+                  netType nettype=netDefault, const char *xName=0);
 
 //------------------------------------------------------------------------------
 //! Set the public and private network interface names.
@@ -399,11 +399,11 @@ struct ifAddrs
 
 bool  GenAddrs(ifAddrs &ifTab, XrdNetAddrInfo *src);
 bool  GenAddrs(ifAddrs &ifTab, const char *hName, bool wantV6);
-bool  GenIF(XrdNetAddrInfo **src, int srcnum);
+bool  GenIF(XrdNetAddrInfo **src, int srcnum, const char *xName=0);
+static const
+char *GetDomain();
 static
 bool  IsOkName(const char *ifn, short &ifIdx);
-static
-char *SetDomain();
 void  SetIFPP();
 bool  SetIF64(bool retVal);
 static
@@ -435,7 +435,8 @@ char           ifAvail;
 
 static
 XrdSysError   *eDest;
-static char   *myDomain;
+static
+const char    *myDomain;
 static char   *ifCfg[2];
 static
 const char    *ifTName[ifMax];

@@ -28,6 +28,7 @@
 #include "PyXRootDCopyProcess.hh"
 #include "PyXRootDURL.hh"
 #include "PyXRootDFinalize.hh"
+#include "PyXRootDEnv.hh"
 
 namespace PyXRootD
 {
@@ -42,11 +43,17 @@ namespace PyXRootD
   static PyMethodDef module_methods[] =
     {
       // The finalization routine used in atexit handler.
-      { "__XrdCl_Stop_Threads", __XrdCl_Stop_Threads, METH_NOARGS, "Stop XrdCl threads." },
+      { "__XrdCl_Stop_Threads", __XrdCl_Stop_Threads, METH_NOARGS,  "Stop XrdCl threads." },
+      // Ths XRootD Env
+      { "EnvPutString_cpp",     EnvPutString_cpp,     METH_VARARGS, "Puts a string into XrdCl environment." },
+      { "EnvGetString_cpp",     EnvGetString_cpp,     METH_VARARGS, "Gets a string from XrdCl environment." },
+      { "EnvPutInt_cpp",        EnvPutInt_cpp,        METH_VARARGS, "Puts an int into XrdCl environment." },
+      { "EnvGetInt_cpp",        EnvGetInt_cpp,        METH_VARARGS, "Gets an int from XrdCl environment." },
+      { "XrdVersion_cpp",       XrdVersion_cpp,       METH_VARARGS, "Get the XRootD client version." },
+      { "EnvGetDefault_cpp",    EnvGetDefault_cpp,    METH_VARARGS, "Get default values from XrdCl environment" },
       { NULL, NULL, 0, NULL }
     };
 
-#if PY_MAJOR_VERSION >= 3
   //----------------------------------------------------------------------------
   //! Module properties
   //----------------------------------------------------------------------------
@@ -61,75 +68,40 @@ namespace PyXRootD
     NULL,                  /* m_clear */
     NULL,                  /* m_free */
   };
-#endif
 
   //----------------------------------------------------------------------------
   //! Module initialization function
   //----------------------------------------------------------------------------
-#ifdef IS_PY3K
   PyMODINIT_FUNC PyInit_client( void )
-#else
-  PyMODINIT_FUNC initclient( void )
-#endif
   {
-    // Ensure GIL state is initialized
-    Py_Initialize();
-    if ( !PyEval_ThreadsInitialized() ) {
-      PyEval_InitThreads();
-    }
-
     FileSystemType.tp_new = PyType_GenericNew;
     if ( PyType_Ready( &FileSystemType ) < 0 ) {
-#ifdef IS_PY3K
       return NULL;
-#else
-      return;
-#endif
     }
     Py_INCREF( &FileSystemType );
 
     FileType.tp_new = PyType_GenericNew;
     if ( PyType_Ready( &FileType ) < 0 ) {
-#ifdef IS_PY3K
       return NULL;
-#else
-      return;
-#endif
     }
     Py_INCREF( &FileType );
 
     URLType.tp_new = PyType_GenericNew;
     if ( PyType_Ready( &URLType ) < 0 ) {
-#ifdef IS_PY3K
       return NULL;
-#else
-      return;
-#endif
     }
     Py_INCREF( &URLType );
 
     CopyProcessType.tp_new = PyType_GenericNew;
     if ( PyType_Ready( &CopyProcessType ) < 0 ) {
-#ifdef IS_PY3K
       return NULL;
-#else
-      return;
-#endif
     }
     Py_INCREF( &CopyProcessType );
 
-#ifdef IS_PY3K
     ClientModule = PyModule_Create(&moduledef);
-#else
-    ClientModule = Py_InitModule3("client", module_methods, client_module_doc);
-#endif
 
     if (ClientModule == NULL) {
-#ifdef IS_PY3K
       return NULL;
-#else
-      return;
-#endif
     }
 
     PyModule_AddObject( ClientModule, "FileSystem", (PyObject *) &FileSystemType );
@@ -137,8 +109,6 @@ namespace PyXRootD
     PyModule_AddObject( ClientModule, "URL", (PyObject *) &URLType );
     PyModule_AddObject( ClientModule, "CopyProcess", (PyObject *) &CopyProcessType );
 
-#ifdef IS_PY3K
     return ClientModule;
-#endif
   }
 }

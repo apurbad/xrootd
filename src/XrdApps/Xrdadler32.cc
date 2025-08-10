@@ -35,15 +35,15 @@
 
 #define _FILE_OFFSET_BITS 64
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <fcntl.h>
-#include <errno.h>
-#ifdef __linux__
+#include <cerrno>
+#if defined(__linux__) || defined(__GNU__) || (defined(__FreeBSD_kernel__) && defined(__GLIBC__))
   #include <sys/xattr.h>
 #endif
 #include <zlib.h>
@@ -71,7 +71,7 @@ void fSetXattrAdler32(const char *path, int fd, const char* attr, char *value)
 
 // Remove any old attribute at this point
 //
-#if defined(__linux__)
+#if defined(__linux__) || defined(__GNU__) || (defined(__FreeBSD_kernel__) && defined(__GLIBC__))
     fremovexattr(fd, attr);
 #elif defined(__solaris__)
     int attrfd;
@@ -88,9 +88,9 @@ int fGetXattrAdler32(int fd, const char* attr, char *value)
     int rc;
 
     if (fstat(fd, &st)) return 0;
-    sprintf(mtime, "%ld", st.st_mtime);
+    sprintf(mtime, "%lld", (long long) st.st_mtime);
 
-#if defined(__linux__)
+#if defined(__linux__) || defined(__GNU__) || (defined(__FreeBSD_kernel__) && defined(__GLIBC__))
     rc = fgetxattr(fd, attr, attr_val, 25);
 #elif defined(__solaris__)
     int attrfd;
@@ -186,14 +186,14 @@ int main(int argc, char *argv[])
     }
     if (argc == 1 || path[0] == '\0')
     {                        /* this is a local file */
-        if (argc > 1) 
+        if (argc > 1)
         {
             strcpy(path, argv[1]);
-            rc = stat(path, &stbuf);        
-            if (rc != 0 || ! S_ISREG(stbuf.st_mode) ||
-                (fd = open(path,O_RDONLY)) < 0) 
+            if ((fd = open(path, O_RDONLY)) < 0 || fstat(fd, &stbuf) != 0 || !S_ISREG(stbuf.st_mode))
             {
-                printf("Error_accessing %s\n", path);
+                if (fd != -1)
+                  close(fd);
+                printf("Error opening %s: %s\n", path, strerror(errno));
                 return 1;
             }
             else  /* see if the adler32 is saved in attribute already */
@@ -237,8 +237,15 @@ int main(int argc, char *argv[])
                 printf("Error_accessing: %s\n", argv[1]);
                 return 1;
             }
-            while ( (len = XrdPosixXrootd::Read(fd, buf, N)) > 0 )
-                adler = adler32(adler, (const Bytef*)buf, len);
+            //!!! TO DO: Remove testing of totbytes once XrdClEC read regression is fixed
+            off_t totbytes = 0;
+            while ( totbytes < stbuf.st_size && (len = XrdPosixXrootd::Read(fd, buf, N)) > 0 )
+            {
+                adler = adler32(adler, 
+                                (const Bytef*)buf, 
+                                (len < (stbuf.st_size - totbytes)? len : stbuf.st_size - totbytes ));
+                totbytes += len;
+            }
 
             XrdPosixXrootd::Close(fd);
             printf("%08lx %s\n", adler, argv[1]);

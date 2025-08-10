@@ -28,11 +28,11 @@
 /******************************************************************************/
 
 #include <unistd.h>
-#include <errno.h>
+#include <cerrno>
 #include <fcntl.h>
-#include <string.h>
-#include <stdio.h>
-#include <stdlib.h>
+#include <cstring>
+#include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <sys/param.h>
 #include <sys/stat.h>
@@ -100,6 +100,9 @@ extern XrdSsiProvider         *Provider;
 
        int                     respWT   = 0x7fffffff;
 
+       int                     minRSZ   = 1024;
+       int                     maxRSZ   = 2097152;
+
        bool                    fsChk    = false;
 
        bool                    detReqOK = false;
@@ -129,7 +132,6 @@ XrdSsiSfsConfig::XrdSsiSfsConfig(bool iscms)
    SvcLib        = 0;
    SvcParms      = 0;
    myRole        = 0;
-   maxRSZ        = 2097152;
    respWT        = 0x7fffffff;
    isServer      = true;
    isCms         = iscms;
@@ -157,7 +159,7 @@ XrdSsiSfsConfig::~XrdSsiSfsConfig()
 /*                             C o n f i g u r e                              */
 /******************************************************************************/
 
-bool XrdSsiSfsConfig::Configure(const char *cFN)
+bool XrdSsiSfsConfig::Configure(const char *cFN, XrdOucEnv *envP)
 {
    char *var;
    const char *tmp;
@@ -167,11 +169,12 @@ bool XrdSsiSfsConfig::Configure(const char *cFN)
 
 // Print warm-up message
 //
-   Log.Say("++++++ ssi phase 1 initialization started.");
+   Log.Say("++++++ ssi initialization started.");
 
 // Preset all variables with common defaults
 //
-   if (getenv("XRDDEBUG")) Trace.What = TRACESSI_ALL | TRACESSI_Debug;
+   if (getenv("XRDDEBUG") || getenv("XRDSSIDEBUG"))
+      Trace.What = TRACESSI_ALL | TRACESSI_Debug;
 
 // If there is no config file, return with an error.
 //
@@ -188,6 +191,8 @@ bool XrdSsiSfsConfig::Configure(const char *cFN)
        return false;
       }
    cStrm.Attach(cfgFD);
+   static const char *cvec[] = { "*** ssi (sfs) plugin config:", 0 };
+   cStrm.Capture(cvec);
 
 // Now start reading records until eof.
 //
@@ -198,7 +203,7 @@ bool XrdSsiSfsConfig::Configure(const char *cFN)
             {if (ConfigXeq(var+4)) {cFile->Echo(); NoGo=1;}}
         }
 
-// Now check if any errors occured during file i/o
+// Now check if any errors occurred during file i/o
 //
    if ((retc = cStrm.LastError()))
        NoGo = Log.Emsg("Config", -retc, "read config file", cFN);
@@ -214,13 +219,23 @@ bool XrdSsiSfsConfig::Configure(const char *cFN)
 
 // Configure filesystem callout as needed
 //
-   fsChk = FSPath.NotEmpty();
-   if (isServer && !theFS) fsChk = false;
+   if ((fsChk = FSPath.NotEmpty()))
+      {if (!theFS && !isCms)
+          {Log.Emsg("Config", "Specifying an fspath requires SSI to be stacked "
+                              "with a file system!");
+           return false;
+          }
+       if (isServer && !theFS && !isCms) fsChk = false;
+      }
+
+// Perform historical phase 2 initialization
+//
+  if (!NoGo) NoGo = !Configure(envP);
 
 // All done
 //
    tmp = (NoGo ? " failed." : " completed.");
-   Log.Say("------ ssi phase 1 initialization", tmp);
+   Log.Say("------ ssi initialization", tmp);
    return !NoGo;
 }
   
@@ -231,12 +246,7 @@ bool XrdSsiSfsConfig::Configure(XrdOucEnv *envP)
    static char theSSI[] = {'s', 's', 'i', 0};
    static char **myArgv = 0, *dfltArgv[] = {0, 0};
    XrdOucEnv    *xrdEnvP;
-   const char *tmp;
    int myArgc = 0, NoGo;
-
-// Print warm-up message
-//
-   Log.Say("++++++ ssi phase 2 initialization started.");
 
 // Now find the scheduler
 //
@@ -278,8 +288,6 @@ bool XrdSsiSfsConfig::Configure(XrdOucEnv *envP)
 
 // All done
 //
-   tmp = (NoGo ? " failed." : " completed.");
-   Log.Say("------ ssi phase 2 initialization", tmp);
    return !NoGo;
 }
 
@@ -291,8 +299,10 @@ class XrdOss;
   
 int XrdSsiSfsConfig::ConfigCms(XrdOucEnv *envP)
 {
+   EPNAME("SsiSfsConfig");
    static const int cmsOpt = XrdCms::IsTarget;
-   XrdCmsClient *cmsP, *(*CmsGC)(XrdSysLogger *, int, int, XrdOss *);
+   const char *tident = "";
+   XrdCmsClient *cmsP = 0, *(*CmsGC)(XrdSysLogger *, int, int, XrdOss *);
    XrdSysLogger *myLogger = Log.logger();
 
 // Check if we are configuring a simple standalone server
@@ -304,18 +314,31 @@ int XrdSsiSfsConfig::ConfigCms(XrdOucEnv *envP)
        return 0;
       }
 
-// If a cmslib was specified then create a plugin object and get the client.
-// Otherwise, simply get the default client.
+// We now must make sure only one cms client is in effect.
 //
-   if (CmsLib)
-      {XrdSysPlugin myLib(&Log, CmsLib, "cmslib", myVersion);
-       CmsGC = (XrdCmsClient *(*)(XrdSysLogger *, int, int, XrdOss *))
-                                  (myLib.getPlugin("XrdCmsGetClient"));
-       if (!CmsGC) return 1;
-       myLib.Persist();
-       cmsP = CmsGC(myLogger, cmsOpt, myPort, 0);
+   if ((cmsP = (XrdCmsClient*)envP->GetPtr("XrdCmsClientT*")))
+      {if (CmsLib) Log.Say("Config warning: ignoring cmslib directive; "
+                           "using existing cms instance!");
+       SsiCms = new XrdSsiCms(cmsP);
+       DEBUG("Config: Using cms clientT from environment!");
+       return 0;
       }
-      else cmsP = XrdCms::GetDefaultClient(myLogger, cmsOpt, myPort);
+   DEBUG("Config: Allocating new cms clientT!");
+
+// If a cmslib was specified then create a plugin object and get the client.
+// Otherwise, simply get the default client. In any case configure them.
+//
+   if (!cmsP)
+      {if (CmsLib)
+          {XrdSysPlugin myLib(&Log, CmsLib, "cmslib", myVersion);
+           CmsGC = (XrdCmsClient *(*)(XrdSysLogger *, int, int, XrdOss *))
+                                      (myLib.getPlugin("XrdCmsGetClient"));
+           if (!CmsGC) return 1;
+           myLib.Persist();
+           cmsP = CmsGC(myLogger, cmsOpt, myPort, 0);
+          }
+          else cmsP = XrdCms::GetDefaultClient(myLogger, cmsOpt, myPort);
+      }
 
 // If we have a client object onfigure it
 //
@@ -337,13 +360,11 @@ int XrdSsiSfsConfig::ConfigCms(XrdOucEnv *envP)
 
 int XrdSsiSfsConfig::ConfigObj()
 {
-   static const int minRSZ = 8192;
 
 // Allocate a buffer pool
 //
    if (maxRSZ < minRSZ) maxRSZ = minRSZ;
    BuffPool = new XrdOucBuffPool(minRSZ, maxRSZ);
-   XrdSsiFileSess::SetMaxSz(maxRSZ);
    return 0;
 }
   
@@ -675,7 +696,7 @@ int XrdSsiSfsConfig::Xrole()
    if (roleID == XrdCmsRole::noRole)
       {Log.Emsg("Config", "invalid role -", Tok1, Tok2); rc = 1;}
 
-// Release storage and return if an error occured
+// Release storage and return if an error occurred
 //
    free(Tok1);
    if (Tok2) free(Tok2);

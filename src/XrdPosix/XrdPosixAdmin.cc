@@ -28,7 +28,12 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <errno.h>
+#include <cerrno>
+#include <limits>
+#include <cstddef>
+#include <unistd.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 
 #include "XrdNet/XrdNetAddr.hh"
 #include "XrdPosix/XrdPosixAdmin.hh"
@@ -46,7 +51,7 @@ XrdCl::URL *XrdPosixAdmin::FanOut(int &num)
    XrdCl::URL                    *uVec;
    XrdNetAddr netLoc;
    const char *hName;
-   int i;
+   unsigned long i;
 
 // Make sure admin is ok
 //
@@ -54,15 +59,17 @@ XrdCl::URL *XrdPosixAdmin::FanOut(int &num)
 
 // Issue the deep locate and verify that all went well
 //
-   xStatus = Xrd.DeepLocate(Url.GetPathWithParams(),XrdCl::OpenFlags::None,info);
+   xStatus = Xrd.DeepLocate(Url.GetPathWithParams(),XrdCl::OpenFlags::PrefName,info);
    if (!xStatus.IsOK())
-      {num = XrdPosixMap::Result(xStatus, false);
+      {num = XrdPosixMap::Result(xStatus, ecMsg, false);
        return 0;
       }
 
 // Allocate an array large enough to hold this information
 //
    if (!(i = info->GetSize())) {delete info; return 0;}
+   if (i > std::numeric_limits<ptrdiff_t>::max() / sizeof(XrdCl::URL))
+      {delete info; return 0;}
    uVec = new XrdCl::URL[i];
 
 // Now start filling out the array
@@ -103,18 +110,19 @@ int XrdPosixAdmin::Query(XrdCl::QueryCode::Code reqCode, void *buff, int bsz)
 
 // Issue the query
 //
-   if (!XrdPosixMap::Result(Xrd.Query(reqCode, reqBuff, rspBuff)))
+   if (!XrdPosixMap::Result(Xrd.Query(reqCode, reqBuff, rspBuff),ecMsg))
       {uint32_t rspSz = rspBuff->GetSize();
-       // if the string is null-terminated decrement the size
        char *rspbuff = rspBuff->GetBuffer();
-       if ( !(rspbuff[rspSz - 1]) ) --rspSz;
-       if (bsz >= (int)rspSz + 1)
-          {strncpy((char *)buff, rspbuff, rspSz);
-           ((char*)buff)[rspSz] = 0; // make sure the string is null-terminated
-           delete rspBuff;
-           return static_cast<int>(rspSz + 1);
-          }
-       errno = ERANGE;
+       if (rspbuff && rspSz)
+          {// if the string is null-terminated decrement the size
+           if ( !(rspbuff[rspSz - 1]) ) --rspSz;
+           if (bsz >= (int)rspSz + 1)
+              {strncpy((char *)buff, rspbuff, rspSz);
+               ((char*)buff)[rspSz] = 0; // make sure it is null-terminated
+               delete rspBuff;
+               return static_cast<int>(rspSz + 1);
+              } else ecMsg.SetErrno(ERANGE,0,"buffer to small to hold result");
+          } else ecMsg.SetErrno(EFAULT,0,"Invalid return results");
       }
 
 // Return error
@@ -127,12 +135,10 @@ int XrdPosixAdmin::Query(XrdCl::QueryCode::Code reqCode, void *buff, int bsz)
 /*                                  S t a t                                   */
 /******************************************************************************/
   
-bool XrdPosixAdmin::Stat(mode_t *flags, time_t *mtime,
-                         size_t *size,  ino_t  *id, dev_t *rdv)
+bool XrdPosixAdmin::Stat(mode_t *flags, time_t *mtime)
 {
    XrdCl::XRootDStatus xStatus;
    XrdCl::StatInfo    *sInfo = 0;
-   int rc = 0;
 
 // Make sure admin is ok
 //
@@ -141,15 +147,70 @@ bool XrdPosixAdmin::Stat(mode_t *flags, time_t *mtime,
 // Issue the stat and verify that all went well
 //
    xStatus = Xrd.Stat(Url.GetPathWithParams(), sInfo);
-   if (!xStatus.IsOK()) rc = XrdPosixMap::Result(xStatus);
-      else {if (flags) *flags = XrdPosixMap::Flags2Mode(rdv, sInfo->GetFlags());
-            if (mtime) *mtime = static_cast<time_t>(sInfo->GetModTime());
-            if (size)  *size  = static_cast<size_t>(sInfo->GetSize());
-            if (id)    *id    = static_cast<ino_t>(strtoll(sInfo->GetId().c_str(), 0, 10));
-           }
+   if (!xStatus.IsOK())
+      {XrdPosixMap::Result(xStatus,ecMsg);
+       delete sInfo;
+       return false;
+      }
+
+// Return wanted data
+//
+   if (flags) *flags = XrdPosixMap::Flags2Mode(0, sInfo->GetFlags());
+   if (mtime) *mtime = static_cast<time_t>(sInfo->GetModTime());
 
 // Delete our status information and return final result
 //
    delete sInfo;
-   return rc == 0;
+   return true;
+}
+
+/******************************************************************************/
+  
+bool XrdPosixAdmin::Stat(struct stat &Stat)
+{
+   XrdCl::XRootDStatus xStatus;
+   XrdCl::StatInfo    *sInfo = 0;
+
+// Make sure admin is ok
+//
+   if (!isOK()) return false;
+
+// Issue the stat and verify that all went well
+//
+   xStatus = Xrd.Stat(Url.GetPathWithParams(), sInfo);
+   if (!xStatus.IsOK())
+      {XrdPosixMap::Result(xStatus,ecMsg);
+       delete sInfo;
+       return false;
+      }
+
+// Return the data
+//
+   Stat.st_size   = static_cast<size_t>(sInfo->GetSize());
+   Stat.st_blocks = Stat.st_size/512 + Stat.st_size%512;
+   Stat.st_ino    = static_cast<ino_t>(strtoll(sInfo->GetId().c_str(), 0, 10));
+#if defined(__mips__) && _MIPS_SIM == _ABIO32
+   // Work around inconsistent type definitions on MIPS
+   // The st_rdev field in struct stat (which is 32 bits) is not type
+   // dev_t (which is 64 bits)
+   dev_t tmp_rdev = Stat.st_rdev;
+   Stat.st_mode   = XrdPosixMap::Flags2Mode(&tmp_rdev, sInfo->GetFlags());
+   Stat.st_rdev = tmp_rdev;
+#else
+   Stat.st_mode   = XrdPosixMap::Flags2Mode(&Stat.st_rdev, sInfo->GetFlags());
+#endif
+   Stat.st_mtime  = static_cast<time_t>(sInfo->GetModTime());
+
+   if (sInfo->ExtendedFormat())
+      {Stat.st_ctime = static_cast<time_t>(sInfo->GetChangeTime());
+       Stat.st_atime = static_cast<time_t>(sInfo->GetAccessTime());
+      } else {
+       Stat.st_ctime = Stat.st_mtime;
+       Stat.st_atime = time(0);
+      }
+
+// Delete our status information and return final result
+//
+   delete sInfo;
+   return true;
 }

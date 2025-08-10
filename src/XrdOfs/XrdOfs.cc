@@ -29,18 +29,21 @@
 
 #include <unistd.h>
 #include <dirent.h>
-#include <errno.h>
+#include <cerrno>
 #include <fcntl.h>
 #include <memory.h>
-#include <string.h>
-#include <stdio.h>
-#include <time.h>
+#include <cstring>
+#include <cstdio>
+#include <ctime>
 #include <netdb.h>
-#include <stdlib.h>
+#include <cstdlib>
+#include <memory>
 #include <sys/param.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/types.h>
+
+#include "XProtocol/XProtocol.hh"
 
 #include "XrdCks/XrdCks.hh"
 #include "XrdCks/XrdCksConfig.hh"
@@ -51,6 +54,8 @@
 #include "XrdNet/XrdNetUtils.hh"
 
 #include "XrdOfs/XrdOfs.hh"
+#include "XrdOfs/XrdOfsChkPnt.hh"
+#include "XrdOfs/XrdOfsConfigCP.hh"
 #include "XrdOfs/XrdOfsEvs.hh"
 #include "XrdOfs/XrdOfsHandle.hh"
 #include "XrdOfs/XrdOfsPoscq.hh"
@@ -69,16 +74,18 @@
 #include "XrdSys/XrdSysLogger.hh"
 #include "XrdSys/XrdSysPlatform.hh"
 #include "XrdSys/XrdSysPthread.hh"
+#include "XrdSys/XrdSysRAtomic.hh"
 
 #include "XrdOuc/XrdOuca2x.hh"
 #include "XrdOuc/XrdOucEnv.hh"
 #include "XrdOuc/XrdOucERoute.hh"
 #include "XrdOuc/XrdOucLock.hh"
 #include "XrdOuc/XrdOucMsubs.hh"
+#include "XrdOuc/XrdOucPgrwUtils.hh"
 #include "XrdOuc/XrdOucTList.hh"
 #include "XrdOuc/XrdOucTPC.hh"
-#include "XrdOuc/XrdOucTrace.hh"
 #include "XrdSec/XrdSecEntity.hh"
+#include "XrdSec/XrdSecEntityAttr.hh"
 #include "XrdSfs/XrdSfsAio.hh"
 #include "XrdSfs/XrdSfsFlags.hh"
 #include "XrdSfs/XrdSfsInterface.hh"
@@ -97,7 +104,7 @@
 
 XrdSysError      OfsEroute(0);
 
-XrdOucTrace      OfsTrace(&OfsEroute);
+XrdSysTrace      OfsTrace("ofs");
 
 /******************************************************************************/
 /*               S t a t i s t i c a l   D a t a   O b j e c t                */
@@ -105,6 +112,35 @@ XrdOucTrace      OfsTrace(&OfsEroute);
   
 XrdOfsStats      OfsStats;
 
+/******************************************************************************/
+/*                       L o c a l   F u n c t i o n s                        */
+/******************************************************************************/
+
+namespace
+{
+bool VerPgw(const char *buf, ssize_t off, size_t len, const uint32_t* csv,
+            XrdOfsHandle *oh,  XrdOucErrInfo  &error)
+{
+   EPNAME("VerPgw");
+   XrdOucPgrwUtils::dataInfo dInfo(buf, csv, off, len);
+   off_t badoff;
+   int   badlen;
+
+// Verify incoming checksums
+//
+   if (!XrdOucPgrwUtils::csVer(dInfo, badoff, badlen))
+      {char eMsg[512];
+       int n;
+       n = snprintf(eMsg, sizeof(eMsg), "Checksum error at offset %lld.", (long long) badoff);
+       error.setErrInfo(EDOM, eMsg);
+       eMsg[n-1] = 0;
+       OfsEroute.Emsg(epname, eMsg, "aborted pgwrite to", oh->Name());
+       return false;
+      }
+   return true;
+}
+}
+  
 /******************************************************************************/
 /*                        S t a t i c   O b j e c t s                         */
 /******************************************************************************/
@@ -128,22 +164,27 @@ XrdOss *XrdOfsOss;
 
 /******************************************************************************/
 /*                    X r d O f s   C o n s t r u c t o r                     */
-/******************************************************************************/
+/*****************************************************************************/
 
-XrdOfs::XrdOfs()
+XrdOfs::XrdOfs() : dMask{0000,0775}, fMask{0000,0775}, // Legacy
+                   tpcRdrHost{}, tpcRdrPort{}
 {
    const char *bp;
 
 // Establish defaults
 //
    ofsConfig     = 0;
+   FSctl_PC      = 0;
+   FSctl_PI      = 0;
    Authorization = 0;
    Finder        = 0;
    Balancer      = 0;
    evsObject     = 0;
+   ossRPList     = 0;
    myRole        = strdup("server");
    OssIsProxy    = 0;
    ossRW         =' ';
+   ossFeatures   = 0;
 
 // Obtain port number we will be using. Note that the constructor must occur
 // after the port number is known (i.e., this cannot be a global static).
@@ -174,23 +215,16 @@ XrdOfs::XrdOfs()
    prepHandler = 0;
    prepAuth = true;
 
-// Set TPC redirect targets
+// Eextended attribute limits
 //
-   tpcRdrHost= 0;
-   tpcRdrPort= 0;
-}
-  
-/******************************************************************************/
-/*                X r d O f s F i l e   C o n s t r u c t o r                 */
-/******************************************************************************/
+   usxMaxNsz = kXR_faMaxNlen;
+   usxMaxVsz = kXR_faMaxVlen;
 
-XrdOfsFile::XrdOfsFile(const char *user, int monid) : XrdSfsFile(user, monid)
-{
-   oh = XrdOfs::dummyHandle; 
-   dorawio = 0;
-   viaDel  = 0;
-   myTPC   = 0;
-   tident = (user ? user : "");
+// Other options
+//
+   DirRdr    = false;
+   reProxy   = false;
+   OssHasPGrw= false;
 }
 
 /******************************************************************************/
@@ -221,6 +255,7 @@ int XrdOfsDirectory::open(const char              *dir_path, // In
 */
 {
    EPNAME("opendir");
+   static const int od_mode = SFS_O_RDONLY|SFS_O_META;
    XrdOucEnv Open_Env(info,0,client);
    int retc;
 
@@ -236,6 +271,12 @@ int XrdOfsDirectory::open(const char              *dir_path, // In
 // Apply security, as needed
 //
    AUTHORIZE(client,&Open_Env,AOP_Readdir,"open directory",dir_path,error);
+
+// Find out where we should open this directory
+//
+   if (XrdOfsFS->DirRdr && XrdOfsFS->Finder && XrdOfsFS->Finder->isRemote()
+   &&  (retc = XrdOfsFS->Finder->Locate(error, dir_path, od_mode, &Open_Env)))
+      return XrdOfsFS->fsError(error, retc);
 
 // Open the directory and allocate a handle for it
 //
@@ -383,15 +424,10 @@ int XrdOfsDirectory::autoStat(struct stat *buf)
              return SFS_ERROR;
             }
 
-// Set the stat buffer in the storage system directory.
+// Set the stat buffer in the storage system directory but don't complain.
 //
-    if ((retc = dp->StatRet(buf)))
-       retc = XrdOfsFS->Emsg(epname, error, retc, "autostat", fname);
-       else retc = SFS_OK;
-
-// All done
-//
-   return retc;
+    if ((retc = dp->StatRet(buf))) return retc;
+    return SFS_OK;
 }
   
 /******************************************************************************/
@@ -399,6 +435,15 @@ int XrdOfsDirectory::autoStat(struct stat *buf)
 /*                F i l e   O b j e c t   I n t e r f a c e s                 */
 /*                                                                            */
 /******************************************************************************/
+/******************************************************************************/
+/*                X r d O f s F i l e   C o n s t r u c t o r                 */
+/******************************************************************************/
+
+XrdOfsFile::XrdOfsFile(XrdOucErrInfo &eInfo, const char *user)
+                      : XrdSfsFile(eInfo), tident(user ? user : ""),
+                        oh(XrdOfs::dummyHandle), myTPC(0), myCKP(0),
+                        dorawio(0), viaDel(0), ckpBad(false) {}
+
 /******************************************************************************/
 /*                                  o p e n                                   */
 /******************************************************************************/
@@ -416,10 +461,12 @@ int XrdOfsFile::open(const char          *path,      // In
                         SFS_O_RDONLY - Open file for reading.
                         SFS_O_WRONLY - Open file for writing.
                         SFS_O_RDWR   - Open file for update
+                        SFS_O_NOTPC  - Disallow TPC opens
                         SFS_O_REPLICA- Open file for replication
                         SFS_O_CREAT  - Create the file open in RW mode
                         SFS_O_TRUNC  - Trunc  the file open in RW mode
                         SFS_O_POSC   - Presist    file on successful close
+                        SFS_O_SEQIO  - Primarily sequential I/O (e.g. xrdcp)
             Mode      - The Posix access mode bits to be assigned to the file.
                         These bits correspond to the standard Unix permission
                         bits (e.g., 744 == "rwxr--r--"). Additionally, Mode
@@ -435,7 +482,6 @@ int XrdOfsFile::open(const char          *path,      // In
    EPNAME("open");
    static const int crMask = (SFS_O_CREAT  | SFS_O_TRUNC);
    static const int opMask = (SFS_O_RDONLY | SFS_O_WRONLY | SFS_O_RDWR);
-   static const int fRedir = (XrdOucEI::uUrlOK | XrdOucEI::uMProt);
 
    struct OpenHelper
          {const char   *Path;
@@ -456,7 +502,7 @@ int XrdOfsFile::open(const char          *path,      // In
                        }
          } oP(path);
 
-   mode_t theMode = Mode & S_IAMB;
+   mode_t theMode = (Mode | XrdOfsFS->fMask[0]) & XrdOfsFS->fMask[1];
    const char *tpcKey;
    int retc, isPosc = 0, crOpts = 0, isRW = 0, open_flag = 0;
    int find_flag = open_mode & (SFS_O_NOWAIT | SFS_O_RESET | SFS_O_MULTIW);
@@ -464,7 +510,8 @@ int XrdOfsFile::open(const char          *path,      // In
 
 // Trace entry
 //
-   ZTRACE(open, std::hex <<open_mode <<"-" <<std::oct <<Mode <<std::dec <<" fn=" <<path);
+   ZTRACE(open, Xrd::hex1 <<open_mode <<"-" <<Xrd::oct1 <<Mode <<" ("
+              <<Xrd::oct1 <<theMode <<") fn=" <<path);
 
 // Verify that this object is not already associated with an open file
 //
@@ -516,9 +563,13 @@ int XrdOfsFile::open(const char          *path,      // In
 
 // Check if we will be redirecting the tpc request
 //
-   if (tpcKey && isRW && XrdOfsFS->tpcRdrHost)
-      {error.setErrInfo(XrdOfsFS->tpcRdrPort, XrdOfsFS->tpcRdrHost);
-       return SFS_REDIRECT;
+   if (tpcKey && isRW && (XrdOfsFS->Options & XrdOfs::RdrTPC))
+      {const char *dOn = Open_Env.Get(XrdOucTPC::tpcDlgOn);
+       int k = ((dOn && *dOn == '1') || strcmp(tpcKey, "delegate") ? 1 : 0);
+       if (XrdOfsFS->tpcRdrHost[k])
+          {error.setErrInfo(XrdOfsFS->tpcRdrPort[k], XrdOfsFS->tpcRdrHost[k]);
+           return SFS_REDIRECT;
+          }
       }
 
 // If we have a finder object, use it to direct the client. The final
@@ -528,18 +579,47 @@ int XrdOfsFile::open(const char          *path,      // In
                                                    find_flag, &Open_Env)))
       return XrdOfsFS->fsError(error, retc);
 
+// Preset TPC handling and if not allowed, complain
+//
+   if (tpcKey && (open_mode & SFS_O_NOTPC))
+      return XrdOfsFS->Emsg(epname, error, EPROTOTYPE, "tpc", path);
+
 // Create the file if so requested o/w try to attach the file
 //
    if (open_flag & O_CREAT)
       {// Apply security, as needed
        //
-       AUTHORIZE(client,&Open_Env,AOP_Create,"create",path,error);
+       // If we aren't requesting O_EXCL, one needs AOP_Create
+       bool overwrite_permitted = true;
+       if (!(open_flag & O_EXCL))
+          {if (client && XrdOfsFS->Authorization &&
+               !XrdOfsFS->Authorization->Access(client, path, AOP_Create, &Open_Env))
+              { // We don't have the ability to create a file without O_EXCL.  If we have AOP_Excl_Create,
+                // then manipulate the open flags and see if we're successful with it.
+                AUTHORIZE(client,&Open_Env,AOP_Excl_Create,"create",path,error);
+                overwrite_permitted = false;
+                open_flag |= O_EXCL;
+                open_flag &= ~O_TRUNC;
+              }
+          }
+       // If we are in O_EXCL mode, then we accept either AOP_Excl_Create or AOP_Create
+       else if (client && XrdOfsFS->Authorization &&
+            !XrdOfsFS->Authorization->Access(client, path, AOP_Create, &Open_Env))
+          {AUTHORIZE(client,&Open_Env,AOP_Excl_Create,"create",path,error);
+           // In this case, we don't have AOP_Create but we do have AOP_Excl_Create; note that
+           // overwrites are not permitted (this is later used to correct an error code).
+           overwrite_permitted = false;
+          }
+
        OOIDENTENV(client, Open_Env);
 
        // For ephemeral file, we must enter the file into the queue
        //
-       if (isPosc && (oP.poscNum = XrdOfsFS->poscQ->Add(tident,path)) < 0)
-          return XrdOfsFS->Emsg(epname, error, oP.poscNum, "pcreate", path);
+       if (isPosc)
+          {bool isNew = (open_mode & SFS_O_TRUNC) == 0;
+           if ((oP.poscNum = XrdOfsFS->poscQ->Add(tident, path, isNew)) < 0)
+              return XrdOfsFS->Emsg(epname, error, oP.poscNum, "pcreate", path);
+          }
 
        // Create the file. If ENOTSUP is returned, promote the creation to
        // the subsequent open. This is to accomodate proxy support.
@@ -552,7 +632,11 @@ int XrdOfsFile::open(const char          *path,      // In
                return XrdOfsFS->fsError(error, SFS_STARTED);
               }
            if (retc != -ENOTSUP)
-              {if (XrdOfsFS->Balancer) XrdOfsFS->Balancer->Removed(path);
+              {// If we tried to overwrite an existing file but do not have the AOP_Create
+               // privilege, then ensure we generate a 'permission denied' instead of 'exists'
+               if ((open_flag & O_EXCL) && retc == -EEXIST && !overwrite_permitted)
+                  {retc = -EACCES;}
+               if (XrdOfsFS->Balancer) XrdOfsFS->Balancer->Removed(path);
                return XrdOfsFS->Emsg(epname, error, retc, "create", path);
               }
           } else {
@@ -609,7 +693,7 @@ int XrdOfsFile::open(const char          *path,      // In
       }
 
 // If this is a previously existing handle, we are almost done. If this is
-// the target of a third party copy requesy, fail it now. We don't support
+// the target of a third party copy request, fail it now. We don't support
 // multiple writers in tpc mode (this should really never happen).
 //
    if (!(oP.hP->Inactive()))
@@ -637,12 +721,13 @@ int XrdOfsFile::open(const char          *path,      // In
 //
    if (XrdOfsFS->OssIsProxy)
       {if (myTPC) open_flag |= O_NOFOLLOW;
-       if ((error.getUCap() & fRedir) == fRedir) open_flag |= O_DIRECT;
+       if (error.getUCap() & XrdOucEI::uUrlOK &&
+           error.getUCap() & XrdOucEI::uLclF) open_flag |= O_DIRECT;
       }
 
 // Open the file
 //
-   if ((retc = oP.fP->Open(path, open_flag, Mode, Open_Env)))
+   if ((retc = oP.fP->Open(path, open_flag, theMode, Open_Env)))
       {if (retc > 0) return XrdOfsFS->Stall(error, retc, path);
        if (retc == -EINPROGRESS)
           {XrdOfsFS->evrObject.Wait4Event(path,&error);
@@ -653,7 +738,7 @@ int XrdOfsFile::open(const char          *path,      // In
           {char *url = Open_Env.Get("FileURL");
            if (url) {error.setErrInfo(-1, url); return SFS_REDIRECT;}
           }
-       if (XrdOfsFS->Balancer && retc != -ECANCELED)
+       if (XrdOfsFS->Balancer && retc == -ENOENT)
           XrdOfsFS->Balancer->Removed(path);
        return XrdOfsFS->Emsg(epname, error, retc, "open", path);
       }
@@ -674,6 +759,20 @@ int XrdOfsFile::open(const char          *path,      // In
       }
    oP.hP->Activate(oP.fP);
    oP.hP->UnLock();
+
+// If this is being opened for sequential I/O advise the filesystem about it.
+//
+#if defined(__linux__) || (defined(__FreeBSD_kernel__) && defined(__GLIBC__))
+   if (!(XrdOfsFS->OssIsProxy) && open_mode & SFS_O_SEQIO)
+      {static RAtomic_int fadFails(0);
+       int theFD =  oP.fP->getFD();
+       if (theFD >= 0 && fadFails < 4096)
+          if (posix_fadvise(theFD, 0, 0, POSIX_FADV_SEQUENTIAL) < 0)
+             {OfsEroute.Emsg(epname, errno, "fadsize for sequential I/O.");
+              fadFails++;
+             }
+      }
+#endif
 
 // Send an open event if we must
 //
@@ -771,6 +870,15 @@ int XrdOfsFile::close()  // In
                }
       }
 
+// Handle any oustanding checkpoint
+//
+   if (myCKP)
+      {retc =  myCKP->Restore();
+       if (retc) XrdOfsFS->Emsg(epname,error,retc,"restore chkpnt",hP->Name());
+       myCKP->Finished();
+       myCKP = 0;
+      }
+
 // We need to handle the cunudrum that an event may have to be sent upon
 // the final close. However, that would cause the path name to be destroyed.
 // So, we have two modes of logic where we copy out the pathname if a final
@@ -797,6 +905,136 @@ int XrdOfsFile::close()  // In
 }
 
 /******************************************************************************/
+/*                            c h e c k p o i n t                             */
+/******************************************************************************/
+
+int XrdOfsFile::checkpoint(XrdSfsFile::cpAct act, struct iov *range, int n)
+{
+   EPNAME("chkpnt");
+   const char *ckpName;
+   int rc;
+   bool readok;
+
+// Make sure we are active
+//
+   if (oh->Inactive()) return XrdOfsFS->Emsg(epname, error, EBADF,
+                                        "handle checkpoint", (const char *)0);
+
+// If checkpointing is disabled, the don't accept this request.
+//
+   if (!XrdOfsConfigCP::Enabled) return XrdOfsFS->Emsg(epname, error, ENOTSUP,
+                        "handle disabled checkpoint", (const char *)0);
+
+// If this checkpoint is bad then only a delete, query or restore is allowed.
+//
+   if (ckpBad && (act == XrdSfsFile::cpTrunc || act == XrdSfsFile::cpWrite))
+      return XrdOfsFS->Emsg(epname, error, EIDRM, "extend checkpoint "
+             "(only delete or restore possible) for", oh->Name());
+
+// Handle the request
+//
+   switch(act)
+         {case XrdSfsFile::cpCreate:
+               ckpName = "create checkpoint for";
+               if ((rc = CreateCKP())) return rc;
+               if ((rc = myCKP->Create())) {myCKP->Finished(); myCKP = 0;}
+               break;
+          case XrdSfsFile::cpDelete:
+               ckpName = "delete checkpoint for";
+               if (!myCKP) rc = ENOENT;
+                  else {rc = myCKP->Delete();
+                        myCKP->Finished();
+                        myCKP = 0;
+                        ckpBad = false;
+                       }
+               break;
+          case XrdSfsFile::cpQuery:
+               ckpName = "query checkpoint for";
+               if (!range || n <= 0)
+                  return XrdOfsFS->Emsg(epname, error, EINVAL,
+                                   "query checkpoint limits for", oh->Name());
+               rc = (myCKP ? myCKP->Query(*range) : ENOENT);
+               break;
+          case XrdSfsFile::cpRestore:
+               ckpName = "restore checkpoint for";
+               if (!myCKP) rc = ENOENT;
+                  else {if (!(rc = myCKP->Restore(&readok)))
+                           {myCKP->Finished();
+                            myCKP  = 0;
+                            ckpBad = false;
+                           } else {
+                            if (!(oh->Select().DFType() & XrdOssDF::DF_isProxy))
+                               oh->Suppress((readok ? 0 : -EDOM));
+                            ckpBad = true;
+                           }
+                       }
+               break;
+          case XrdSfsFile::cpTrunc:
+               ckpName = "checkpoint truncate";
+                    if (!range) rc = EINVAL;
+               else if (!myCKP) rc = ENOENT;
+               else if ((rc = myCKP->Truncate(range))) ckpBad = true;
+               break;
+          case XrdSfsFile::cpWrite:
+               ckpName = "checkpoint write";
+                    if (!range || n <= 0) rc = EINVAL;
+               else if (!myCKP)           rc = ENOENT;
+               else if ((rc = myCKP->Write(range, n))) ckpBad = true;
+               break;
+
+          default: return XrdOfsFS->Emsg(epname, error, EINVAL,
+                                  "decode checkpoint request for", oh->Name());
+         };
+
+// Complete as needed
+//
+   if (rc) return XrdOfsFS->Emsg(epname, error, rc, ckpName, oh->Name());
+
+// Trace success and return
+//
+   FTRACE(chkpnt, ckpName);
+   return SFS_OK;
+}
+  
+/******************************************************************************/
+/* Private:                    C r e a t e C K P                              */
+/******************************************************************************/
+
+int            XrdOfsFile::CreateCKP()
+{
+
+// Verify that a checkpoint does not exist
+//
+   if (myCKP) return XrdOfsFS->Emsg("CreateCKP", error, EEXIST,
+                                    "create checkpoint for", oh->Name());
+
+// Verify that this file is open r/w mode
+//
+   if (!(oh->isRW)) return XrdOfsFS->Emsg("CreateCKP", error, ENOTTY,
+                           "create checkpoint for R/O", oh->Name());
+
+// POSC and checkpoints are mutally exclusive
+//
+   if (oh->isRW == XrdOfsHandle::opPC)
+      return XrdOfsFS->Emsg("CreateCKP", error, ENOTTY,
+                            "create checkpoint for POSC file", oh->Name());
+
+// Get a new checkpoint object
+//
+   if (XrdOfsFS->OssIsProxy)
+      {char *resp;
+       int rc = oh->Select().Fctl(XrdOssDF::Fctl_ckpObj, 0, 0, &resp);
+       if (rc) return XrdOfsFS->Emsg("CreateCKP", error, rc,
+                                     "create proxy checkpoint");
+       myCKP = (XrdOucChkPnt *)resp;
+      } else myCKP = new XrdOfsChkPnt(oh->Select(), oh->Name());
+
+// All done
+//
+   return 0;
+}
+  
+/******************************************************************************/
 /*                                  f c t l                                   */
 /******************************************************************************/
   
@@ -814,15 +1052,16 @@ int            XrdOfsFile::fctl(const int               cmd,
 // We don't support this
 //
    out_error.setErrInfo(ENOTSUP, "fctl operation not supported");
+
+// Return
+//
    return SFS_ERROR;
 }
 
 /******************************************************************************/
 
-int            XrdOfsFile::fctl(const int               cmd,
-                                      int               alen,
-                                const char             *args,
-                                const XrdSecEntity     *client)
+int XrdOfsFile::fctl(const int cmd, int alen, const char *args,
+                     const XrdSecEntity *client)
 {                             // 12345678901234
    static const char *fctlArg = "ofs.tpc cancel";
    static const int   fctlAsz = 15;
@@ -830,9 +1069,7 @@ int            XrdOfsFile::fctl(const int               cmd,
 // See if the is a tpc cancellation (the only thing we support here)
 //
    if (cmd != SFS_FCTL_SPEC1 || !args || alen < fctlAsz || strcmp(fctlArg,args))
-      {error.setErrInfo(ENOTSUP, "fctl operation not supported");
-       return SFS_ERROR;
-      }
+      return XrdOfsFS->FSctl(*this, cmd, alen, args, client);
 
 // Check if we have a tpc operation in progress
 //
@@ -845,6 +1082,221 @@ int            XrdOfsFile::fctl(const int               cmd,
 //
    myTPC->Del();
    myTPC = 0;
+   return SFS_OK;
+}
+
+/******************************************************************************/
+/*                                p g R e a d                                 */
+/******************************************************************************/
+  
+XrdSfsXferSize XrdOfsFile::pgRead(XrdSfsFileOffset   offset,
+                                  char              *buffer,
+                                  XrdSfsXferSize     rdlen,
+                                  uint32_t          *csvec,
+                                  uint64_t           opts)
+{
+   EPNAME("pgRead");
+   XrdSfsXferSize nbytes;
+   uint64_t pgOpts;
+
+// If the oss plugin does not support pgRead and we doing rawio then simulate
+// the pgread. As this is relatively common we skip the vtable. This means
+// this class cannot be a inherited to override the read() method.
+//
+   if (!XrdOfsFS->OssHasPGrw || dorawio)
+      {if ((nbytes = XrdOfsFile::read(offset, buffer, rdlen)) > 0)
+          XrdOucPgrwUtils::csCalc(buffer, offset, nbytes, csvec);
+       return nbytes;
+      }
+
+// Perform required tracing
+//
+   FTRACE(read, rdlen <<"@" <<offset);
+
+// Make sure the offset is not too large
+//
+#if _FILE_OFFSET_BITS!=64
+   if (offset >  0x000000007fffffff)
+      return  XrdOfsFS->Emsg(epname, error, EFBIG, "pgRead", oh->Name());
+#endif
+
+// Pass through any flags of interest
+//
+   if (opts & XrdSfsFile::Verify) pgOpts = XrdOssDF::Verify;
+      else pgOpts = 0;
+
+// Now read the actual number of bytes
+//
+   nbytes = (XrdSfsXferSize)(oh->Select().pgRead((void *)buffer,
+                            (off_t)offset, (size_t)rdlen, csvec, pgOpts));
+   if (nbytes < 0)
+      return XrdOfsFS->Emsg(epname, error, (int)nbytes, "pgRead", oh->Name());
+
+// Return number of bytes read
+//
+   return nbytes;
+}
+
+/******************************************************************************/
+
+XrdSfsXferSize XrdOfsFile::pgRead(XrdSfsAio *aioparm, uint64_t opts)
+{
+   EPNAME("aiopgread");
+   uint64_t pgOpts;
+   int rc;
+
+// If the oss plugin does not support pgRead or if we are doing rawio or the
+// file is compressed then revert to using a standard async read. Note that
+// the standard async read will generate checksums if a vector is present.
+// Note: we set cksVec in the request to nil to indicate simulation!
+//
+   if (!XrdOfsFS->OssHasPGrw || dorawio || oh->isCompressed)
+      {aioparm->cksVec = 0;
+       return XrdOfsFile::read(aioparm);
+      }
+
+// Perform required tracing
+//
+   FTRACE(aio, aioparm->sfsAio.aio_nbytes <<"@" <<aioparm->sfsAio.aio_offset);
+
+// Make sure the offset is not too large
+//
+#if _FILE_OFFSET_BITS!=64
+   if (aiop->sfsAio.aio_offset >  0x000000007fffffff)
+      return  XrdOfsFS->Emsg(epname, error, EFBIG, "pgRead", oh->Name());
+#endif
+
+// Pass through any flags of interest
+//
+   if (opts & XrdSfsFile::Verify) pgOpts = XrdOssDF::Verify;
+      else pgOpts = 0;
+
+// Issue the read. Only true errors are returned here.
+//
+   if ((rc = oh->Select().pgRead(aioparm, pgOpts)) < 0)
+      return XrdOfsFS->Emsg(epname, error, rc, "pgRead", oh->Name());
+
+// All done
+//
+   return SFS_OK;
+}
+
+/******************************************************************************/
+/*                               p g W r i t e                                */
+/******************************************************************************/
+  
+XrdSfsXferSize XrdOfsFile::pgWrite(XrdSfsFileOffset   offset,
+                                   char              *buffer,
+                                   XrdSfsXferSize     wrlen,
+                                   uint32_t          *csvec,
+                                   uint64_t           opts)
+{
+   EPNAME("pgWrite");
+   XrdSfsXferSize nbytes;
+   uint64_t pgOpts;
+
+// If the oss plugin does not support pgWrite revert to using a standard write.
+//
+   if (!XrdOfsFS->OssHasPGrw)
+      {if ((opts & XrdSfsFile::Verify)
+       && !VerPgw(buffer, offset, wrlen, csvec, oh, error)) return SFS_ERROR;
+       return XrdOfsFile::write(offset, buffer, wrlen);
+      }
+
+// Perform any required tracing
+//
+   FTRACE(write, wrlen <<"@" <<offset);
+
+// Make sure the offset is not too large
+//
+#if _FILE_OFFSET_BITS!=64
+   if (offset >  0x000000007fffffff)
+      return  XrdOfsFS->Emsg(epname, error, EFBIG, "pgwrite", oh);
+#endif
+
+// Silly Castor stuff
+//
+   if (XrdOfsFS->evsObject && !(oh->isChanged)
+   &&  XrdOfsFS->evsObject->Enabled(XrdOfsEvs::Fwrite)) GenFWEvent();
+
+// Pass through any flags of interest
+//
+   if (opts & XrdSfsFile::Verify) pgOpts = XrdOssDF::Verify;
+      else pgOpts = 0;
+
+// Write the requested bytes
+//
+   oh->isPending = 1;
+   nbytes = (XrdSfsXferSize)(oh->Select().pgWrite((void *)buffer,
+                            (off_t)offset, (size_t)wrlen, csvec, pgOpts));
+   if (nbytes < 0)
+      return XrdOfsFS->Emsg(epname, error, (int)nbytes, "pgwrite", oh);
+
+// Return number of bytes written
+//
+   return nbytes;
+}
+
+/******************************************************************************/
+
+XrdSfsXferSize XrdOfsFile::pgWrite(XrdSfsAio *aioparm, uint64_t opts)
+{
+   EPNAME("aiopgWrite");
+   uint64_t pgOpts;
+   int rc;
+
+// If the oss plugin does not support pgWrite revert to using a standard write.
+//
+   if (!XrdOfsFS->OssHasPGrw)
+      {if ((opts & XrdSfsFile::Verify)
+       && !VerPgw((char *)aioparm->sfsAio.aio_buf,
+                          aioparm->sfsAio.aio_offset,
+                          aioparm->sfsAio.aio_nbytes,
+                          aioparm->cksVec, oh, error)) return SFS_ERROR;
+       return XrdOfsFile::write(aioparm);
+      }
+
+// If this is a POSC file, we must convert the async call to a sync call as we
+// must trap any errors that unpersist the file. We can't do that via aio i/f.
+//
+   if (oh->isRW == XrdOfsHandle::opPC)
+      {aioparm->Result = XrdOfsFile::pgWrite(aioparm->sfsAio.aio_offset,
+                                     (char *)aioparm->sfsAio.aio_buf,
+                                             aioparm->sfsAio.aio_nbytes,
+                                             aioparm->cksVec, opts);
+       aioparm->doneWrite();
+       return SFS_OK;
+      }
+
+// Perform any required tracing
+//
+   FTRACE(aio, aioparm->sfsAio.aio_nbytes <<"@" <<aioparm->sfsAio.aio_offset);
+
+// Make sure the offset is not too large
+//
+#if _FILE_OFFSET_BITS!=64
+   if (aiop->sfsAio.aio_offset >  0x000000007fffffff)
+      return  XrdOfsFS->Emsg(epname, error, EFBIG, "pgwrite", oh->Name());
+#endif
+
+// Silly Castor stuff
+//
+   if (XrdOfsFS->evsObject && !(oh->isChanged)
+   &&  XrdOfsFS->evsObject->Enabled(XrdOfsEvs::Fwrite)) GenFWEvent();
+
+// Pass through any flags of interest
+//
+   if (opts & XrdSfsFile::Verify) pgOpts = XrdOssDF::Verify;
+      else pgOpts = 0;
+
+// Write the requested bytes
+//
+   oh->isPending = 1;
+   if ((rc = oh->Select().pgWrite(aioparm, pgOpts)) < 0)
+       return XrdOfsFS->Emsg(epname, error, rc, "pgwrite", oh->Name());
+
+// All done
+//
    return SFS_OK;
 }
 
@@ -1400,11 +1852,13 @@ int XrdOfs::chksum(      csFunc            Func,   // In
    if (CksPfn && !(Path = XrdOfsOss->Lfn2Pfn(Path, buff, MAXPATHLEN, rc)))
       return Emsg(epname, einfo, rc, "checksum", Path);
 
-// If this is a proxy server then we may need to pass a pointer to the env
+// Originally we only passed he env pointer for proxy servers. Due to popular
+// demand, we always pass the env as it points to the SecEntity object unless
+// we don't have it then we pass the caller's environment.
 //
-   if (OssIsProxy)
-      {if (Func == XrdSfsFileSystem::csGet || Func == XrdSfsFileSystem::csCalc)
-          cksData.tident = tident;
+   if (Func == XrdSfsFileSystem::csGet || Func == XrdSfsFileSystem::csCalc)
+      {if (client) cksData.envP = &cksEnv;
+          else cksData.envP = (einfo.getEnv() ? einfo.getEnv() : &cksEnv);
       }
 
 // Now determine what to do
@@ -1423,7 +1877,7 @@ int XrdOfs::chksum(      csFunc            Func,   // In
    if (rc >= 0 || rc == -ENODATA || rc == -ESTALE || rc == -ESRCH)
 #endif
       {if (rc >= 0) {cksData.Get(buff, MAXPATHLEN); rc = 0;}
-          else {*buff = 0; rc = ENOENT;}
+          else {*buff = 0; rc = -rc;}
        einfo.setErrInfo(rc, buff);
        return SFS_OK;
       }
@@ -1455,6 +1909,7 @@ int XrdOfs::chmod(const char             *path,    // In
 {
    EPNAME("chmod");
    static const int locFlags = SFS_O_RDWR|SFS_O_META;
+   struct stat Stat;
    mode_t acc_mode = Mode & S_IAMB;
    const char *tident = einfo.getErrUser();
    XrdOucEnv chmod_Env(info,0,client);
@@ -1477,6 +1932,13 @@ int XrdOfs::chmod(const char             *path,    // In
                   return fsError(einfo, retc);
       }
 
+// We need to adjust the mode based on whether this is a file or directory.
+//
+   if ((retc = XrdOfsOss->Stat(path, &Stat, 0, &chmod_Env)))
+      return XrdOfsFS->Emsg(epname, einfo, retc, "change", path);
+   if (S_ISDIR(Stat.st_mode)) acc_mode = (acc_mode | dMask[0]) & dMask[1];
+      else acc_mode = (acc_mode | fMask[0]) & fMask[1];
+
 // Check if we should generate an event
 //
    if (evsObject && evsObject->Enabled(XrdOfsEvs::Chmod))
@@ -1488,9 +1950,35 @@ int XrdOfs::chmod(const char             *path,    // In
 //
    if (!(retc = XrdOfsOss->Chmod(path, acc_mode, &chmod_Env))) return SFS_OK;
 
-// An error occured, return the error info
+// An error occurred, return the error info
 //
    return XrdOfsFS->Emsg(epname, einfo, retc, "change", path);
+}
+
+/******************************************************************************/
+/*                               C o n n e c t                                */
+/******************************************************************************/
+
+void XrdOfs::Connect(const XrdSecEntity *client)
+{
+   XrdOucEnv myEnv(0, 0, client);
+
+// Pass this call along
+//
+   XrdOfsOss->Connect(myEnv);
+}
+
+/******************************************************************************/
+/*                                  D i s c                                   */
+/******************************************************************************/
+  
+void XrdOfs::Disc(const XrdSecEntity *client)
+{
+   XrdOucEnv myEnv(0, 0, client);
+
+// Pass this call along
+//
+   XrdOfsOss->Disc(myEnv);
 }
 
 /******************************************************************************/
@@ -1551,175 +2039,9 @@ int XrdOfs::exists(const char                *path,        // In
        return SFS_OK;
       }
 
-// An error occured, return the error info
+// An error occurred, return the error info
 //
    return XrdOfsFS->Emsg(epname, einfo, retc, "locate", path);
-}
-
-/******************************************************************************/
-/*                                 f s c t l                                  */
-/******************************************************************************/
-
-int XrdOfs::fsctl(const int               cmd,
-                  const char             *args,
-                  XrdOucErrInfo          &einfo,
-                  const XrdSecEntity     *client)
-/*
-  Function: Perform filesystem operations:
-
-  Input:    cmd       - Operation command (currently supported):
-                        SFS_FSCTL_LOCATE - locate file
-                        SFS_FSCTL_STATCC - return cluster config status
-                        SFS_FSCTL_STATFS - return file system info (physical)
-                        SFS_FSCTL_STATLS - return file system info (logical)
-                        SFS_FSCTL_STATXA - return file extended attributes
-            arg       - Command dependent argument:
-                      - Locate: The path whose location is wanted
-            buf       - The stat structure to hold the results
-            einfo     - Error/Response information structure.
-            client    - Authentication credentials, if any.
-
-  Output:   Returns SFS_OK upon success and SFS_ERROR upon failure.
-*/
-{
-   EPNAME("fsctl");
-   static int PrivTab[]     = {XrdAccPriv_Delete, XrdAccPriv_Insert,
-                               XrdAccPriv_Lock,   XrdAccPriv_Lookup,
-                               XrdAccPriv_Rename, XrdAccPriv_Read,
-                               XrdAccPriv_Write};
-   static char PrivLet[]    = {'d',               'i',
-                               'k',               'l',
-                               'n',               'r',
-                               'w'};
-   static const int PrivNum = sizeof(PrivLet);
-
-   int retc, i, blen, privs, opcode = cmd & SFS_FSCTL_CMD;
-   const char *tident = einfo.getErrUser();
-   char *bP, *cP;
-   XTRACE(fsctl, args, "");
-
-// Process the LOCATE request
-//
-   if (opcode == SFS_FSCTL_LOCATE)
-      {static const int locMask = (SFS_O_FORCE|SFS_O_NOWAIT|SFS_O_RESET|
-                                   SFS_O_HNAME|SFS_O_RAWIO);
-       struct stat fstat;
-       char pbuff[1024], rType[3];
-       const char *Resp[2] = {rType, pbuff};
-       const char *locArg, *opq, *Path = Split(args,&opq,pbuff,sizeof(pbuff));
-       XrdNetIF::ifType ifType;
-       int Resp1Len;
-       int find_flag = SFS_O_LOCATE | (cmd & locMask);
-       XrdOucEnv loc_Env(opq ? opq+1 : 0,0,client);
-
-       if (cmd & SFS_O_TRUNC)           locArg = (char *)"*";
-          else {     if (*Path == '*') {locArg = Path; Path++;}
-                        else            locArg = Path;
-                AUTHORIZE(client,0,AOP_Stat,"locate",Path,einfo);
-               }
-       if (Finder && Finder->isRemote()
-       &&  (retc = Finder->Locate(einfo, locArg, find_flag, &loc_Env)))
-          return fsError(einfo, retc);
-
-       if (cmd & SFS_O_TRUNC) {rType[0] = 'S'; rType[1] = ossRW;}
-          else {if ((retc = XrdOfsOss->Stat(Path, &fstat, 0, &loc_Env)))
-                   return XrdOfsFS->Emsg(epname, einfo, retc, "locate", Path);
-                rType[0] = ((fstat.st_mode & S_IFBLK) == S_IFBLK ? 's' : 'S');
-                rType[1] =  (fstat.st_mode & S_IWUSR             ? 'w' : 'r');
-               }
-       rType[2] = '\0';
-
-       ifType = XrdNetIF::GetIFType((einfo.getUCap() & XrdOucEI::uIPv4)  != 0,
-                                    (einfo.getUCap() & XrdOucEI::uIPv64) != 0,
-                                    (einfo.getUCap() & XrdOucEI::uPrip)  != 0);
-       bool retHN = (cmd & SFS_O_HNAME) != 0;
-       if ((Resp1Len = myIF->GetDest(pbuff, sizeof(pbuff), ifType, retHN)))
-           {einfo.setErrInfo(Resp1Len+3, (const char **)Resp, 2);
-            return SFS_DATA;
-           }
-       return Emsg(epname, einfo, ENETUNREACH, "locate", Path);
-      }
-
-// Process the STATFS request
-//
-   if (opcode == SFS_FSCTL_STATFS)
-      {char pbuff[1024];
-       const char *opq, *Path = Split(args, &opq, pbuff, sizeof(pbuff));
-       XrdOucEnv fs_Env(opq ? opq+1 : 0,0,client);
-       AUTHORIZE(client,0,AOP_Stat,"statfs",Path,einfo);
-       if (Finder && Finder->isRemote()
-       &&  (retc = Finder->Space(einfo, Path, &fs_Env)))
-          return fsError(einfo, retc);
-       bP = einfo.getMsgBuff(blen);
-       if ((retc = XrdOfsOss->StatFS(Path, bP, blen, &fs_Env)))
-          return XrdOfsFS->Emsg(epname, einfo, retc, "statfs", args);
-       einfo.setErrCode(blen+1);
-       return SFS_DATA;
-      }
-
-// Process the STATLS request
-//
-   if (opcode == SFS_FSCTL_STATLS)
-      {char pbuff[1024];
-       const char *opq, *Path = Split(args, &opq, pbuff, sizeof(pbuff));
-       XrdOucEnv statls_Env(opq ? opq+1 : 0,0,client);
-       AUTHORIZE(client,0,AOP_Stat,"statfs",Path,einfo);
-       if (Finder && Finder->isRemote())
-          {statls_Env.Put("cms.qvfs", "1");
-           if ((retc = Finder->Space(einfo, Path, &statls_Env)))
-              {if (retc == SFS_DATA) retc = Reformat(einfo);
-               return fsError(einfo, retc);
-              }
-          }
-       bP = einfo.getMsgBuff(blen);
-       if ((retc = XrdOfsOss->StatLS(statls_Env, Path, bP, blen)))
-          return XrdOfsFS->Emsg(epname, einfo, retc, "statls", Path);
-       einfo.setErrCode(blen+1);
-       return SFS_DATA;
-      }
-
-// Process the STATXA request
-//
-   if (opcode == SFS_FSCTL_STATXA)
-      {char pbuff[1024];
-       const char *opq, *Path = Split(args, &opq, pbuff, sizeof(pbuff));
-       XrdOucEnv xa_Env(opq ? opq+1 : 0,0,client);
-       AUTHORIZE(client,0,AOP_Stat,"statxa",Path,einfo);
-       if (Finder && Finder->isRemote()
-       && (retc = Finder->Locate(einfo,Path,SFS_O_RDONLY|SFS_O_STAT,&xa_Env)))
-          return fsError(einfo, retc);
-       bP = einfo.getMsgBuff(blen);
-       if ((retc = XrdOfsOss->StatXA(Path, bP, blen, &xa_Env)))
-          return XrdOfsFS->Emsg(epname, einfo, retc, "statxa", Path);
-       if (!client || !XrdOfsFS->Authorization) privs = XrdAccPriv_All;
-          else privs = XrdOfsFS->Authorization->Access(client, Path, AOP_Any);
-       cP = bP + blen; strcpy(cP, "&ofs.ap="); cP += 8;
-       if (privs == XrdAccPriv_All) *cP++ = 'a';
-          else {for (i = 0; i < PrivNum; i++)
-                    if (PrivTab[i] & privs) *cP++ = PrivLet[i];
-                if (cP == (bP + blen + 1)) *cP++ = '?';
-               }
-       *cP++ = '\0';
-       einfo.setErrCode(cP-bP+1);
-       return SFS_DATA;
-      }
-
-// Process the STATCC request (this should always succeed)
-//
-   if (opcode == SFS_FSCTL_STATCC)
-      {static const int lcc_flag = SFS_O_LOCATE | SFS_O_LOCAL;
-       XrdOucEnv lcc_Env(0,0,client);
-            if (Finder)   retc = Finder  ->Locate(einfo,".",lcc_flag,&lcc_Env);
-       else if (Balancer) retc = Balancer->Locate(einfo,".",lcc_flag,&lcc_Env);
-       else retc = SFS_ERROR;
-       if (retc != SFS_DATA) einfo.setErrInfo(5, "none|");
-       return fsError(einfo, SFS_DATA);
-      }
-
-// Operation is not supported
-//
-   return XrdOfsFS->Emsg(epname, einfo, ENOTSUP, "fsctl", args);
-
 }
 
 /******************************************************************************/
@@ -1770,7 +2092,7 @@ int XrdOfs::mkdir(const char             *path,    // In
 {
    EPNAME("mkdir");
    static const int LocOpts = SFS_O_RDWR | SFS_O_CREAT | SFS_O_META;
-   mode_t acc_mode = Mode & S_IAMB;
+   mode_t acc_mode = (Mode | dMask[0]) & dMask[1];
    int retc, mkpath = Mode & SFS_O_MKPTH;
    const char *tident = einfo.getErrUser();
    XrdOucEnv mkdir_Env(info,0,client);
@@ -1961,9 +2283,25 @@ int XrdOfs::rename(const char             *old_name,  // In
 
 // Apply security, as needed
 //
-   AUTHORIZE2(client, einfo,
-              AOP_Rename, "renaming",    old_name, &old_Env,
-              AOP_Insert, "renaming to", new_name, &new_Env );
+   AUTHORIZE(client, &old_Env, AOP_Rename, "renaming", old_name, einfo);
+
+// The above authorization may mutate the XrdSecEntity by putting a mapped name
+// into the extended attributes.  This mapped name will affect the subsequent
+// authorization check below, giving the client access that may not be permitted.
+// Hence, we delete this attribute to reset the object back to "pristine" state.
+// If there was a way to make a copy of the XrdSecEntity, we could avoid this
+// hack-y reach inside the extended attributes.
+   if (client) client->eaAPI->Add("request.name", "", true);
+
+// If we do not have full-blown insert authorization, we'll need to test for
+// destination existence
+   bool cannot_overwrite = false;
+   if (client && XrdOfsFS->Authorization &&
+      !XrdOfsFS->Authorization->Access(client, new_name, AOP_Insert, &new_Env))
+      {cannot_overwrite = true;
+       AUTHORIZE(client, &new_Env, AOP_Excl_Insert,
+             "rename to existing file (overwrite disallowed)", new_name, einfo);
+      }
 
 // Find out where we should rename this file
 //
@@ -1984,10 +2322,32 @@ int XrdOfs::rename(const char             *old_name,  // In
        evsObject->Notify(XrdOfsEvs::Mv, evInfo);
       }
 
+// If we cannot overwrite, we must test for existence first.  This will test whether
+// we will destroy data in the rename (without actually destroying data).
+// Note there's an obvious race condition here; it was seen as the lesser-of-evils
+// compared to creating an exclusive file and potentially leaking it in the event
+// of a crash.
+//
+   if (cannot_overwrite)
+      {XrdSfsFileExistence exists_flag;
+       if (SFS_OK != exists(new_name, exists_flag, einfo, client, infoN))
+          {// File existence check itself failed; we can't prove that data won't
+           // be overwritten so we return an error.
+           return fsError(einfo, -einfo.getErrInfo());
+          }
+       if (exists_flag != XrdSfsFileExistNo)
+          {// EPERM mimics the error code set by Linux when you invoke rename()
+           // but cannot overwrite the destination file.
+           einfo.setErrInfo(EPERM, "Overwrite of existing data not permitted");
+           return fsError(einfo, -EPERM);
+          }
+      }
+
 // Perform actual rename operation
 //
    if ((retc = XrdOfsOss->Rename(old_name, new_name, &old_Env, &new_Env)))
-      return XrdOfsFS->Emsg(epname, einfo, retc, "rename", old_name);
+      {return XrdOfsFS->Emsg(epname, einfo, retc, "rename", old_name);
+      }
    XrdOfsHandle::Hide(old_name);
    if (Balancer) {Balancer->Removed(old_name);
                   Balancer->Added(new_name);
@@ -2142,7 +2502,7 @@ int XrdOfs::truncate(const char             *path,    // In
 //
    if (!(retc = XrdOfsOss->Truncate(path, Size, &trunc_Env))) return SFS_OK;
 
-// An error occured, return the error info
+// An error occurred, return the error info
 //
    return XrdOfsFS->Emsg(epname, einfo, retc, "trunc", path);
 }
@@ -2190,12 +2550,19 @@ int XrdOfs::Emsg(const char    *pfx,    // Message prefix value
 // If the error is EBUSY then we just need to stall the client. This is
 // a hack in order to provide for proxy support
 //
+// The hack unfotunately is now beinng triggered for reads and writes when
+// it was never so before (presumably due to client changes). So do not
+// apply the hack for these operations. This gets a better fix in R 6.0
+//
+if (strcmp("read", op) && strcmp("readv", op) && strcmp("pgRead", op) && 
+    strcmp("write",op) && strcmp("pgwrite",op)) {
     if (ecode < 0) ecode = -ecode;
     if (ecode == EBUSY) return 5;  // A hack for proxy support
 
 // Check for timeout conditions that require a client delay
 //
    if (ecode == ETIMEDOUT) return OSSDelay;
+   }
 
 // Format the error message
 //
@@ -2325,6 +2692,7 @@ const char * XrdOfs::Split(const char *Args, const char **Opq,
    xlen = (*Opq)-Args;
    if (xlen >= Plen) xlen = Plen-1;
    strncpy(Path, Args, xlen);
+   Path[xlen] = 0;
    return Path;
 }
 

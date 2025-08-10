@@ -36,6 +36,8 @@
 #include <map>
 #include <string>
 
+#include "XrdNet/XrdNetPMark.hh"
+
 class XrdLink;
 class XrdSecEntity;
 class XrdHttpReq;
@@ -54,6 +56,15 @@ public:
   
   std::string clientdn, clienthost, clientgroups;
   long long length;
+
+  XrdNetPMark * pmark;
+
+  bool tpcForwardCreds = false;
+
+  int mSciTag;
+
+  // Get full client identifier
+  void GetClientID(std::string &clid);
   
   // A view of the XrdSecEntity associated with the request.
   const XrdSecEntity &GetSecEntity() const;

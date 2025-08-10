@@ -32,6 +32,7 @@
   
 #include "XProtocol/XPtypes.hh"
 #include "XrdSys/XrdSysPthread.hh"
+#include "XrdXrootd/XrdXrootdProtocol.hh"
 
 class XrdXrootdFile;
 
@@ -39,30 +40,27 @@ class XrdXrootdPio
 {
 public:
 
-       XrdXrootdPio      *Next;
-       XrdXrootdFile     *myFile;
-       long long          myOffset;
-       int                myIOLen;
-       kXR_char           StreamID[2];
-       char               isWrite;
+       XrdXrootdPio       *Next;
+       int                (XrdXrootdProtocol::*ResumePio)();
+       XrdXrootd::IOParms  IO;
+       kXR_char            StreamID[2];
 
 static XrdXrootdPio      *Alloc(int n=1);
 
 inline XrdXrootdPio      *Clear(XrdXrootdPio *np=0)
-                               {const kXR_char zed[2] = {0,0};
-                                Set(0, 0, 0, zed,'\0');
+                               {ResumePio = 0;
+                                memset(&IO, 0, sizeof(IO));
+                                StreamID[0] = 0; StreamID[1] = 0;
                                 Next = np; return this;
                                }
 
        void               Recycle();
 
-inline void               Set(XrdXrootdFile *theFile, long long theOffset,
-                             int theIOLen, const kXR_char *theSID, char theW)
-                             {myFile      = theFile;
-                              myOffset    = theOffset;
-                              myIOLen     = theIOLen;
+inline void               Set(int (XrdXrootdProtocol::*Invoke)(),
+                              XrdXrootd::IOParms &io, const kXR_char *theSID)
+                             {ResumePio = Invoke;
+                              IO = io;
                               StreamID[0] = theSID[0]; StreamID[1] = theSID[1];
-                              isWrite     = theW;
                              }
 
                           XrdXrootdPio(XrdXrootdPio *np=0) {Clear(np);}

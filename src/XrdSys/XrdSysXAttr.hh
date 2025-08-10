@@ -36,6 +36,7 @@
 //! handling. The plugin is loaded via the ofs.xattrlib directive.
 //------------------------------------------------------------------------------
 
+class XrdOucEnv;
 class XrdSysError;
 
 class XrdSysXAttr
@@ -86,9 +87,9 @@ virtual int  Copy(const char *iPath, int iFD, const char *oPath, int oFD,
 //! @param  Path   -> Path of the file whose attribute is to be removed.
 //! @param  fd        If >=0 is the file descriptor of the opened subject file.
 //!
-//! @return =0     Attribute was successfully removed or did not exist.
-//! @return <0     Attribute was not removed, the return value is -errno that
-//!                describes the reason for the failure.
+//! @return =0     Attribute was successfully removed.
+//! @return <0     Attribute was not removed or does not exist. The return value
+//!                is -errno that describes the reason for the failure.
 //------------------------------------------------------------------------------
 
 virtual int  Del(const char *Aname, const char *Path, int fd=-1) = 0;
@@ -115,7 +116,7 @@ virtual void Free(AList *aPL) = 0;
 //!
 //! @return >0     The number of bytes placed in Aval. However, if avsz is zero
 //!                then the value is the actual size of the attribute value.
-//! @return =0     The attribute does not exist.
+//! @return =0     The attribute exists but has no associated value.
 //! @return <0     The attribute value could not be returned. The returned
 //!                value is -errno describing the reason.
 //------------------------------------------------------------------------------
@@ -154,7 +155,7 @@ virtual int  List(AList **aPL, const char *Path, int fd=-1, int getSz=0) = 0;
 //!                   attribute value which may contain binary data.
 //! @param  Path   -> Path of the file whose attribute is to be set.
 //! @param  fd     -> If >=0 is the file descriptor of the opened subject file.
-//! @param  isnew     When !0 then the attribute must not exist (i.e. new).
+//! @param  isNew     When !0 then the attribute must not exist (i.e. new).
 //!                   Otherwise, if it does exist, the value is replaced. In
 //!                   either case, if it does not exist it should be created.
 //!
@@ -208,12 +209,46 @@ XrdSysError *Say;
 //! The object creation function must be declared as an extern "C" function
 //! in the plug-in shared library as follows:
 //------------------------------------------------------------------------------
+
+typedef XrdSysXAttr *(*XrdSysGetXAttrObject_t)(XrdSysError  *errP,
+                                               const char   *config_fn,
+                                               const char   *parms);
 /*!
-    extern "C" XrdSysXAttr *XrdSysGetXAttrObject(XrdSysError  *errP,
-                                                 const char   *config_fn,
-                                                 const char   *parms);
+extern "C" XrdSysXAttr *XrdSysGetXAttrObject(XrdSysError  *errP,
+                                             const char   *config_fn,
+                                             const char   *parms);
 */
 
+//------------------------------------------------------------------------------
+//! Add an instance of a configured XrdSysXAttr object, wrapping previous one.
+//!
+//! @param  errP       -> Error message object for error messages.
+//! @param  config_fn  -> The name of the config file.
+//! @param  parms      -> Any parameters specified on the ofs.xattrlib
+//!                       directive. If there are no parameters parms may be 0.
+//! @param  envP       -> To environmental information (may be nil).
+//! @param  attrP      -> the current attribue object that should be wraped by
+//!                       this object.
+//!
+//! @return Success:   -> an instance of the XrdSysXattr object to be used.
+//!         Failure:      Null pointer which causes initialization to fail.
+//!
+//! The object creation function must be declared as an extern "C" function
+//! in the plug-in shared library as follows:
+//------------------------------------------------------------------------------
+
+typedef XrdSysXAttr *(*XrdSysAddXAttrObject_t)(XrdSysError  *errP,
+                                               const char   *config_fn,
+                                               const char   *parms,
+                                               XrdOucEnv    *envP,
+                                               XrdSysXAttr  *attrP);
+/*!
+    extern "C" XrdSysXAttr *XrdSysAddXAttrObject(XrdSysError  *errP,
+                                                 const char   *config_fn,
+                                                 const char   *parms,
+                                                 XrdOucEnv    *envP,
+                                                 XrdSysXAttr  *attrP);
+*/
 //------------------------------------------------------------------------------
 //! Declare compilation version.
 //!

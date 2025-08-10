@@ -34,22 +34,25 @@
  */
 
 
-#include <stdlib.h>
+#include <cstdlib>
 #include <unistd.h>
 #include <sys/types.h>
 
 #include "XrdSys/XrdSysError.hh"
 #include "XrdSys/XrdSysPthread.hh"
 #include "XrdSec/XrdSecInterface.hh"
-#include "XrdCrypto/XrdCryptoFactory.hh"
 #include "Xrd/XrdObject.hh"
 #include "XrdXrootd/XrdXrootdBridge.hh"
 #include "XrdOuc/XrdOucStream.hh"
 #include "Xrd/XrdProtocol.hh"
 #include "XrdOuc/XrdOucHash.hh"
+#include "XrdHttpChecksumHandler.hh"
+#include "XrdHttpReadRangeHandler.hh"
+#include "XrdNet/XrdNetPMark.hh"
 
 #include <openssl/ssl.h>
 
+#include <unordered_map>
 #include <vector>
 
 #include "XrdHttpReq.hh"
@@ -72,6 +75,7 @@ class XrdHttpSecXtractor;
 class XrdHttpExtHandler;
 struct XrdVersionInfo;
 class XrdOucGMap;
+class XrdCryptoFactory;
 
 class XrdHttpProtocol : public XrdProtocol {
   
@@ -87,6 +91,9 @@ public:
   void DoIt() {
     if (Resume) (*this.*Resume)();
   }
+
+  /// Use this function to parse header2cgi configurations
+  static int parseHeader2CGI(XrdOucStream &Config, XrdSysError & err, std::map<std::string, std::string> & header2cgi);
 
   /// Tells if the oustanding bytes on the socket match this protocol implementation
   XrdProtocol *Match(XrdLink *lp);
@@ -125,6 +132,12 @@ public:
   /// Authentication area
   XrdSecEntity SecEntity;
 
+  // XrdHttp checksum handling class
+  static XrdHttpChecksumHandler cksumHandler;
+
+  /// configuration for the read range handler
+  static XrdHttpReadRangeHandler::Configuration ReadRangeConfig;
+
   /// called via https
   bool isHTTPS() { return ishttps; }
 
@@ -135,7 +148,10 @@ private:
   int (XrdHttpProtocol::*Resume)();
 
   /// Initialization of the ssl security things
-  static int InitSecurity();
+  static bool InitTLS();
+
+  /// Initialization fo security addon
+  static bool InitSecurity();
 
   /// Start a response back to the client
   int StartSimpleResp(int code, const char *desc, const char *header_to_add, long long bodylen, bool keepalive);
@@ -149,9 +165,20 @@ private:
   /// Reset values, counters, in order to reutilize an object of this class
   void Reset();
 
+  /// Handle authentication of the client
+  /// @return 0 if successful, otherwise error
+  int HandleAuthentication(XrdLink* lp);
+
   /// After the SSL handshake, retrieve the VOMS info and the various stuff
   /// that is needed for autorization
   int GetVOMSData(XrdLink *lp);
+
+  // Handle gridmap file mapping if present
+  // Second argument is the OpenSSL hash of the EEC, if present; this allows
+  // a consistent fallback if the user is not in the mapfile.
+  //
+  // @return 0 if successful, otherwise !0
+  int HandleGridMap(XrdLink* lp, const char * eechash);
 
   /// Get up to blen bytes from the connection. Put them into mybuff.
   /// This primitive, for the way it is used, is not supposed to block
@@ -160,13 +187,26 @@ private:
   /// Create a new BIO object from an XrdLink.  Returns NULL on failure.
   static BIO *CreateBIO(XrdLink *lp);
   
+  /// The following records the external handlers that need to be loaded. We
+  /// must defer loading these handlers as we need to pass some information
+  /// to the handler and that is only known after we process our config file.
+  struct extHInfo
+        {XrdOucString extHName;  // The instance name (1 to 16 characters)
+         XrdOucString extHPath;  // The shared library path
+         XrdOucString extHParm;  // The parameter (sort of)
+         bool extHNoTlsOK;     // If true the exthandler can be loaded if TLS has NOT been configured
+         extHInfo(const char *hName, const char *hPath, const char *hParm, const bool hNoTlsOK)
+                 : extHName(hName), extHPath(hPath), extHParm(hParm), extHNoTlsOK(hNoTlsOK) {}
+        ~extHInfo() {}
+  };
   /// Functions related to the configuration
   static int Config(const char *fn, XrdOucEnv *myEnv);
+  static const char *Configed();
   static int xtrace(XrdOucStream &Config);
   static int xsslcert(XrdOucStream &Config);
   static int xsslkey(XrdOucStream &Config);
   static int xsecxtractor(XrdOucStream &Config);
-  static int xexthandler(XrdOucStream & Config, const char *ConfigFN, XrdOucEnv *myEnv);
+  static int xexthandler(XrdOucStream & Config, std::vector<extHInfo> &hiVec);
   static int xsslcadir(XrdOucStream &Config);
   static int xsslcipherfilter(XrdOucStream &Config);
   static int xdesthttps(XrdOucStream &Config);
@@ -174,6 +214,7 @@ private:
   static int xlistredir(XrdOucStream &Config);
   static int xselfhttps2http(XrdOucStream &Config);
   static int xembeddedstatic(XrdOucStream &Config);
+  static int xstaticheader(XrdOucStream &Config);
   static int xstaticredir(XrdOucStream &Config);
   static int xstaticpreload(XrdOucStream &Config);
   static int xgmap(XrdOucStream &Config);
@@ -181,9 +222,15 @@ private:
   static int xsslverifydepth(XrdOucStream &Config);
   static int xsecretkey(XrdOucStream &Config);
   static int xheader2cgi(XrdOucStream &Config);
+  static int xhttpsmode(XrdOucStream &Config);
+  static int xtlsreuse(XrdOucStream &Config);
+  static int xauth(XrdOucStream &Config);
   
+  static bool isRequiredXtractor; // If true treat secxtractor errors as fatal
   static XrdHttpSecXtractor *secxtractor;
   
+  static bool usingEC;   // using XrdEC
+  static bool hasCache;  // This is a caching server
   // Loads the SecXtractor plugin, if available
   static int LoadSecXtractor(XrdSysError *eDest, const char *libName,
                       const char *libParms);
@@ -195,8 +242,14 @@ private:
     XrdHttpExtHandler *ptr;
   } exthandler[MAX_XRDHTTPEXTHANDLERS];
   static int exthandlercnt;
-  
+
+  static int LoadExtHandlerNoTls(std::vector<extHInfo> &hiVec,
+                                 const char *cFN, XrdOucEnv &myEnv);
+
   // Loads the ExtHandler plugin, if available
+  static int LoadExtHandler(std::vector<extHInfo> &hiVec,
+                            const char *cFN, XrdOucEnv &myEnv);
+
   static int LoadExtHandler(XrdSysError *eDest, const char *libName,
                             const char *configFN, const char *libParms,
                             XrdOucEnv *myEnv, const char *instName);
@@ -237,24 +290,31 @@ private:
 
   /// Starts a chunked response; body of request is sent over multiple parts using the SendChunkResp
   //  API.
-  int StartChunkedResp(int code, const char *desc, const char *header_to_add, bool keepalive);
+  int StartChunkedResp(int code, const char *desc, const char *header_to_add, long long bodylen, bool keepalive);
 
   /// Send a (potentially partial) body in a chunked response; invoking with NULL body
   //  indicates that this is the last chunk in the response.
   int ChunkResp(const char *body, long long bodylen);
-  
+
+  /// Send the beginning of a chunked response but not the body; useful when the size
+  //  of the chunk is known but the body is not immediately available.
+  int ChunkRespHeader(long long bodylen);
+
+  /// Send the footer of the chunk response
+  int ChunkRespFooter();
+
   /// Gets a string that represents the IP address of the client. Must be freed
   char *GetClientIPStr();
-  
+
   /// Tells that we are just logging in
   bool DoingLogin;
+
+  /// Indicates whether we've attempted to send app info.
+  bool DoneSetInfo;
   
   /// Tells that we are just waiting to have N bytes in the buffer
   long ResumeBytes;
   
-  /// Global, static SSL context
-  static SSL_CTX *sslctx;
-
   /// Private SSL context
   SSL *ssl;
 
@@ -270,11 +330,9 @@ private:
   /// Flag to tell if the https handshake has finished, in the case of an https
   /// connection being established
   bool ssldone;
-
   static XrdCryptoFactory *myCryptoFactory;
+
 protected:
-
-
 
   // Statistical area
   //
@@ -333,15 +391,17 @@ protected:
   /// Our port, as a string
   static char * Port_str;
 
-  /// Windowsize
-  static int Window;
-
   /// OpenSSL stuff
   static char *sslcert, *sslkey, *sslcadir, *sslcafile, *sslcipherfilter;
 
+  /// CRL thread refresh interval
+  static int crlRefIntervalSec;
+
   /// Gridmap file location. The same used by XrdSecGsi
   static char *gridmap;// [s] gridmap file [/etc/grid-security/gridmap]
-   
+  static bool isRequiredGridmap; // If true treat gridmap errors as fatal
+  static bool compatNameGeneration; // If true, utilize the old algorithm for username generation for unknown users.
+
   /// The key used to calculate the url hashes
   static char *secretkey;
 
@@ -384,5 +444,21 @@ protected:
 
   /// C-style vptr table for our custom BIO objects.
   static BIO_METHOD *m_bio_method;
+
+  /// The list of checksums that were configured via the xrd.cksum parameter on the server config file
+  static char * xrd_cslist;
+
+  /// Packet marking handler pointer (assigned from the environment during the Config() call)
+  static XrdNetPMark * pmarkHandle;
+
+  /// If set to true, the HTTP TPC transfers will forward the credentials to redirected hosts
+  static bool tpcForwardCreds;
+
+  /// The static headers to always return; map is from verb to a list of (header, val) pairs.
+  static std::unordered_map<std::string, std::vector<std::pair<std::string, std::string>>> m_staticheader_map;
+
+  /// The static string version of m_staticheader_map.  After config parsing is done, this is
+  /// computed and we won't need to reference m_staticheader_map in the response path.
+  static std::unordered_map<std::string, std::string> m_staticheaders;
 };
 #endif

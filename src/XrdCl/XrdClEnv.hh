@@ -22,6 +22,7 @@
 #include <map>
 #include <string>
 #include <utility>
+#include <algorithm>
 
 #include "XrdSys/XrdSysPthread.hh"
 
@@ -88,6 +89,26 @@ namespace XrdCl
       bool ImportString( const std::string &key, const std::string &shellKey );
 
       //------------------------------------------------------------------------
+      //! Get default integer value for the given key
+      //! @param key   : the key
+      //! @param value : output parameter, default value corresponding to
+      //!                the key
+      //! @return      : true if a default integer value for the given key
+      //!                exists, false otherwise
+      //------------------------------------------------------------------------
+      bool GetDefaultIntValue( const std::string &key, int &value );
+
+      //------------------------------------------------------------------------
+      //! Get default string value for the given key
+      //! @param key   : the key
+      //! @param value : output parameter, default value corresponding to
+      //!                the key
+      //! @return      : true if a default string value for the given key
+      //!                exists, false otherwise
+      //------------------------------------------------------------------------
+      bool GetDefaultStringValue( const std::string &key, std::string &value );
+
+      //------------------------------------------------------------------------
       // Lock the environment for writing
       //------------------------------------------------------------------------
       void WriteLock()
@@ -114,7 +135,37 @@ namespace XrdCl
         pLock.ReInitialize();
       }
 
+      //------------------------------------------------------------------------
+      // Re-create the lock in the same memory
+      //------------------------------------------------------------------------
+      void RecreateLock()
+      {
+        new( &pLock )XrdSysRWLock();
+      }
+
     private:
+
+      //------------------------------------------------------------------------
+      // Unify the key, make sure it is not case sensitive and strip it of
+      // the XRD_ prefix if necessary
+      //------------------------------------------------------------------------
+      inline std::string UnifyKey( std::string key )
+      {
+        //----------------------------------------------------------------------
+        // Make the key lower case
+        //----------------------------------------------------------------------
+        std::transform( key.begin(), key.end(), key.begin(), ::tolower );
+
+        //----------------------------------------------------------------------
+        // Strip the `xrd_` prefix if necessary
+        //----------------------------------------------------------------------
+        static const char prefix[] = "xrd_";
+        if( key.compare( 0, sizeof( prefix ) - 1, prefix ) == 0 )
+          key = key.substr( sizeof( prefix ) - 1 );
+
+        return key;
+      }
+
       std::string GetEnv( const std::string &key );
       typedef std::map<std::string, std::pair<std::string, bool> > StringMap;
       typedef std::map<std::string, std::pair<int, bool> >         IntMap;

@@ -41,23 +41,31 @@
 #define TRACE_PROT      0x0020
 #define TRACE_SCHED     0x0040
 
+#define TRACE_TLS       0x0500
+#define TRACE_TLSCTX    0x0100
+#define TRACE_TLSSIO    0x0200
+#define TRACE_TLSSOK    0x0400
+
 #ifndef NODEBUG
 
 #include "XrdSys/XrdSysHeaders.hh"
-#include "XrdOuc/XrdOucTrace.hh"
+#include "XrdSys/XrdSysTrace.hh"
+
+namespace XrdGlobal
+{
+extern XrdSysTrace XrdTrace;
+}
 
 #ifndef XRD_TRACE
-#define XRD_TRACE XrdTrace.
+#define XRD_TRACE XrdGlobal::XrdTrace.
 #endif
 
 #define TRACE(act, x) \
-   if (XRD_TRACE What & TRACE_ ## act) \
-      {XRD_TRACE Beg(TraceID);   cerr <<x; XRD_TRACE End();}
+   if (XRD_TRACE What & TRACE_ ## act) {SYSTRACE(XRD_TRACE, 0, TraceID, 0, x)}
 
 #define TRACEI(act, x) \
    if (XRD_TRACE What & TRACE_ ## act) \
-      {XRD_TRACE Beg(TraceID,TRACELINK->ID); cerr <<x; \
-       XRD_TRACE End();}
+      {SYSTRACE(XRD_TRACE, TRACE_IDENT, TraceID, 0, x)}
 
 #define TRACING(x) XRD_TRACE What & x
 

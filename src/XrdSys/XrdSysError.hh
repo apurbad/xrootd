@@ -29,13 +29,13 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
  
-#include <stdlib.h>
+#include <cstdlib>
 #ifndef WIN32
 #include <unistd.h>
-#include <string.h>
+#include <cstring>
 #include <strings.h>
 #else
-#include <string.h>
+#include <cstring>
 #endif
 
 /******************************************************************************/
@@ -112,7 +112,7 @@ int baseFD();
 // ec2text tyranslates an error code to the correspodning error text or returns
 // null if matching text cannot be found.
 //
-static char *ec2text(int ecode);
+static const char *ec2text(int ecode);
 
 // Emsg() produces a message of various forms. The message is written to the 
 // constructor specified file descriptor. See variations below.
@@ -163,7 +163,7 @@ inline const char *SetPrefix(const char *prefix)
                          return oldpfx;
                         }
 
-// TBeg() is used to start a trace on ostream cerr. The TEnd() ends the trace.
+// TBeg() is used to start a trace on std::ostream std::cerr. The TEnd() ends the trace.
 //
 void TBeg(const char *txt1=0, const char *txt2=0, const char *txt3=0);
 void TEnd();

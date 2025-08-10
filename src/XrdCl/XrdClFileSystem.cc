@@ -36,6 +36,7 @@
 #include "XrdCl/XrdClPlugInManager.hh"
 #include "XrdCl/XrdClLocalFileTask.hh"
 #include "XrdCl/XrdClZipListHandler.hh"
+#include "XrdSys/XrdSysE2T.hh"
 #include "XrdSys/XrdSysPthread.hh"
 
 #include <sys/stat.h>
@@ -62,10 +63,9 @@ namespace
         struct stat ssp;
         if( stat( path.c_str(), &ssp ) == -1 )
         {
-          log->Error( FileMsg, "Stat: failed: %s", strerror( errno ) );
-          XRootDStatus *error = new XRootDStatus( stError, errErrorResponse,
-                                                  XProtocol::mapError( errno ),
-                                                  strerror( errno ) );
+          log->Error( FileMsg, "Stat: failed: %s", XrdSysE2T( errno ) );
+          XRootDStatus *error = new XRootDStatus( stError, errLocalError,
+                                                  XProtocol::mapError( errno ) );
           return QueueTask( error, 0, handler );
         }
 
@@ -75,7 +75,7 @@ namespace
         std::ostringstream data;
         data << ssp.st_dev << " " << ssp.st_size << " " << flags << " "
             << ssp.st_mtime;
-        log->Debug( FileMsg, data.str().c_str() );
+        log->Debug( FileMsg, "%s", data.str().c_str() );
 
         StatInfo *statInfo = new StatInfo();
         if( !statInfo->ParseServerResponse( data.str().c_str() ) )
@@ -89,6 +89,24 @@ namespace
         AnyObject *resp = new AnyObject();
         resp->Set( statInfo );
         return QueueTask( new XRootDStatus(), resp, handler );
+      }
+
+      XrdCl::XRootDStatus Rm( const std::string       &path,
+                              XrdCl::ResponseHandler  *handler,
+                              uint16_t                 timeout )
+      {
+        using namespace XrdCl;
+
+        Log *log = DefaultEnv::GetLog();
+        if( unlink( path.c_str() ) )
+        {
+          log->Error( FileMsg, "Rm: failed: %s", XrdSysE2T( errno ) );
+          XRootDStatus *error = new XRootDStatus( stError, errLocalError,
+                                                  XProtocol::mapError( errno ) );
+          return QueueTask( error, 0, handler );
+        }
+
+        return QueueTask( new XRootDStatus(), 0, handler );
       }
 
       static LocalFS& Instance()
@@ -248,15 +266,21 @@ namespace
       DeepLocateHandler( XrdCl::ResponseHandler   *handler,
                          const std::string        &path,
                          XrdCl::OpenFlags::Flags   flags,
-                         time_t                    expires ):
+                         time_t                    timeout ):
         pFirstTime( true ),
         pPartial( false ),
         pOutstanding( 1 ),
         pHandler( handler ),
         pPath( path ),
-        pFlags( flags ),
-        pExpires(expires)
+        pFlags( flags )
       {
+        if (timeout == 0) {
+          int val = XrdCl::DefaultRequestTimeout;
+          XrdCl::DefaultEnv::GetEnv()->GetInt("RequestTimeout", val);
+          timeout = val;
+        }
+
+        pExpires = ::time(nullptr) + timeout;
         pLocations = new XrdCl::LocationInfo();
       }
 
@@ -284,8 +308,8 @@ namespace
         //----------------------------------------------------------------------
         if( !status->IsOK() )
         {
-          log->Dump( FileSystemMsg, "[0x%x@DeepLocate(%s)] Got error "
-                     "response: %s", this, pPath.c_str(),
+          log->Dump( FileSystemMsg, "[%p@DeepLocate(%s)] Got error "
+                     "response: %s", (void*)this, pPath.c_str(),
                      status->ToStr().c_str() );
 
           //--------------------------------------------------------------------
@@ -293,8 +317,8 @@ namespace
           //--------------------------------------------------------------------
           if( pFirstTime )
           {
-            log->Debug( FileSystemMsg, "[0x%x@DeepLocate(%s)] Failed to get "
-                        "the initial location list: %s", this, pPath.c_str(),
+            log->Debug( FileSystemMsg, "[%p@DeepLocate(%s)] Failed to get "
+                        "the initial location list: %s", (void*)this, pPath.c_str(),
                         status->ToStr().c_str() );
             pHandler->HandleResponse( status, response );
             scopedLock.UnLock();
@@ -310,8 +334,8 @@ namespace
           //--------------------------------------------------------------------
           if( !pOutstanding )
           {
-            log->Debug( FileSystemMsg, "[0x%x@DeepLocate(%s)] No outstanding "
-                        "requests, give out what we've got", this,
+            log->Debug( FileSystemMsg, "[%p@DeepLocate(%s)] No outstanding "
+                        "requests, give out what we've got", (void*)this,
                         pPath.c_str() );
             scopedLock.UnLock();
             HandleFinalResponse();
@@ -328,8 +352,15 @@ namespace
         response->Get( info );
         LocationInfo::Iterator it;
 
-        log->Dump( FileSystemMsg, "[0x%x@DeepLocate(%s)] Got %d locations",
-                   this, pPath.c_str(), info->GetSize() );
+        if(!info) {
+          log->Error(FileSystemMsg,
+            "[%p@DeepLocate(%s)] No locations received in response",
+            (void*)this, pPath.c_str());
+          return;
+        }
+
+        log->Dump( FileSystemMsg, "[%p@DeepLocate(%s)] Got %d locations",
+                   (void*)this, pPath.c_str(), info->GetSize() );
 
         for( it = info->Begin(); it != info->End(); ++it )
         {
@@ -617,7 +648,7 @@ namespace
               XRootDStatus st = pCtx->fs->DirList( child, flags, handler, timeout );
               if( !st.IsOK() )
               {
-                log->Error( FileMsg, "Recursive directory list operation for %s failed: ",
+                log->Error( FileMsg, "Recursive directory list operation for %s failed: %s",
                             child.c_str(), st.ToString().c_str() );
                 pCtx->UpdateStatus( st );
                 continue;
@@ -653,7 +684,7 @@ namespace
         // clean up the arguments
         delete status;
         delete response;
-        // if we wont be continuing with the same handler, it can be deleted
+        // if we won't be continuing with the same handler, it can be deleted
         if( finalrsp )
           delete this;
       }
@@ -843,6 +874,8 @@ namespace
 
 namespace XrdCl
 {
+  struct FileSystemData;
+
   //----------------------------------------------------------------------------
   //! Wrapper class used to assign a load balancer
   //----------------------------------------------------------------------------
@@ -852,7 +885,8 @@ namespace XrdCl
       //------------------------------------------------------------------------
       // Constructor and destructor
       //------------------------------------------------------------------------
-      AssignLBHandler( FileSystem *fs, ResponseHandler *userHandler ):
+      AssignLBHandler( std::shared_ptr<FileSystemData> &fs,
+                       ResponseHandler                 *userHandler ):
         pFS(fs), pUserHandler(userHandler) {}
 
       virtual ~AssignLBHandler() {}
@@ -862,41 +896,201 @@ namespace XrdCl
       //------------------------------------------------------------------------
       virtual void HandleResponseWithHosts( XRootDStatus *status,
                                             AnyObject    *response,
-                                            HostList     *hostList )
-      {
-        if( status->IsOK() )
-        {
-          HostList::reverse_iterator it;
-          for( it = hostList->rbegin(); it != hostList->rend(); ++it )
-            if( it->loadBalancer )
-            {
-              pFS->AssignLoadBalancer( it->url );
-              break;
-            }
-        }
-
-        bool finalrsp = !( status->IsOK() && status->code == suContinue );
-        pUserHandler->HandleResponseWithHosts( status, response, hostList );
-        if( finalrsp )
-          delete this;
-      }
+                                            HostList     *hostList );
 
     private:
-      FileSystem      *pFS;
+      std::shared_ptr<FileSystemData> pFS;
       ResponseHandler *pUserHandler;
   };
 
+  //----------------------------------------------------------------------------
+  //! Wrapper class used to assign last URL
+  //----------------------------------------------------------------------------
+  class AssignLastURLHandler: public ResponseHandler
+  {
+    public:
+      //------------------------------------------------------------------------
+      // Constructor and destructor
+      //------------------------------------------------------------------------
+      AssignLastURLHandler( std::shared_ptr<FileSystemData> &fs,
+                            ResponseHandler                 *userHandler ):
+        pFS(fs), pUserHandler(userHandler) {}
+
+      virtual ~AssignLastURLHandler() {}
+
+      //------------------------------------------------------------------------
+      // Response callback
+      //------------------------------------------------------------------------
+      virtual void HandleResponseWithHosts( XRootDStatus *status,
+                                            AnyObject    *response,
+                                            HostList     *hostList );
+
+    private:
+      std::shared_ptr<FileSystemData> pFS;
+      ResponseHandler *pUserHandler;
+  };
+
+
+  struct FileSystemData
+  {
+    FileSystemData( const URL &url ) :
+      pLoadBalancerLookupDone( false ),
+      pFollowRedirects( true ),
+      pUrl( new URL( url.GetURL() ) )
+    {
+    }
+
+    //------------------------------------------------------------------------
+    // Send a message in a locked environment
+    //------------------------------------------------------------------------
+    static XRootDStatus Send( std::shared_ptr<FileSystemData> &fs,
+                              Message                         *msg,
+                              ResponseHandler                 *handler,
+                              MessageSendParams               &params )
+    {
+      Log *log = DefaultEnv::GetLog();
+      XrdSysMutexHelper scopedLock( fs->pMutex );
+
+      log->Dump( FileSystemMsg, "[%p@%s] Sending %s", (void*)fs.get(),
+                 fs->pUrl->GetHostId().c_str(), msg->GetObfuscatedDescription().c_str() );
+
+      AssignLastURLHandler *lastUrlHandler = new AssignLastURLHandler( fs, handler );
+      handler = lastUrlHandler;
+
+      AssignLBHandler *lbHandler = nullptr;
+      if( !fs->pLoadBalancerLookupDone && fs->pFollowRedirects )
+      {
+        lbHandler = new AssignLBHandler( fs, handler );
+        handler = lbHandler;
+      }
+
+      params.followRedirects = fs->pFollowRedirects;
+
+      auto st = MessageUtils::SendMessage( *fs->pUrl, msg, handler, params, 0 );
+      if( !st.IsOK() )
+      {
+        delete lastUrlHandler;
+        delete lbHandler;
+      }
+
+      return st;
+    }
+
+    //----------------------------------------------------------------------------
+    // Assign a load balancer if it has not already been assigned
+    //----------------------------------------------------------------------------
+    void AssignLoadBalancer( const URL &url )
+    {
+      Log *log = DefaultEnv::GetLog();
+      XrdSysMutexHelper scopedLock( pMutex );
+
+      if( pLoadBalancerLookupDone )
+        return;
+
+      log->Dump( FileSystemMsg, "[%p@%s] Assigning %s as load balancer", (void*)this,
+                 pUrl->GetHostId().c_str(), url.GetHostId().c_str() );
+
+      pUrl.reset( new URL( url ) );
+      pLoadBalancerLookupDone = true;
+    }
+
+    //----------------------------------------------------------------------------
+    // Assign last URL
+    //----------------------------------------------------------------------------
+    void AssignLastURL( const URL &url )
+    {
+      Log *log = DefaultEnv::GetLog();
+      XrdSysMutexHelper scopedLock( pMutex );
+
+      log->Dump( FileSystemMsg, "[%p@%s] Assigning %s as last URL", (void*)this,
+                 pUrl->GetHostId().c_str(), url.GetHostId().c_str() );
+
+      pLastUrl.reset( new URL( url ) );
+    }
+
+    XrdSysMutex           pMutex;
+    bool                  pLoadBalancerLookupDone;
+    bool                  pFollowRedirects;
+    std::unique_ptr<URL>  pUrl;
+    std::unique_ptr<URL>  pLastUrl;
+  };
+
+  //----------------------------------------------------------------------------
+  //! Implementation holding the data members
+  //----------------------------------------------------------------------------
+  struct FileSystemImpl
+  {
+    FileSystemImpl( const URL &url ) :
+      fsdata( std::make_shared<FileSystemData>( url ) )
+    {
+    }
+
+    std::shared_ptr<FileSystemData> fsdata;
+  };
+
+  //------------------------------------------------------------------------
+  // Response callback
+  //------------------------------------------------------------------------
+  void AssignLBHandler::HandleResponseWithHosts( XRootDStatus *status,
+                                                 AnyObject    *response,
+                                                 HostList     *hostList )
+  {
+    if( status->IsOK() )
+    {
+      HostList::reverse_iterator it;
+      for( it = hostList->rbegin(); it != hostList->rend(); ++it )
+        if( it->loadBalancer )
+        {
+          pFS->AssignLoadBalancer( it->url );
+          break;
+        }
+    }
+
+    bool finalrsp = !( status->IsOK() && status->code == suContinue );
+
+    SyncResponseHandler * syncHandler = dynamic_cast<SyncResponseHandler*>( pUserHandler );
+    if( !syncHandler )
+      pUserHandler->HandleResponseWithHosts( status, response, hostList );
+
+    if( finalrsp )
+    {
+      if( syncHandler )
+        pUserHandler->HandleResponseWithHosts( status, response, hostList );
+      delete this;
+    }
+  }
+
+  //------------------------------------------------------------------------
+  // Response callback
+  //------------------------------------------------------------------------
+  void AssignLastURLHandler::HandleResponseWithHosts( XRootDStatus *status,
+                                                      AnyObject    *response,
+                                                      HostList     *hostList )
+  {
+    if( status->IsOK() && hostList )
+      pFS->AssignLastURL( hostList->front().url );
+
+    bool finalrsp = !( status->IsOK() && status->code == suContinue );
+
+    SyncResponseHandler *syncHandler = dynamic_cast<SyncResponseHandler*>( pUserHandler );
+    if( !syncHandler )
+      pUserHandler->HandleResponseWithHosts( status, response, hostList );
+
+    if( finalrsp )
+    {
+      if( syncHandler )
+        pUserHandler->HandleResponseWithHosts( status, response, hostList );
+      delete this;
+    }
+  }
 
   //----------------------------------------------------------------------------
   // Constructor
   //----------------------------------------------------------------------------
   FileSystem::FileSystem( const URL &url, bool enablePlugIns ):
-    pLoadBalancerLookupDone( false ),
-    pFollowRedirects( true ),
+    pImpl( new FileSystemImpl( url ) ),
     pPlugIn(0)
   {
-    pUrl = new URL( url.GetURL() );
-
     //--------------------------------------------------------------------------
     // Check if we need to install a plug-in for this URL
     //--------------------------------------------------------------------------
@@ -911,7 +1105,7 @@ namespace XrdCl
         if( !pPlugIn )
         {
           log->Error( FileMsg, "Plug-in factory failed to produce a plug-in "
-                      "for %s, continuing without one", urlStr.c_str() );
+                      "for %s, continuing without one", url.GetObfuscatedURL().c_str() );
         }
       }
     }
@@ -931,8 +1125,8 @@ namespace XrdCl
         DefaultEnv::GetForkHandler()->UnRegisterFileSystemObject( this );
     }
 
-    delete pUrl;
     delete pPlugIn;
+    delete pImpl;
   }
 
   //----------------------------------------------------------------------------
@@ -961,7 +1155,7 @@ namespace XrdCl
 
     XRootDTransport::SetDescription( msg );
 
-    return Send( msg, handler, params );
+    return FileSystemData::Send( pImpl->fsdata, msg, handler, params );
   }
 
   //----------------------------------------------------------------------------
@@ -989,9 +1183,7 @@ namespace XrdCl
                                        uint16_t           timeout )
   {
     return Locate( path, flags,
-                   new DeepLocateHandler( handler, path, flags,
-                                          ::time(0)+timeout ),
-                   timeout );
+                   new DeepLocateHandler( handler, path, flags, timeout ), timeout );
   }
 
   //----------------------------------------------------------------------------
@@ -1039,7 +1231,7 @@ namespace XrdCl
 
     XRootDTransport::SetDescription( msg );
 
-    return Send( msg, handler, params );
+    return FileSystemData::Send( pImpl->fsdata, msg, handler, params );
   }
 
   //----------------------------------------------------------------------------
@@ -1080,7 +1272,7 @@ namespace XrdCl
     MessageUtils::ProcessSendParams( params );
     XRootDTransport::SetDescription( msg );
 
-    return Send( msg, handler, params );
+    return FileSystemData::Send( pImpl->fsdata, msg, handler, params );
   }
 
   //----------------------------------------------------------------------------
@@ -1124,7 +1316,7 @@ namespace XrdCl
     MessageUtils::ProcessSendParams( params );
     XRootDTransport::SetDescription( msg );
 
-    return Send( msg, handler, params );
+    return FileSystemData::Send( pImpl->fsdata, msg, handler, params );
   }
 
   //----------------------------------------------------------------------------
@@ -1152,6 +1344,9 @@ namespace XrdCl
     if( pPlugIn )
       return pPlugIn->Rm( path, handler, timeout );
 
+    if( pImpl->fsdata->pUrl->IsLocalFile() )
+      return LocalFS::Instance().Rm( path, handler, timeout );
+
     std::string fPath = FilterXrdClCgi( path );
 
     Message         *msg;
@@ -1165,7 +1360,7 @@ namespace XrdCl
     MessageUtils::ProcessSendParams( params );
     XRootDTransport::SetDescription( msg );
 
-    return Send( msg, handler, params );
+    return FileSystemData::Send( pImpl->fsdata, msg, handler, params );
   }
 
   //----------------------------------------------------------------------------
@@ -1209,7 +1404,7 @@ namespace XrdCl
     MessageUtils::ProcessSendParams( params );
     XRootDTransport::SetDescription( msg );
 
-    return Send( msg, handler, params );
+    return FileSystemData::Send( pImpl->fsdata, msg, handler, params );
   }
 
   //----------------------------------------------------------------------------
@@ -1251,7 +1446,7 @@ namespace XrdCl
     MessageUtils::ProcessSendParams( params );
     XRootDTransport::SetDescription( msg );
 
-    return Send( msg, handler, params );
+    return FileSystemData::Send( pImpl->fsdata, msg, handler, params );
   }
 
   //----------------------------------------------------------------------------
@@ -1293,7 +1488,7 @@ namespace XrdCl
     MessageUtils::ProcessSendParams( params );
     XRootDTransport::SetDescription( msg );
 
-    return Send( msg, handler, params );
+    return FileSystemData::Send( pImpl->fsdata, msg, handler, params );
   }
 
   //----------------------------------------------------------------------------
@@ -1329,7 +1524,7 @@ namespace XrdCl
     MessageUtils::ProcessSendParams( params );
     XRootDTransport::SetDescription( msg );
 
-    return Send( msg, handler, params );
+    return FileSystemData::Send( pImpl->fsdata, msg, handler, params );
   }
 
   //----------------------------------------------------------------------------
@@ -1355,7 +1550,7 @@ namespace XrdCl
     if( pPlugIn )
       return pPlugIn->Stat( path, handler, timeout );
 
-    if( pUrl->IsLocalFile() )
+    if( pImpl->fsdata->pUrl->IsLocalFile() )
       return LocalFS::Instance().Stat( path, handler, timeout );
 
     std::string fPath = FilterXrdClCgi( path );
@@ -1372,7 +1567,7 @@ namespace XrdCl
     MessageUtils::ProcessSendParams( params );
     XRootDTransport::SetDescription( msg );
 
-    return Send( msg, handler, params );
+    return FileSystemData::Send( pImpl->fsdata, msg, handler, params );
   }
 
   //----------------------------------------------------------------------------
@@ -1414,7 +1609,7 @@ namespace XrdCl
     MessageUtils::ProcessSendParams( params );
     XRootDTransport::SetDescription( msg );
 
-    return Send( msg, handler, params );
+    return FileSystemData::Send( pImpl->fsdata, msg, handler, params );
   }
 
   //----------------------------------------------------------------------------
@@ -1451,7 +1646,7 @@ namespace XrdCl
     MessageUtils::ProcessSendParams( params );
     XRootDTransport::SetDescription( msg );
 
-    return Send( msg, handler, params );
+    return FileSystemData::Send( pImpl->fsdata, msg, handler, params );
   }
 
   //----------------------------------------------------------------------------
@@ -1486,7 +1681,7 @@ namespace XrdCl
     {
       // stat the file to check if it is a directory or a file
       // the ZIP handler will take care of the rest
-      ZipListHandler *zipHandler = new ZipListHandler( *pUrl, path, flags, handler, timeout );
+      ZipListHandler *zipHandler = new ZipListHandler( *pImpl->fsdata->pUrl, path, flags, handler, timeout );
       XRootDStatus st = Stat( path, zipHandler, timeout );
       if( !st.IsOK() )
         delete zipHandler;
@@ -1503,8 +1698,11 @@ namespace XrdCl
     if( ( flags & DirListFlags::Stat ) || ( flags & DirListFlags::Recursive ) )
       req->options[0] = kXR_dstat;
 
+    if( ( flags & DirListFlags::Cksm ) )
+      req->options[0] = kXR_dstat | kXR_dcksm;
+
     if( flags & DirListFlags::Recursive )
-      handler = new RecursiveDirListHandler( *pUrl, url.GetPath(), flags, handler, timeout );
+      handler = new RecursiveDirListHandler( *pImpl->fsdata->pUrl, url.GetPath(), flags, handler, timeout );
 
     if( flags & DirListFlags::Merge )
       handler = new MergeDirListHandler( flags & DirListFlags::Chunked, handler );
@@ -1516,7 +1714,7 @@ namespace XrdCl
     MessageUtils::ProcessSendParams( params );
     XRootDTransport::SetDescription( msg );
 
-    return Send( msg, handler, params );
+    return FileSystemData::Send( pImpl->fsdata, msg, handler, params );
   }
 
   //----------------------------------------------------------------------------
@@ -1546,75 +1744,107 @@ namespace XrdCl
     //--------------------------------------------------------------------------
     if( flags & DirListFlags::Locate )
     {
+      bool isserver = false;
       //------------------------------------------------------------------------
-      // Locate all the disk servers holding the directory
+      // Check if destination is a data server
       //------------------------------------------------------------------------
-      LocationInfo *locations;
-      std::string locatePath = "*"; locatePath += path;
-      XRootDStatus st = DeepLocate( locatePath, OpenFlags::PrefName, locations );
-
-      if( !st.IsOK() )
-        return st;
-
-      if( locations->GetSize() == 0 )
       {
-        delete locations;
-        return XRootDStatus( stError, errNotFound );
+        AnyObject obj;
+        XRootDStatus st = DefaultEnv::GetPostMaster()->QueryTransport(
+            *pImpl->fsdata->pUrl, XRootDQuery::ServerFlags, obj);
+
+        if( st.IsOK() )
+        {
+          int *ptr = 0;
+          obj.Get( ptr );
+          isserver = ( ptr && (*ptr & kXR_isServer) );
+          delete ptr;
+        }
       }
 
-      //------------------------------------------------------------------------
-      // Ask each server for a directory list
-      //------------------------------------------------------------------------
-      flags &= ~DirListFlags::Locate;
-      FileSystem    *fs;
-      DirectoryList *currentResp  = 0;
-      uint32_t       errors       = 0;
-      uint32_t       numLocations = locations->GetSize();
-      bool           partial      = st.code == suPartial ? true : false;
+      if (isserver) {
+        // Just disable the locate flag if we are talking to a single server
+        flags &= ~DirListFlags::Locate;
+      } else {
+        //------------------------------------------------------------------------
+        // Locate all the disk servers holding the directory
+        //------------------------------------------------------------------------
+        LocationInfo *locations;
+        std::string locatePath = "*"; locatePath += path;
 
-      response = new DirectoryList();
-      response->SetParentName( path );
+        XRootDStatus st = DeepLocate(locatePath,
+                                     OpenFlags::PrefName |
+                                     OpenFlags::Compress |
+                                     OpenFlags::IntentDirList,
+                                     locations);
 
-      for( uint32_t i = 0; i < locations->GetSize(); ++i )
-      {
-        fs = new FileSystem( locations->At(i).GetAddress() );
-        st = fs->DirList( path, flags, currentResp, timeout );
         if( !st.IsOK() )
-        {
-          ++errors;
-          delete fs;
-          continue;
-        }
-
-        if( st.code == suPartial )
-          partial = true;
-
-        DirectoryList::Iterator it;
-
-        for( it = currentResp->Begin(); it != currentResp->End(); ++it )
-        {
-          response->Add( *it );
-          *it = 0;
-        }
-
-        delete fs;
-        delete currentResp;
-        fs          = 0;
-        currentResp = 0;
-      }
-      delete locations;
-
-      if( flags & DirListFlags::Merge )
-        MergeDirListHandler::Merge( response );
-
-      if( errors || partial )
-      {
-        if( errors == numLocations )
           return st;
-        return XRootDStatus( stOK, suPartial );
+
+        if( locations->GetSize() == 0 )
+        {
+          delete locations;
+          return XRootDStatus( stError, errNotFound );
+        }
+
+        //------------------------------------------------------------------------
+        // Ask each server for a directory list
+        //------------------------------------------------------------------------
+        flags &= ~DirListFlags::Locate;
+        FileSystem    *fs;
+        DirectoryList *currentResp  = 0;
+        uint32_t       errors       = 0;
+        uint32_t       numLocations = locations->GetSize();
+        bool           partial      = st.code == suPartial ? true : false;
+
+        response = new DirectoryList();
+        response->SetParentName( path );
+
+        for( uint32_t i = 0; i < locations->GetSize(); ++i )
+        {
+          URL locationURL( locations->At(i).GetAddress() );
+          // make sure the original protocol is preserved (root vs roots)
+          locationURL.SetProtocol( pImpl->fsdata->pUrl->GetProtocol() );
+          fs = new FileSystem( locationURL );
+          st = fs->DirList( path, flags, currentResp, timeout );
+          if( !st.IsOK() )
+          {
+            ++errors;
+            delete fs;
+            continue;
+          }
+
+          if( st.code == suPartial )
+            partial = true;
+
+          DirectoryList::Iterator it;
+
+          for( it = currentResp->Begin(); it != currentResp->End(); ++it )
+          {
+            response->Add( *it );
+            *it = 0;
+          }
+
+          delete fs;
+          delete currentResp;
+          fs          = 0;
+          currentResp = 0;
+        }
+
+        delete locations;
+
+        if( flags & DirListFlags::Merge )
+          MergeDirListHandler::Merge( response );
+
+        if( errors || partial )
+        {
+          if( errors == numLocations )
+            return st;
+          return XRootDStatus( stOK, suPartial );
+        }
+        return XRootDStatus();
       }
-      return XRootDStatus();
-    };
+    }
 
     //--------------------------------------------------------------------------
     // We just ask the current server
@@ -1662,6 +1892,35 @@ namespace XrdCl
   }
 
   //----------------------------------------------------------------------------
+  // Send cache info to the server - async
+  //----------------------------------------------------------------------------
+  XRootDStatus FileSystem::SendCache( const std::string &info,
+                                      ResponseHandler   *handler,
+                                      uint16_t           timeout )
+  {
+  // Note: adding SendCache() to the FileSystemPlugin class breaks ABI!
+  // So, the class is missing this until we do a major release. TODO
+  //if( pPlugIn )
+  //  return pPlugIn->SendCache( info, handler, timeout );
+    return SendSet("cache ", info, handler, timeout );
+  }
+
+  //----------------------------------------------------------------------------
+  //! Send cache info to the server - sync
+  //----------------------------------------------------------------------------
+  XRootDStatus FileSystem::SendCache( const std::string  &info,
+                                      Buffer            *&response,
+                                      uint16_t            timeout )
+  {
+    SyncResponseHandler handler;
+    Status st = SendCache( info, &handler, timeout );
+    if( !st.IsOK() )
+      return st;
+
+    return MessageUtils::WaitForResponse( &handler, response );
+  }
+
+  //----------------------------------------------------------------------------
   // Send info to the server - async
   //----------------------------------------------------------------------------
   XRootDStatus FileSystem::SendInfo( const std::string &info,
@@ -1670,22 +1929,7 @@ namespace XrdCl
   {
     if( pPlugIn )
       return pPlugIn->SendInfo( info, handler, timeout );
-
-    Message          *msg;
-    ClientSetRequest *req;
-    const char *prefix    = "monitor info ";
-    size_t      prefixLen = strlen( prefix );
-    MessageUtils::CreateRequest( msg, req, info.length()+prefixLen );
-
-    req->requestid  = kXR_set;
-    req->dlen       = info.length()+prefixLen;
-    msg->Append( prefix, prefixLen, 24 );
-    msg->Append( info.c_str(), info.length(), 24+prefixLen );
-    MessageSendParams params; params.timeout = timeout;
-    MessageUtils::ProcessSendParams( params );
-    XRootDTransport::SetDescription( msg );
-
-    return Send( msg, handler, params );
+    return SendSet("monitor info ", info, handler, timeout );
   }
 
   //----------------------------------------------------------------------------
@@ -1701,6 +1945,31 @@ namespace XrdCl
       return st;
 
     return MessageUtils::WaitForResponse( &handler, response );
+  }
+
+  //----------------------------------------------------------------------------
+  // Send set request to the server - async
+  //----------------------------------------------------------------------------
+  XRootDStatus FileSystem::SendSet(  const char        *prefix,
+                                     const std::string &info,
+                                     ResponseHandler   *handler,
+                                     uint16_t           timeout )
+  {
+
+    Message          *msg;
+    ClientSetRequest *req;
+    size_t      prefixLen = strlen( prefix );
+    MessageUtils::CreateRequest( msg, req, info.length()+prefixLen );
+
+    req->requestid  = kXR_set;
+    req->dlen       = info.length()+prefixLen;
+    msg->Append( prefix, prefixLen, 24 );
+    msg->Append( info.c_str(), info.length(), 24+prefixLen );
+    MessageSendParams params; params.timeout = timeout;
+    MessageUtils::ProcessSendParams( params );
+    XRootDTransport::SetDescription( msg );
+
+    return FileSystemData::Send( pImpl->fsdata, msg, handler, params );
   }
 
   //----------------------------------------------------------------------------
@@ -1729,7 +1998,8 @@ namespace XrdCl
     MessageUtils::CreateRequest( msg, req, list.length() );
 
     req->requestid  = kXR_prepare;
-    req->options    = flags;
+    req->options    = 0xff & flags;
+    req->optionX    = 0xffff & ( flags >> 8 );
     req->prty       = priority;
     req->dlen       = list.length();
 
@@ -1739,11 +2009,11 @@ namespace XrdCl
     MessageUtils::ProcessSendParams( params );
     XRootDTransport::SetDescription( msg );
 
-    return Send( msg, handler, params );
+    return FileSystemData::Send( pImpl->fsdata, msg, handler, params );
   }
 
   //------------------------------------------------------------------------
-  //! Prepare one or more files for access - sync
+  // Prepare one or more files for access - sync
   //------------------------------------------------------------------------
   XRootDStatus FileSystem::Prepare( const std::vector<std::string>  &fileList,
                                     PrepareFlags::Flags              flags,
@@ -1759,6 +2029,146 @@ namespace XrdCl
     return MessageUtils::WaitForResponse( &handler, response );
   }
 
+  //------------------------------------------------------------------------
+  // Set extended attributes - async
+  //------------------------------------------------------------------------
+  XRootDStatus FileSystem::SetXAttr( const std::string           &path,
+                                     const std::vector<xattr_t>  &attrs,
+                                     ResponseHandler             *handler,
+                                     uint16_t                     timeout )
+  {
+    if( pPlugIn )
+      return XRootDStatus( stError, errNotSupported );
+
+    return XAttrOperationImpl( kXR_fattrSet, 0, path, attrs, handler, timeout );
+  }
+
+  //------------------------------------------------------------------------
+  // Set extended attributes - sync
+  //------------------------------------------------------------------------
+  XRootDStatus FileSystem::SetXAttr( const std::string           &path,
+                                     const std::vector<xattr_t>  &attrs,
+                                     std::vector<XAttrStatus>    &result,
+                                     uint16_t                     timeout )
+  {
+    SyncResponseHandler handler;
+    XRootDStatus st = SetXAttr( path, attrs, &handler, timeout );
+    if( !st.IsOK() )
+      return st;
+
+    std::vector<XAttrStatus> *resp = 0;
+    st = MessageUtils::WaitForResponse( &handler, resp );
+    if( resp ) result.swap( *resp );
+    delete resp;
+
+    return st;
+  }
+
+  //------------------------------------------------------------------------
+  // Get extended attributes - async
+  //------------------------------------------------------------------------
+  XRootDStatus FileSystem::GetXAttr( const std::string               &path,
+                                     const std::vector<std::string>  &attrs,
+                                     ResponseHandler                 *handler,
+                                     uint16_t                         timeout )
+  {
+    if( pPlugIn )
+      return XRootDStatus( stError, errNotSupported );
+
+    return XAttrOperationImpl( kXR_fattrGet, 0, path, attrs, handler, timeout );
+  }
+
+  //------------------------------------------------------------------------
+  // Get extended attributes - sync
+  //------------------------------------------------------------------------
+  XRootDStatus FileSystem::GetXAttr( const std::string               &path,
+                                     const std::vector<std::string>  &attrs,
+                                     std::vector<XAttr>              &result,
+                                     uint16_t                         timeout )
+  {
+    SyncResponseHandler handler;
+    XRootDStatus st = GetXAttr( path, attrs, &handler, timeout );
+    if( !st.IsOK() )
+      return st;
+
+    std::vector<XAttr> *resp = 0;
+    st = MessageUtils::WaitForResponse( &handler, resp );
+    if( resp ) result.swap( *resp );
+    delete resp;
+
+    return st;
+  }
+
+  //------------------------------------------------------------------------
+  // Delete extended attributes - async
+  //------------------------------------------------------------------------
+  XRootDStatus FileSystem::DelXAttr( const std::string               &path,
+                                     const std::vector<std::string>  &attrs,
+                                     ResponseHandler                *handler,
+                                     uint16_t                        timeout )
+  {
+    if( pPlugIn )
+      return XRootDStatus( stError, errNotSupported );
+
+    return XAttrOperationImpl( kXR_fattrDel, 0, path, attrs, handler, timeout );
+  }
+
+  //------------------------------------------------------------------------
+  // Delete extended attributes - sync
+  //------------------------------------------------------------------------
+  XRootDStatus FileSystem::DelXAttr( const std::string               &path,
+                                     const std::vector<std::string>  &attrs,
+                                     std::vector<XAttrStatus>        &result,
+                                     uint16_t                         timeout )
+  {
+    SyncResponseHandler handler;
+    XRootDStatus st = DelXAttr( path, attrs, &handler, timeout );
+    if( !st.IsOK() )
+      return st;
+
+    std::vector<XAttrStatus> *resp = 0;
+    st = MessageUtils::WaitForResponse( &handler, resp );
+    if( resp ) result.swap( *resp );
+    delete resp;
+
+    return st;
+  }
+
+  //------------------------------------------------------------------------
+  // List extended attributes - async
+  //------------------------------------------------------------------------
+  XRootDStatus FileSystem::ListXAttr( const std::string         &path,
+                                      ResponseHandler           *handler,
+                                      uint16_t                   timeout )
+  {
+    if( pPlugIn )
+      return XRootDStatus( stError, errNotSupported );
+
+    static const std::vector<std::string> nothing;
+    return XAttrOperationImpl( kXR_fattrList,  ClientFattrRequest::aData,
+                               path, nothing, handler, timeout );
+  }
+
+  //------------------------------------------------------------------------
+  // List extended attributes - sync
+  //------------------------------------------------------------------------
+  XRootDStatus FileSystem::ListXAttr( const std::string    &path,
+                                      std::vector<XAttr>   &result,
+                                      uint16_t              timeout )
+  {
+    SyncResponseHandler handler;
+    XRootDStatus st = ListXAttr( path, &handler, timeout );
+    if( !st.IsOK() )
+      return st;
+
+    std::vector<XAttr> *resp = 0;
+    st = MessageUtils::WaitForResponse( &handler, resp );
+    if( resp ) result.swap( *resp );
+    delete resp;
+
+    return st;
+  }
+
   //----------------------------------------------------------------------------
   // Set file property
   //----------------------------------------------------------------------------
@@ -1770,8 +2180,8 @@ namespace XrdCl
 
     if( name == "FollowRedirects" )
     {
-      if( value == "true" ) pFollowRedirects = true;
-      else pFollowRedirects = false;
+      if( value == "true" ) pImpl->fsdata->pFollowRedirects = true;
+      else pImpl->fsdata->pFollowRedirects = false;
       return true;
     }
     return false;
@@ -1788,50 +2198,67 @@ namespace XrdCl
 
     if( name == "FollowRedirects" )
     {
-      if( pFollowRedirects ) value = "true";
+      if( pImpl->fsdata->pFollowRedirects ) value = "true";
       else value = "false";
       return true;
     }
+    else if( name == "LastURL" )
+    {
+      if( pImpl->fsdata->pLastUrl )
+      {
+        value = pImpl->fsdata->pLastUrl->GetURL();
+        return true;
+      }
+      else return false;
+    }
+
     return false;
   }
 
-  //----------------------------------------------------------------------------
-  // Assign a load balancer if it has not already been assigned
-  //----------------------------------------------------------------------------
-  void FileSystem::AssignLoadBalancer( const URL &url )
+  //------------------------------------------------------------------------
+  // Generic implementation of xattr operation
+  //------------------------------------------------------------------------
+  template<typename T>
+  Status FileSystem::XAttrOperationImpl( kXR_char               subcode,
+                                         kXR_char               options,
+                                         const std::string     &path,
+                                         const std::vector<T>  &attrs,
+                                         ResponseHandler       *handler,
+                                         uint16_t               timeout )
   {
-    Log *log = DefaultEnv::GetLog();
-    XrdSysMutexHelper scopedLock( pMutex );
+    Message            *msg;
+    ClientFattrRequest *req;
+    MessageUtils::CreateRequest( msg, req );
 
-    if( pLoadBalancerLookupDone )
-      return;
+    req->requestid = kXR_fattr;
+    req->subcode   = subcode;
+    req->options   = options;
+    req->numattr   = attrs.size();
+    memset( req->fhandle, 0, 4 );
+    XRootDStatus st = MessageUtils::CreateXAttrBody( msg, attrs, path );
+    if( !st.IsOK() ) return st;
 
-    log->Dump( FileSystemMsg, "[0x%x@%s] Assigning %s as load balancer", this,
-               pUrl->GetHostId().c_str(), url.GetHostId().c_str() );
+    MessageSendParams params; params.timeout = timeout;
+    MessageUtils::ProcessSendParams( params );
 
-    delete pUrl;
-    pUrl = new URL( url );
-    pLoadBalancerLookupDone = true;
+    XRootDTransport::SetDescription( msg );
+
+    return FileSystemData::Send( pImpl->fsdata, msg, handler, params );
   }
 
-  //----------------------------------------------------------------------------
-  // Send a message in a locked environment
-  //----------------------------------------------------------------------------
-  Status FileSystem::Send( Message                  *msg,
-                           ResponseHandler          *handler,
-                           MessageSendParams        &params )
+  //------------------------------------------------------------------------
+  // Lock the internal lock
+  //------------------------------------------------------------------------
+  void FileSystem::Lock()
   {
-    Log *log = DefaultEnv::GetLog();
-    XrdSysMutexHelper scopedLock( pMutex );
+    pImpl->fsdata->pMutex.Lock();
+  }
 
-    log->Dump( FileSystemMsg, "[0x%x@%s] Sending %s", this,
-               pUrl->GetHostId().c_str(), msg->GetDescription().c_str() );
-
-    if( !pLoadBalancerLookupDone && pFollowRedirects )
-      handler = new AssignLBHandler( this, handler );
-
-    params.followRedirects = pFollowRedirects;
-
-    return MessageUtils::SendMessage( *pUrl, msg, handler, params, 0 );
+  //------------------------------------------------------------------------
+  // Unlock the internal lock
+  //------------------------------------------------------------------------
+  void FileSystem::UnLock()
+  {
+    pImpl->fsdata->pMutex.UnLock();
   }
 }

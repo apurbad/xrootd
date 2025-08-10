@@ -72,15 +72,15 @@
 //                                                                        //
 //  Author: G.Ganis, 2005                                                 //
 // ---------------------------------------------------------------------- //
-#include <stdio.h>
-#include <string.h>
-#include <stdlib.h>
+#include <cstdio>
+#include <cstring>
+#include <cstdlib>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <sys/types.h>
 #include <fcntl.h>
-#include <errno.h>
+#include <cerrno>
 #include <pwd.h>
 #include <dirent.h>
 
@@ -212,7 +212,7 @@ bool GetEntry(XrdSutPFile *ff, XrdOucString tag,
 bool AskConfirm(const char *msg1, bool defact, const char *msg2 = 0);
 int LocateFactoryIndex(char *tag, int &id);
 
-#define PRT(x) {cerr <<x <<endl;}
+#define PRT(x) {std::cerr <<x <<std::endl;}
 // Max number of attemps entreing a password
 #define kMAXPWDATT 3
 

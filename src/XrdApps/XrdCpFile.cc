@@ -28,9 +28,9 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <errno.h>
+#include <cerrno>
 #include <fcntl.h>
-#include <string.h>
+#include <cstring>
 #include <strings.h>
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -51,10 +51,13 @@ const char *XrdCpFile::mPfx = 0;
 XrdCpFile::XrdCpFile(const char *FSpec, int &badURL)
 {
    static struct proto {const char *pHdr; int pHsz; PType pVal;}
-                 pTab[] = {{"xroot://", 8, isXroot},
-                           { "root://", 7, isXroot},
-                           { "http://", 7, isHttp},
-                           {"https://", 8, isHttps}
+                 pTab[] = {{"xroot://",  8, isXroot},
+                           {"xroots://", 9, isXroots},
+                           {"root://",   7, isXroot},
+                           {"roots://",  8, isXroots},
+                           {"http://",   7, isHttp},
+                           {"pelican://",  10, isPelican},
+                           {"https://",  8, isHttps}
                           };
    static int pTnum = sizeof(pTab)/sizeof(struct proto);
    const char *Slash;
@@ -83,7 +86,7 @@ XrdCpFile::XrdCpFile(const char *FSpec, int &badURL)
        return;
       }
 
-// Dtermine protocol of the incomming spec
+// Dtermine protocol of the incoming spec
 //
    for (i = 0; i < pTnum; i++)
        {if (!strncmp(FSpec, pTab[i].pHdr, pTab[i].pHsz))
@@ -159,7 +162,10 @@ int XrdCpFile::Resolve()
 
 // This should exist but it might not, the caller will determine what to do
 //
+   char *cgibeg = strchr( Path, '?' );
+   if( cgibeg ) *cgibeg = '\0';
    if (stat(Path, &Stat)) return errno;
+   if( cgibeg ) *cgibeg = '?';
 
 // Find out what this really is
 //

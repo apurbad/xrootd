@@ -31,18 +31,23 @@
 
 // Include stdlib so that ENDIAN macros are defined properly
 //
-#include <stdlib.h>
+#include <cstdint>
+#include <cstdlib>
+
 #ifdef __linux__
 #include <memory.h>
-#include <string.h>
+#include <cstring>
 #include <sys/types.h>
-#include <asm/param.h>
+#include <sys/param.h>
 #include <byteswap.h>
 #define MAXNAMELEN NAME_MAX
 #endif
+
 #ifdef __APPLE__
 #include <AvailabilityMacros.h>
 #include <sys/types.h>
+#include <sys/param.h>
+#include <libkern/OSByteOrder.h>
 #define fdatasync(x) fsync(x)
 #define MAXNAMELEN NAME_MAX
 #ifndef dirent64
@@ -58,23 +63,48 @@
 #endif
 #endif
 #endif
-#ifdef __FreeBSD__
+
+#if defined(__FreeBSD__) || (defined(__FreeBSD_kernel__) && defined(__GLIBC__))
 #include <sys/types.h>
+#include <sys/param.h>
+#if defined(__FreeBSD__)
+#include <sys/endian.h>
+#else
+#include <byteswap.h>
+#endif
+#define MAXNAMELEN NAME_MAX
 #endif
 
-#ifdef __solaris__
+#ifdef __GNU__
+#include <sys/types.h>
+#include <sys/param.h>
+#include <byteswap.h>
+// These are undefined on purpose in GNU/Hurd.
+// The values below are the ones used in Linux.
+// The proper fix is to rewrite the code to not use hardcoded values,
+// but instead allocate memory dynamically at runtime when sizes are known.
+// This is true also for systems where these constants are defined.
+#define MAXNAMELEN 255
+#define MAXPATHLEN 4096
+#define MAXHOSTNAMELEN 64
+#endif
+
+#ifdef WIN32
+#define MAXNAMELEN 256
+#define MAXPATHLEN 1024
+#endif
+
+// The following provides historical support for Solaris 5.10.x
+//
+#if defined(__solaris__) && defined(__SunOS_5_10)
 #define posix_memalign(memp, algn, sz) \
         ((*memp = memalign(algn, sz)) ? 0 : ENOMEM)
 #define __USE_LEGACY_PROTOTYPES__ 1
 #endif
 
-#if defined(__linux__) || defined(__APPLE__) || defined(__FreeBSD__)
+#if defined(__linux__) || defined(__APPLE__) || defined(__FreeBSD__) || defined(__GNU__) || (defined(__FreeBSD_kernel__) && defined(__GLIBC__))
 
 #define S_IAMB      0x1FF   /* access mode bits */
-
-#if !defined(__FreeBSD__)
-#define F_DUP2FD F_DUPFD
-#endif
 
 #define STATFS      statfs
 #define STATFS_BUFF struct statfs
@@ -110,7 +140,6 @@ typedef off_t offset_t;
 // For alternative platforms
 //
 #ifdef __APPLE__
-#include <AvailabilityMacros.h>
 #ifndef POLLRDNORM
 #define POLLRDNORM  0
 #endif
@@ -121,9 +150,6 @@ typedef off_t offset_t;
 #define POLLWRNORM  0
 #endif
 #define O_LARGEFILE 0
-#define memalign(pgsz,amt) valloc(amt)
-#define posix_memalign(memp, algn, sz) \
-        ((*memp = memalign(algn, sz)) ? 0 : ENOMEM)
 #define SHMDT_t void *
 #ifndef EDEADLOCK
 #define EDEADLOCK EDEADLK
@@ -133,8 +159,23 @@ typedef off_t offset_t;
 #ifdef __FreeBSD__
 #define	O_LARGEFILE 0
 typedef off_t off64_t;
-#define	memalign(pgsz,amt) valloc(amt)
 #endif
+
+#if defined(__APPLE__)
+#define bswap_16 OSSwapInt16
+#define bswap_32 OSSwapInt32
+#define bswap_64 OSSwapInt64
+#endif
+
+#if defined(__FreeBSD__)
+#define bswap_16 bswap16
+#define bswap_32 bswap32
+#define bswap_64 bswap64
+#endif
+
+static inline uint16_t bswap(uint16_t x) { return bswap_16(x); }
+static inline uint32_t bswap(uint32_t x) { return bswap_32(x); }
+static inline uint64_t bswap(uint64_t x) { return bswap_64(x); }
 
 // Only sparc platforms have structure alignment problems w/ optimization
 // so the h2xxx() variants are used when converting network streams.
@@ -218,21 +259,14 @@ extern "C"
 #      endif
 #   endif
 #endif
-#if defined(__MACH__) && defined(__i386__)
-#   define R__GLIBC
+#if defined(__GNU__)
+#   define XR__GLIBC
 #endif
 #if defined(_AIX) || \
    (defined(XR__SUNGCC3) && !defined(__arch64__))
 #   define SOCKLEN_t size_t
-#elif defined(XR__GLIBC) || \
-   defined(__FreeBSD__) || \
-   (defined(XR__SUNGCC3) && defined(__arch64__)) || defined(__APPLE__) || \
-   (defined(__sun) && defined(_SOCKLEN_T))
-#   ifndef SOCKLEN_t
-#      define SOCKLEN_t socklen_t
-#   endif
 #elif !defined(SOCKLEN_t)
-#   define SOCKLEN_t int
+#   define SOCKLEN_t socklen_t
 #endif
 
 #ifdef _LP64
@@ -247,6 +281,7 @@ extern "C"
 #define Sokdata_t char *
 #define IOV_INIT(data,dlen) dlen,data
 #define MAKEDIR(path,mode) mkdir(path)
+#define CHMOD(path, mode) {}
 #define net_errno WSAGetLastError()
 #else
 #define O_BINARY 0
@@ -254,18 +289,10 @@ extern "C"
 #define Sokdata_t void *
 #define IOV_INIT(data,dlen) data,dlen
 #define MAKEDIR(path,mode) mkdir(path,mode)
+#define CHMOD(path, mode) chmod(path,mode)
 #define net_errno errno
 #endif
 
-#ifdef WIN32
-#define MAXNAMELEN 256
-#define MAXPATHLEN 1024
-#else
-#include <sys/param.h>
-#if defined(__FreeBSD__)
-#define MAXNAMELEN 256
-#endif
-#endif
 // The following gets arround a relative new gcc compiler bug
 //
 #define XRDABS(x) (x < 0 ? -x : x)
@@ -273,5 +300,12 @@ extern "C"
 #ifndef LT_MODULE_EXT
 #define LT_MODULE_EXT ".so"
 #endif
+
+namespace XrdSys {
+  //--------------------------------------------------------------------------
+  //! @return : maximum size of I/O vector
+  //--------------------------------------------------------------------------
+  int getIovMax();
+}
 
 #endif  // __XRDSYS_PLATFORM_H__

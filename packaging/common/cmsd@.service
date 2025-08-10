@@ -6,12 +6,20 @@ Requires=network-online.target
 After=network-online.target
 
 [Service]
-ExecStart=/usr/bin/cmsd -l /var/log/xrootd/cmsd.log -c /etc/xrootd/xrootd-%i.cfg -k fifo -s /var/run/xrootd/cmsd-%i.pid -n %i
+PrivateDevices=true
+ProtectHostname=true
+ProtectClock=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictRealtime=true
+ExecStart=/usr/bin/cmsd -l /var/log/xrootd/cmsd.log -c /etc/xrootd/xrootd-%i.cfg -k fifo -s /run/xrootd/cmsd-%i.pid -n %i
 User=xrootd
 Group=xrootd
 Type=simple
 Restart=on-abort
-RestartSec=0
+RestartSec=10
 KillMode=control-group
 LimitNOFILE=65536
 WorkingDirectory=/var/spool/xrootd

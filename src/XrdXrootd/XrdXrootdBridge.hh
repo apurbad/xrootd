@@ -30,7 +30,7 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <string.h>
+#include <cstring>
 
 #include "XProtocol/XPtypes.hh"
 
@@ -39,8 +39,8 @@
 //!
 //! The Bridge object allows other protocols to gain access to the xrootd
 //! protocol stack. Almost any kind of request/response protocol can use this
-//! class to convert its request to an xrootd protocol request and rewrite the
-//! xrootd protocol response to adhere to its protocol specification. Callers
+//! class to convert its request to an xroot protocol request and rewrite the
+//! xroot protocol response to adhere to its protocol specification. Callers
 //! of these methods must be thread-safe and must not rely on thread-local
 //! storage as bridge requests and responses may or may not be executed using
 //! the initiating thread. Also, see the Result object class below.
@@ -84,15 +84,15 @@ class Result;
 //!                 created for each session or, if the protocol allows, be
 //!                 shared by all sessions. It cannot be deleted until all
 //!                 references to the object disappear (see the Result class).
-//!         linkP   a pointer to the link object that the protocol driver
+//! @param  linkP   a pointer to the link object that the protocol driver
 //!                 created to the client connection.
-//!         secP    a pointer to the XrdSecEntity object that describes the
+//! @param  seceP   a pointer to the XrdSecEntity object that describes the
 //!                 client's identity.
-//!         nameP   An arbitrary 1-to-8 character client name. The Bridge will
+//! @param  nameP   An arbitrary 1-to-8 character client name. The Bridge will
 //!                 uniquefy this name so that log file messages will track the
 //!                 the associated client. The link's identity is set to
 //!                 correspond to this name with additional information.
-//!         protP   a 1-to-7 character name of the protocol using this bridge
+//! @param  protP   a 1-to-7 character name of the protocol using this bridge
 //!                 (e.g. "http").
 //!
 //! @return bridgeP a pointer to a new instance of this class if a bridge
@@ -113,7 +113,7 @@ Bridge       *Login(Result       *rsltP, //!< The result callback object
 //!
 //! The Run() method allows you to inject an xrootd-style request into the
 //! stack. It must use the same format as a real xrootd client would use across
-//! the network. The xrootd protocol reference describes these requests. The
+//! the network. The xroot protocol reference describes these requests. The
 //! Run() method handles the request as if it came through the network with
 //! some notable exceptions (see the xdataP and xdataL arguments).
 //!
@@ -179,7 +179,7 @@ virtual bool  Disc() = 0;
 //! must see the data prior to sending to the client (e.g. for encryption).
 //!
 //! @param  fhandle the filehandle as returned by kXR_open.
-//! @param  mode    When true, enables sendfile() otherwise it is disabled.
+//! @param  seton   When true, enables sendfile() otherwise it is disabled.
 //!
 //! @return =0      Sucessful.
 //! @return <0      Call failed. The return code is -errno and usually will
@@ -207,7 +207,7 @@ virtual int   setSF(kXR_char *fhandle, bool seton=false) = 0;
 //!
 //-----------------------------------------------------------------------------
 
-virtual void  SetWait(int wime, bool notify=false) = 0;
+virtual void  SetWait(int wtime, bool notify=false) = 0;
 
 /******************************************************************************/
 /*            X r d X r o o t d : : B r i d g e : : C o n t e x t             */
@@ -282,10 +282,10 @@ virtual      ~Context() {}
 /******************************************************************************/
 
 //-----------------------------------------------------------------------------
-//! Handle xrootd protocol execution results.
+//! Handle xroot protocol execution results.
 //!
 //! The Result object is an abstract class that defines the interface used
-//! by the xrootd protocol stack to effect a client response using whatever
+//! by the xroot protocol stack to effect a client response using whatever
 //! alternate protocol is needed. You must define an implementation and pass it
 //! as an argument to the Login() Bridge method.
 //-----------------------------------------------------------------------------

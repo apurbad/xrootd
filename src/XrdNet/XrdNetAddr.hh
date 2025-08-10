@@ -43,6 +43,15 @@ class XrdNetAddr : public XrdNetAddrInfo
 public:
 
 //------------------------------------------------------------------------------
+//! Determine if dynamic DNS has been set.
+//!
+//! @return True     Dynamic DNS has     been set.
+//!         False    Dynamic DNS has not been set.
+//------------------------------------------------------------------------------
+
+static bool DynDNS() {return dynDNS;}
+
+//------------------------------------------------------------------------------
 //! Determine if IPV4 mode has been set.
 //!
 //! @return True     IPV4 mode has     been set.
@@ -62,6 +71,19 @@ static bool IPV4Set() {return useIPV4;}
 //------------------------------------------------------------------------------
 
 int         Port(int pNum=-1);
+
+//------------------------------------------------------------------------------
+//! Register a host name with this IP address. This is not MT-safe!
+//!
+//! @param  hName    -> to a true host name which should be fully qualified.
+//!                     One of the IP addresses registered to this name must
+//!                     match the IP address associated with this object.
+//!
+//! @return True:    Specified name is now associated with this address.
+//!         False:   Nothing changed, registration could not be verified.
+//------------------------------------------------------------------------------
+
+bool        Register(const char *hName);
 
 //------------------------------------------------------------------------------
 //! Set the IP address and possibly the port number.
@@ -175,6 +197,23 @@ const char *Set(struct addrinfo *rP, int port, bool mapit=false);
 static void SetCache(int keeptime);
 
 //------------------------------------------------------------------------------
+//! Set the dialect being spoken on this network link.
+//!
+//! @param dP Pointer to the dialect name. It must be permanently stable.
+//------------------------------------------------------------------------------
+
+       void SetDialect(const char *dP) {protName = dP;}
+
+//------------------------------------------------------------------------------
+//! Indicate whether or not dynamic DNS is being used. This method should only
+//! be called during initialization time. The default is fixed DNS.
+//!
+//! @param  onoff True if dynamic DNS is being used, false otherwise.
+//------------------------------------------------------------------------------
+
+static void SetDynDNS(bool onoff);
+
+//------------------------------------------------------------------------------
 //! Force this object to work in IPV4 mode only. This method permanently sets
 //! IPV4 mode which cannot be undone without a restart. It is meant to bypass
 //! broken IPV6 stacks on those unfortunate hosts that have one. It should be
@@ -200,7 +239,15 @@ static void SetIPV6();
 //!              XrdnetAddrInfo for the definition of the stucture.
 //------------------------------------------------------------------------------
 
-void        SetLocation(XrdNetAddrInfo::LocInfo &loc) {addrLoc = loc;}
+void        SetLocation(XrdNetAddrInfo::LocInfo &loc);
+
+//------------------------------------------------------------------------------
+//! Set the location's TLS state.
+//!
+//! @param  val  True if TLS is being used, false otherwise.
+//------------------------------------------------------------------------------
+
+void        SetTLS(bool val);
 
 //------------------------------------------------------------------------------
 //! Assignment operator and copy constructor are inherited, no need to define
@@ -243,5 +290,6 @@ static struct addrinfo    *hostHints;
 static struct addrinfo    *huntHintsTCP;
 static struct addrinfo    *huntHintsUDP;
 static bool                useIPV4;
+static bool                dynDNS;
 };
 #endif

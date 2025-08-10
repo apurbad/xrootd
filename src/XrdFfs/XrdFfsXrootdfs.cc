@@ -29,8 +29,8 @@
 
 #define FUSE_USE_VERSION 26
 
-#include <stdio.h>
-#include <stdlib.h>
+#include <cstdio>
+#include <cstdlib>
 #include <unistd.h>
 #include <stddef.h>
 
@@ -41,24 +41,23 @@
 #endif
 #endif
 
-#ifdef HAVE_FUSE
 #include <fuse.h>
 #include <fuse/fuse_opt.h>
-#include <ctype.h>
-#include <string.h>
+#include <cctype>
+#include <cstring>
 #include <fcntl.h>
 #include <dirent.h>
-#include <errno.h>
+#include <cerrno>
 #include <sys/time.h>
 #include <pthread.h>
 #include <pwd.h>
 #include <libgen.h>
 #include <syslog.h>
 #include <signal.h>
+#if defined(__linux__)
 #include <sys/prctl.h>
-#if !defined(__solaris__)
-#include <sys/xattr.h>
 #endif
+#include <sys/xattr.h>
 
 #include "XrdFfs/XrdFfsPosix.hh"
 #include "XrdFfs/XrdFfsMisc.hh"
@@ -88,6 +87,8 @@ struct XROOTDFS xrootdfs;
 static struct fuse_opt xrootdfs_opts[14];
 
 enum { OPT_KEY_HELP, OPT_KEY_SECSSS, };
+
+bool usingEC = false;
 
 static void* xrootdfs_init(struct fuse_conn_info *conn)
 {
@@ -120,7 +121,9 @@ static void* xrootdfs_init(struct fuse_conn_info *conn)
             syslog( LOG_ERR, "ERROR: Unable to set gid to %d", pw.pw_gid );
         if( setuid((uid_t)pw.pw_uid) != 0 )
             syslog( LOG_ERR, "ERROR: Unable to set uid to %d", pw.pw_uid );
+#if defined(__linux__)
         prctl(PR_SET_DUMPABLE, 1); // enable core dump after setuid/setgid
+#endif
     }
     free(pwbuf);
 
@@ -128,6 +131,17 @@ static void* xrootdfs_init(struct fuse_conn_info *conn)
     XrdPosixXrootd *abc = new XrdPosixXrootd(-xrootdfs.maxfd);
     XrdFfsMisc_xrd_init(xrootdfs.rdr,xrootdfs.urlcachelife,0);
     XrdFfsWcache_init(abc->fdOrigin(), xrootdfs.maxfd);
+
+    char *next, *savptr;
+    next = strtok_r(strdup(xrootdfs.rdr), "//", &savptr);
+    next = strtok_r(NULL, "//", &savptr);
+    char exportpath[1024];
+    while ((next = strtok_r(NULL, "//", &savptr)) != NULL)
+    {
+        strcat(exportpath, "/");
+        strcat(exportpath, next);
+    }
+    setenv("XRDEXPORTS", exportpath, 1);
 /*
    From FAQ:
       Miscellaneous threads should be started from the init() method.
@@ -416,6 +430,7 @@ static int xrootdfs_mknod(const char *path, mode_t mode, dev_t rdev)
         res = XrdFfsPosix_open(rootpath, O_CREAT | O_EXCL | O_WRONLY, S_IRUSR|S_IWUSR|S_IRGRP|S_IROTH); 
 */
     res = xrootdfs_do_create(path, xrootdfs.rdr, O_CREAT | O_WRONLY, false, &fd);
+    if (res < 0) return res;
     XrdFfsPosix_close(fd);
     if (xrootdfs.cns != NULL)
     {
@@ -439,9 +454,13 @@ static int xrootdfs_create(const char *path, mode_t mode, struct fuse_file_info 
     int res, fd;
     if (!S_ISREG(mode))
         return -EPERM;
-    res = xrootdfs_do_create(path, xrootdfs.rdr, O_CREAT | O_WRONLY, true, &fd);
+    if (usingEC)
+        res = xrootdfs_do_create(path, xrootdfs.rdr, O_CREAT | O_WRONLY | O_EXCL, true, &fd);
+    else
+        res = xrootdfs_do_create(path, xrootdfs.rdr, O_CREAT | O_WRONLY, true, &fd);
+    if (res < 0) return res;
     fi->fh = fd;
-    XrdFfsWcache_create(fd);    // Unlike mknod and like open, prepare wcache.
+    XrdFfsWcache_create(fd, fi->flags);    // Unlike mknod and like open, prepare wcache.
     if (xrootdfs.cns != NULL)
     {
         xrootdfs_do_create(path, xrootdfs.cns, O_CREAT | O_EXCL, false, &fd);
@@ -781,7 +800,7 @@ static int xrootdfs_open(const char *path, struct fuse_file_info *fi)
 
     fi->fh = fd;
     // be careful, 0 means error for this function
-    if (XrdFfsWcache_create(fi->fh))
+    if (XrdFfsWcache_create(fi->fh, fi->flags))
         return 0;
     else
         return -errno;
@@ -794,10 +813,31 @@ static int xrootdfs_read(const char *path, char *buf, size_t size, off_t offset,
     int res;
 
     fd = (int) fi->fh;
-    XrdFfsWcache_flush(fd);  /* in case is the file is reading/writing */
-    res = XrdFfsPosix_pread(fd, buf, size, offset);
+    if ((fi->flags & O_ACCMODE) == O_RDWR) XrdFfsWcache_flush(fd);
+
+    if (usingEC)
+    {
+        struct stat stbuf;
+        XrdPosixXrootd::Fstat(fd, &stbuf);  // Silly but does not seem to hurt performance
+        off_t fsize = stbuf.st_size;
+
+        //!!! TO DO: Remove offset test once XrdClEC read regression is fixed 
+        if ( offset >= fsize )
+            return 0;
+
+        size = (size_t)(fsize - offset) > size ? size : fsize - offset; 
+        // Restrict the use of read cache to O_DIRECT use case 
+        // See comment in XRdFfsWcache_pread()
+        if ( ((fi->flags & O_ACCMODE) != O_RDWR) && (fi->flags & O_DIRECT) )
+            res = XrdFfsWcache_pread(fd, buf, size, offset);
+        else
+            res = XrdFfsPosix_pread(fd, buf, size, offset);
+    }
+    else
+        res = XrdFfsPosix_pread(fd, buf, size, offset);
+
     if (res == -1)
-        res = -errno;
+    res = -errno;
 
     return res;
 }
@@ -908,7 +948,7 @@ static int xrootdfs_release(const char *path, struct fuse_file_info *fi)
 
     return 0;
 */
-    if (xrootdfs.cns == NULL || (fi->flags & 0100001) == (0100000 | O_RDONLY))
+    if (xrootdfs.cns == NULL)
         return 0;
 
     int res;
@@ -1182,7 +1222,7 @@ static int xrootdfs_removexattr(const char *path, const char *name)
 
 /*
  * We need this as casting function pointer to a function pointer
- * of a diffrent type and then calling it results in undefined
+ * of a different type and then calling it results in undefined
  * behavior (Annex J.2).
  *
  * GCC 8 available on Fedora 28 is very picky about those things.
@@ -1229,6 +1269,7 @@ static void xrootdfs_usage(const char *progname)
 "\n"
 "Default options:\n"
 "    fsname=xrootdfs,allow_other,max_write=131072,attr_timeout=10,entry_timeout=10,negative_timeout=5\n"
+"  In case of an Erasure Encoding storage, entry_timeout=0\n"
 "\n"
 "[Required]\n"
 "    -o rdr=redirector_url    root URL of the Xrootd redirector\n"
@@ -1304,13 +1345,25 @@ int main(int argc, char *argv[])
 /* Define XrootdFS options */
     char **cmdline_opts;
 
+    if (getenv("XRDCL_EC")) usingEC = true;
+
     cmdline_opts = (char **) malloc(sizeof(char*) * (argc -1 + 3));
     cmdline_opts[0] = argv[0];
     cmdline_opts[1] = strdup("-o");
     if (getenv("XROOTDFS_NO_ALLOW_OTHER") != NULL && ! strcmp(getenv("XROOTDFS_NO_ALLOW_OTHER"),"1") )
-        cmdline_opts[2] = strdup("fsname=xrootdfs,max_write=131072,attr_timeout=10,entry_timeout=10,negative_timeout=5");
+     {
+        if (! usingEC)
+            cmdline_opts[2] = strdup("fsname=xrootdfs,max_write=131072,attr_timeout=10,entry_timeout=10,negative_timeout=5");
+        else
+            cmdline_opts[2] = strdup("fsname=xrootdfs,max_write=131072,attr_timeout=10,entry_timeout=0,negative_timeout=5");
+    }
     else
-        cmdline_opts[2] = strdup("fsname=xrootdfs,allow_other,max_write=131072,attr_timeout=10,entry_timeout=10,negative_timeout=5");
+    {
+        if (! usingEC)
+            cmdline_opts[2] = strdup("fsname=xrootdfs,allow_other,max_write=131072,attr_timeout=10,entry_timeout=10,negative_timeout=5");
+        else
+            cmdline_opts[2] = strdup("fsname=xrootdfs,allow_other,max_write=131072,attr_timeout=10,entry_timeout=0,negative_timeout=5");
+    }
 
     for (int i = 1; i < argc; i++)
         cmdline_opts[i+2] = argv[i];
@@ -1441,11 +1494,3 @@ int main(int argc, char *argv[])
 
     return fuse_main(args.argc, args.argv, &xrootdfs_oper, NULL);
 }
-#else
-
-int main(int argc, char *argv[])
-{
-    printf("This platform does not have FUSE; xrootdfs cannot be started!");
-    exit(13);
-}
-#endif

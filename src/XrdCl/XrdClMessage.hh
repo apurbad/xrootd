@@ -20,6 +20,8 @@
 #define __XRD_CL_MESSAGE_HH__
 
 #include "XrdCl/XrdClBuffer.hh"
+#include "XrdOuc/XrdOucUtils.hh"
+#include "XrdOuc/XrdOucPrivateUtils.hh"
 
 namespace XrdCl
 {
@@ -33,10 +35,31 @@ namespace XrdCl
       //! Constructor
       //------------------------------------------------------------------------
       Message( uint32_t size = 0 ):
-        Buffer( size ), pIsMarshalled( false ), pSessionId(0)
+        Buffer( size ), pIsMarshalled( false ), pSessionId(0), pVirtReqID( 0 )
       {
         if( size )
           Zero();
+      }
+
+      //------------------------------------------------------------------------
+      //! Move Constructor
+      //------------------------------------------------------------------------
+      Message( Message && msg ):
+        Buffer( std::move( msg ) ), pIsMarshalled( msg.pIsMarshalled ),
+        pSessionId( std::move( msg.pSessionId ) ), pVirtReqID( msg.pVirtReqID )
+      {
+      }
+
+      //------------------------------------------------------------------------
+      //! Move assignment operator
+      //------------------------------------------------------------------------
+      Message& operator=( Message && msg )
+      {
+        Steal( std::move( msg ) );
+        pIsMarshalled = msg.pIsMarshalled;
+        pSessionId = std::move( msg.pSessionId );
+        pVirtReqID = msg.pVirtReqID;
+        return *this;
       }
 
       //------------------------------------------------------------------------
@@ -66,6 +89,7 @@ namespace XrdCl
       void SetDescription( const std::string &description )
       {
         pDescription = description;
+        pObfuscatedDescription = obfuscateAuth(description);
       }
 
       //------------------------------------------------------------------------
@@ -74,6 +98,14 @@ namespace XrdCl
       const std::string &GetDescription() const
       {
         return pDescription;
+      }
+
+      //------------------------------------------------------------------------
+      //! Get the description of the message with authz parameter obfuscated
+      //------------------------------------------------------------------------
+      const std::string & GetObfuscatedDescription() const
+      {
+        return pObfuscatedDescription;
       }
 
       //------------------------------------------------------------------------
@@ -92,10 +124,28 @@ namespace XrdCl
         return pSessionId;
       }
 
+      //------------------------------------------------------------------------
+      //! Set virtual request ID for the message
+      //------------------------------------------------------------------------
+      void SetVirtReqID( uint16_t virtReqID )
+      {
+        pVirtReqID = virtReqID;
+      }
+
+      //------------------------------------------------------------------------
+      //! Get virtual request ID for the message
+      //------------------------------------------------------------------------
+      uint16_t GetVirtReqID() const
+      {
+        return pVirtReqID;
+      }
+
     private:
       bool         pIsMarshalled;
       uint64_t     pSessionId;
       std::string  pDescription;
+      uint16_t     pVirtReqID;
+      std::string  pObfuscatedDescription;
   };
 }
 

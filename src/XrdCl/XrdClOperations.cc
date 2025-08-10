@@ -30,21 +30,60 @@
 #include "XrdCl/XrdClDefaultEnv.hh"
 #include "XrdCl/XrdClConstants.hh"
 
+namespace
+{
+  //----------------------------------------------------------------------------
+  //! An exception type used to (force) stop a pipeline
+  //----------------------------------------------------------------------------
+  struct StopPipeline
+  {
+    StopPipeline( const XrdCl::XRootDStatus &status ) : status( status ) { }
+    XrdCl::XRootDStatus status;
+  };
+
+  //----------------------------------------------------------------------------
+  //! An exception type used to repeat an operation
+  //----------------------------------------------------------------------------
+  struct RepeatOpeation { };
+
+  //----------------------------------------------------------------------------
+  //! An exception type used to replace an operation
+  //----------------------------------------------------------------------------
+  struct ReplaceOperation
+  {
+    ReplaceOperation( XrdCl::Operation<false> &&opr ) : opr( opr.ToHandled() )
+    {
+    }
+
+    std::unique_ptr<XrdCl::Operation<true>> opr;
+  };
+
+  //----------------------------------------------------------------------------
+  //! An exception type used to replace whole pipeline
+  //----------------------------------------------------------------------------
+  struct ReplacePipeline
+  {
+    ReplacePipeline( XrdCl::Pipeline p ) : pipeline( std::move( p ) )
+    {
+    }
+
+    XrdCl::Pipeline pipeline;
+  };
+
+  //----------------------------------------------------------------------------
+  //! An exception type used to ignore a failed operation
+  //----------------------------------------------------------------------------
+  struct IgnoreError { };
+}
+
 namespace XrdCl
 {
 
   //----------------------------------------------------------------------------
   // OperationHandler Constructor.
   //----------------------------------------------------------------------------
-  PipelineHandler::PipelineHandler( ResponseHandler *handler, bool own ) :
-      responseHandler( handler ), ownHandler( own )
-  {
-  }
-
-  //----------------------------------------------------------------------------
-  // Default Constructor.
-  //----------------------------------------------------------------------------
-  PipelineHandler::PipelineHandler() : responseHandler( nullptr ), ownHandler( false )
+  PipelineHandler::PipelineHandler( ResponseHandler  *handler ) :
+      responseHandler( handler )
   {
   }
 
@@ -71,12 +110,46 @@ namespace XrdCl
   {
     std::unique_ptr<PipelineHandler> myself( this );
 
-    // We need to copy status as original status object is destroyed in HandleResponse function
+    // We need to copy status as original status object is destroyed in
+    // HandleResponse function
     XRootDStatus st( *status );
     if( responseHandler )
     {
-      responseHandler->HandleResponseWithHosts( status, response, hostList );
-      ownHandler = false;
+      try
+      {
+        responseHandler->HandleResponseWithHosts( status, response, hostList );
+      }
+      catch( const StopPipeline &stop )
+      {
+        if( final ) final( stop.status );
+        prms.set_value( stop.status );
+        return;
+      }
+      catch( const RepeatOpeation &repeat )
+      {
+        Operation<true> *opr = currentOperation.release();
+        opr->handler.reset( myself.release() );
+        opr->Run( timeout, std::move( prms ), std::move( final ) );
+        return;
+      }
+      catch( ReplaceOperation &replace )
+      {
+        Operation<true> *opr = replace.opr.release();
+        opr->handler.reset( myself.release() );
+        opr->Run( timeout, std::move( prms ), std::move( final ) );
+        return;
+      }
+      catch( ReplacePipeline &replace )
+      {
+        Pipeline p = std::move( replace.pipeline );
+        Operation<true> *opr = p.operation.release();
+        opr->Run( timeout, std::move( prms ), std::move( final ) );
+        return;
+      }
+      catch( const IgnoreError &ignore )
+      {
+        st = XRootDStatus();
+      }
     }
     else
       dealloc( status, response, hostList );
@@ -88,7 +161,8 @@ namespace XrdCl
       return;
     }
 
-    nextOperation->Run( std::move( prms ), std::move( final ) );
+    Operation<true> *opr = nextOperation.release();
+    opr->Run( timeout, std::move( prms ), std::move( final ) );
   }
 
   //----------------------------------------------------------------------------
@@ -110,22 +184,97 @@ namespace XrdCl
   }
 
   //----------------------------------------------------------------------------
-  // OperationHandler Destructor
-  //----------------------------------------------------------------------------
-  PipelineHandler::~PipelineHandler()
-  {
-    if( ownHandler ) delete responseHandler;
-  }
-
-  //----------------------------------------------------------------------------
   // OperationHandler::AssignToWorkflow
   //----------------------------------------------------------------------------
-  void PipelineHandler::Assign( std::promise<XRootDStatus>                p,
-                                std::function<void(const XRootDStatus&)>  f )
+  void PipelineHandler::Assign( const Timeout                            &t,
+                                std::promise<XRootDStatus>                p,
+                                std::function<void(const XRootDStatus&)>  f,
+                                Operation<true>                          *opr )
   {
-    prms  = std::move( p );
+    timeout = t;
+    prms    = std::move( p );
+    if( !final ) final   = std::move( f );
+    else if( f )
+    {
+      auto f1 = std::move( final );
+      final = [f1, f]( const XRootDStatus &st ){ f1( st ); f( st ); };
+    }
+    currentOperation.reset( opr );
+  }
+
+  //------------------------------------------------------------------------
+  // Assign the finalization routine
+  //------------------------------------------------------------------------
+  void PipelineHandler::Assign( std::function<void(const XRootDStatus&)>  f )
+  {
     final = std::move( f );
   }
 
+  //------------------------------------------------------------------------
+  // Called by a pipeline on the handler of its first operation before Run
+  //------------------------------------------------------------------------
+  void PipelineHandler::PreparePipelineStart()
+  {
+    // Move any final-function from the handler of the last operaiton to the
+    // first. It will be moved along the pipeline of handlers while the
+    // pipeline is run.
+
+    if( final || !nextOperation ) return;
+    PipelineHandler *last = nextOperation->handler.get();
+    while( last )
+    {
+      Operation<true> *nextop = last->nextOperation.get();
+      if( !nextop ) break;
+      last = nextop->handler.get();
+    }
+    if( last )
+    {
+      // swap-then-move rather than only move as we need to guarantee that
+      // last->final is left without target.
+      std::function<void(const XRootDStatus&)> f;
+      f.swap( last->final );
+      Assign( std::move( f ) );
+    }
+  }
+
+  //------------------------------------------------------------------------
+  // Stop the current pipeline
+  //------------------------------------------------------------------------
+  void Pipeline::Stop( const XRootDStatus &status )
+  {
+    throw StopPipeline( status );
+  }
+
+  //------------------------------------------------------------------------
+  // Repeat current operation
+  //------------------------------------------------------------------------
+  void Pipeline::Repeat()
+  {
+    throw RepeatOpeation();
+  }
+
+  //------------------------------------------------------------------------
+  // Replace current operation
+  //------------------------------------------------------------------------
+  void Pipeline::Replace( Operation<false> &&opr )
+  {
+    throw ReplaceOperation( std::move( opr ) );
+  }
+
+  //------------------------------------------------------------------------
+  // Replace with pipeline
+  //------------------------------------------------------------------------
+  void Pipeline::Replace( Pipeline p )
+  {
+    throw ReplacePipeline( std::move( p ) );
+  }
+
+  //------------------------------------------------------------------------
+  // Ignore error and proceed with the pipeline
+  //------------------------------------------------------------------------
+  void Pipeline::Ignore()
+  {
+    throw IgnoreError();
+  }
 }
 

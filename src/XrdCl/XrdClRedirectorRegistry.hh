@@ -14,14 +14,14 @@
 #include "XrdSys/XrdSysPthread.hh"
 
 #include <string>
+#include <vector>
 #include <map>
 
 namespace XrdCl
 {
 
 class Message;
-class IncomingMsgHandler;
-class OutgoingMsgHandler;
+class MsgHandler;
 
 //--------------------------------------------------------------------------------
 //! A job class for redirect handling in the thread-pool
@@ -32,7 +32,7 @@ class RedirectJob: public Job
     //------------------------------------------------------------------------
     //! Constructor
     //------------------------------------------------------------------------
-    RedirectJob( IncomingMsgHandler *handler ) : pHandler( handler )
+    RedirectJob( MsgHandler *handler, std::shared_ptr<Message> msg ) : pHandler( handler ), msg( msg )
     {
     }
 
@@ -49,7 +49,8 @@ class RedirectJob: public Job
     virtual void Run( void *arg );
 
   private:
-    IncomingMsgHandler *pHandler;
+    MsgHandler *pHandler;
+    std::shared_ptr<Message> msg;
 };
 
 //--------------------------------------------------------------------------------
@@ -70,7 +71,7 @@ class VirtualRedirector
     //! in the thread-pool.
     //----------------------------------------------------------------------------
     virtual XRootDStatus HandleRequest( const Message *msg,
-                                        IncomingMsgHandler *handler ) = 0;
+                                        MsgHandler *handler ) = 0;
 
     //----------------------------------------------------------------------------
     //! Initializes the object with the content of the metalink file
@@ -89,6 +90,12 @@ class VirtualRedirector
     virtual std::string GetCheckSum( const std::string &type ) const = 0;
 
     //----------------------------------------------------------------------------
+    //! Returns the default checksum type (the first one given in the metalink),
+    //! if no checksum is available returns an empty string
+    //----------------------------------------------------------------------------
+    virtual std::vector<std::string> GetSupportedCheckSums() const = 0;
+
+    //----------------------------------------------------------------------------
     //! Returns the file size as specified in the metalink,
     //! or a negative number if size was not specified
     //----------------------------------------------------------------------------
@@ -102,7 +109,7 @@ class VirtualRedirector
     //----------------------------------------------------------------------------
     //! Count how many replicas do we have left to try for given request
     //----------------------------------------------------------------------------
-    virtual int Count( Message *req ) const = 0;
+    virtual int Count( Message &req ) const = 0;
 };
 
 //--------------------------------------------------------------------------------

@@ -28,9 +28,9 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
   
-#include <errno.h>
-#include <string.h>
-#include <stdio.h>
+#include <cerrno>
+#include <cstring>
+#include <cstdio>
 #include <unistd.h>
 #include <sys/param.h>
 #include <sys/types.h>
@@ -42,10 +42,12 @@
 #include "XrdCks/XrdCksConfig.hh"
 #include "XrdCks/XrdCksManager.hh"
 #include "XrdCks/XrdCksManOss.hh"
+#include "XrdCks/XrdCksWrapper.hh"
 #include "XrdOuc/XrdOucPinLoader.hh"
 #include "XrdOuc/XrdOucStream.hh"
 #include "XrdOuc/XrdOucUtils.hh"
 #include "XrdSys/XrdSysError.hh"
+#include "XrdSys/XrdSysPlatform.hh"
 #include "XrdSys/XrdSysPlugin.hh"
 
 /******************************************************************************/
@@ -55,7 +57,8 @@
 XrdCksConfig::XrdCksConfig(const char *cFN, XrdSysError *Eroute, int &aOK,
                            XrdVersionInfo &vInfo)
                           : eDest(Eroute), cfgFN(cFN), CksLib(0), CksParm(0),
-                            CksList(0), CksLast(0), myVersion(vInfo)
+                            CksList(0), CksLast(0), LibList(0), LibLast(0),
+                            myVersion(vInfo), CKSopts(0)
 {
    static XrdVERSIONINFODEF(myVer, XrdCks, XrdVNUMBER, XrdVERSION);
 
@@ -67,10 +70,51 @@ XrdCksConfig::XrdCksConfig(const char *cFN, XrdSysError *Eroute, int &aOK,
 }
 
 /******************************************************************************/
+/*                                a d d C k s                                 */
+/******************************************************************************/
+
+XrdCks *XrdCksConfig::addCks(XrdCks *pCks, XrdOucEnv *envP)
+{
+   XrdOucPinLoader *myLib;
+   XrdCks          *(*ep)(XRDCKSADD2PARMS);
+   const char      *theParm;
+   XrdOucTList     *tP = LibList;
+
+// Create a plugin object (we will throw this away without deletion because
+// the library must stay open but we never want to reference it again).
+//
+   while(tP)
+        {if (!(myLib = new XrdOucPinLoader(eDest,&myVersion,"ckslib",tP->text)))
+            return 0;
+
+         // Now get the entry point of the object creator
+         //
+         ep = (XrdCks *(*)(XRDCKSADD2PARMS))(myLib->Resolve("XrdCksAdd2"));
+         if (!ep) {myLib->Unload(true); return 0;}
+
+         // Get the Object now
+         //
+         delete myLib;
+         theParm = (tP->val ? (tP->text) + tP->val : 0);
+         pCks = ep(*pCks, eDest, cfgFN, theParm, envP);
+         if (!pCks) return 0;
+
+         // Move on to the next stacked plugin
+         //
+         tP = tP->next;
+        }
+
+// All done
+//
+   return pCks;
+}
+
+/******************************************************************************/
 /*                             C o n f i g u r e                              */
 /******************************************************************************/
   
-XrdCks *XrdCksConfig::Configure(const char *dfltCalc, int rdsz, XrdOss *ossP)
+XrdCks *XrdCksConfig::Configure(const char *dfltCalc, int rdsz,
+                                XrdOss *ossP, XrdOucEnv *envP)
 {
    XrdCks *myCks = getCks(ossP, rdsz);
    XrdOucTList *tP = CksList;
@@ -78,6 +122,11 @@ XrdCks *XrdCksConfig::Configure(const char *dfltCalc, int rdsz, XrdOss *ossP)
 
 // Check if we have a cks object
 //
+   if (!myCks) return 0;
+
+// Stack all pugins
+//
+   myCks = addCks(myCks, envP);
    if (!myCks) return 0;
 
 // Configure the object
@@ -95,7 +144,7 @@ XrdCks *XrdCksConfig::Configure(const char *dfltCalc, int rdsz, XrdOss *ossP)
 }
 
 /******************************************************************************/
-/*                                g e t C k s                                 */
+/* Private:                       g e t C k s                                 */
 /******************************************************************************/
 
 XrdCks *XrdCksConfig::getCks(XrdOss *ossP, int rdsz)
@@ -103,11 +152,14 @@ XrdCks *XrdCksConfig::getCks(XrdOss *ossP, int rdsz)
    XrdOucPinLoader *myLib;
    XrdCks          *(*ep)(XRDCKSINITPARMS);
 
-// Authorization comes from the library or we use the default
+// Cks manager comes from the library or we use the default
 //
    if (!CksLib)
-      {if (ossP) return (XrdCks *)new XrdCksManOss (ossP,eDest,rdsz,myVersion);
-          else   return (XrdCks *)new XrdCksManager(     eDest,rdsz,myVersion);
+      {XrdCksManager* manP;
+       if (ossP) manP = new XrdCksManOss (ossP,eDest,rdsz,myVersion);
+          else   manP = new XrdCksManager(     eDest,rdsz,myVersion);
+       manP->SetOpts(CKSopts);
+       return manP;
       }
 
 // Create a plugin object (we will throw this away without deletion because
@@ -126,7 +178,7 @@ XrdCks *XrdCksConfig::getCks(XrdOss *ossP, int rdsz)
    delete myLib;
    return ep(eDest, cfgFN, CksParm);
 }
-  
+
 /******************************************************************************/
 /*                               M a n a g e r                                */
 /******************************************************************************/
@@ -143,12 +195,13 @@ XrdCks *XrdCksConfig::getCks(XrdOss *ossP, int rdsz)
 
 int XrdCksConfig::Manager(const char *Path, const char *Parms)
 {
-// Replace the library path and parameters
+// Replace the library path and parameters. Note that for default plugins
+// we reset the path to null to indicate we want the default plugin.
 //
    if (CksLib) free(CksLib);
-   CksLib = strdup(Path);
+   CksLib = (Path  ? strdup(Path) : 0);
    if (CksParm) free(CksParm);
-   CksParm = (Parms  && *Parms ? strdup(Parms) : 0);
+   CksParm = (Parms && *Parms ? strdup(Parms) : 0);
    return 0;
 }
   
@@ -186,6 +239,12 @@ int XrdCksConfig::ParseLib(XrdOucStream &Config, int &libType)
       {eDest->Emsg("Config", "ckslib digest name too long -", val); return 1;}
    strcpy(buff, val); XrdOucUtils::toLower(buff); bP = buff+n; *bP++ = ' ';
 
+// Determine the library type
+//
+   if (!strcmp(val, "*")) libType = -1;
+      else if (!strcmp(val, "=")) libType = 1;
+              else libType = 0;
+
 // Get the path
 //
    if (!(val = Config.GetWord()) || !val[0])
@@ -195,6 +254,17 @@ int XrdCksConfig::ParseLib(XrdOucStream &Config, int &libType)
       {eDest->Emsg("Config", "ckslib path name too long -", val); return 1;}
    strcpy(bP, val); bP += n;
 
+// Check if path is 'default' and is appropriate for this context
+//
+   if (!strcmp("default", val))
+      {if (!libType)
+          {eDest->Emsg("Config","ckslib 'default' is only valid for '*' and '='");
+           return 1;
+          }
+       if (!ParseOpt(Config)) return 1;
+       return Manager(0,0);
+      }
+
 // Record any parms
 //
    *parms = 0;
@@ -203,17 +273,60 @@ int XrdCksConfig::ParseLib(XrdOucStream &Config, int &libType)
 
 // Check if this is for the manager
 //
-   if ((*buff == '*' || *buff == '=') && *(buff+1) == ' ')
-      {libType = (*buff == '*' ? -1 : 1);
-       return Manager(buff+2, parms);
-      } else libType = 0;
+   if (libType) return Manager(buff+2, parms);
 
-// Add this digest to the list of digests
+// Create a new TList object either for a digest or stackable library
 //
-   *bP++ = ' '; strcpy(bP, parms);
-   tP = new XrdOucTList(buff);
-   if (CksLast) CksLast->next = tP;
-      else      CksList = tP;
-   CksLast = tP;
+   n = (strncmp(buff, "++ ", 3) ? 0 : 3);
+   *bP = ' '; strcpy(bP+1, parms);
+   tP = new XrdOucTList(buff + n);
+
+// Add this digest to the list of digests or stackable library list
+//
+   if (n)
+      {n = (bP - buff) - n;
+       tP->text[n] = 0;
+       tP->val = (*parms ? n+1 : 0);
+       if (LibLast) LibLast->next = tP;
+          else      LibList = tP;
+       LibLast = tP;
+      } else {
+       if (CksLast) CksLast->next = tP;
+          else      CksList = tP;
+       CksLast = tP;
+      }
    return 0;
+}
+  
+/******************************************************************************/
+/*                              P a r s e O p t                               */
+/******************************************************************************/
+  
+/* Function: ParseOpt
+
+   Purpose:  To parse the paramneters for the default manager plugin
+
+
+   Output: true upon success or false upon failure.
+*/
+
+bool XrdCksConfig::ParseOpt(XrdOucStream &Config)
+{
+   char* val = Config.GetWord();
+
+// Get the next word, if any
+//
+   while(val)
+        {if (!strcmp(val, "nomtchk")) CKSopts |= XrdCksManager::Cks_nomtchk;
+            else break;
+         val = Config.GetWord();
+        }
+
+// Check for errors
+//
+   if (val)
+      {eDest->Emsg("Config", "Invalid default ckslib plugin parameter -", val);
+       return false;
+      }
+   return true;
 }

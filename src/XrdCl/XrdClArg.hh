@@ -27,7 +27,9 @@
 #define __XRD_CL_OPERATION_PARAMS_HH__
 
 #include "XrdCl/XrdClFwd.hh"
+#include "XrdCl/XrdClOptional.hh"
 
+#include <future>
 #include <string>
 #include <sstream>
 #include <unordered_map>
@@ -94,10 +96,15 @@ namespace XrdCl
       //------------------------------------------------------------------------
       //! @return : value of the argument
       //------------------------------------------------------------------------
-      T Get()
+      inline T& Get() const
       {
         if( !holder ) throw std::logic_error( "XrdCl::ArgBase::Get(): value not set." );
         return holder->Get();
+      }
+
+      operator T() const
+      {
+        return Get();
       }
 
     protected:
@@ -117,7 +124,7 @@ namespace XrdCl
         //----------------------------------------------------------------------
         //! @return : the value
         //----------------------------------------------------------------------
-        virtual T Get() = 0;
+        virtual T& Get() = 0;
       };
 
       //------------------------------------------------------------------------
@@ -137,9 +144,9 @@ namespace XrdCl
           //--------------------------------------------------------------------
           //! @return : the value
           //--------------------------------------------------------------------
-          T Get()
+          T& Get()
           {
-            return std::move( value );
+            return value;
           }
 
         private:
@@ -157,7 +164,7 @@ namespace XrdCl
           //--------------------------------------------------------------------
           //! Constructor
           //!
-          //! @param value : the future value to be hold by us
+          //! @param ftr : the future value to be hold by us
           //--------------------------------------------------------------------
           FutureValue( std::future<T> &&ftr ) : ftr( std::move( ftr ) )
           {
@@ -166,9 +173,11 @@ namespace XrdCl
           //--------------------------------------------------------------------
           //! @return : the value
           //--------------------------------------------------------------------
-          T Get()
+          T& Get()
           {
-            return ftr.get();
+            if( val ) return *val;
+            val = ftr.get();
+            return *val;
           }
 
         private:
@@ -176,6 +185,7 @@ namespace XrdCl
           //! the future value
           //--------------------------------------------------------------------
           std::future<T> ftr;
+          Optional<T>    val;
       };
 
       //------------------------------------------------------------------------
@@ -186,7 +196,7 @@ namespace XrdCl
           //--------------------------------------------------------------------
           //! Constructor
           //!
-          //! @param value : the forwarded value to be hold by us
+          //! @param fwd : the forwarded value to be hold by us
           //--------------------------------------------------------------------
           FwdValue( const Fwd<T> &fwd ) : fwd( fwd )
           {
@@ -195,9 +205,9 @@ namespace XrdCl
           //--------------------------------------------------------------------
           //! @return : the value
           //--------------------------------------------------------------------
-          T Get()
+          T& Get()
           {
-            return std::move( *fwd );
+            return *fwd;
           }
 
         private:
@@ -296,7 +306,7 @@ namespace XrdCl
       //------------------------------------------------------------------------
       //! Constructor.
       //!
-      //! @param value : value of the argument
+      //! @param str : value of the argument
       //------------------------------------------------------------------------
       Arg( std::string str ) : ArgBase<std::string>( str )
       {
@@ -305,7 +315,7 @@ namespace XrdCl
       //------------------------------------------------------------------------
       //! Constructor.
       //!
-      //! @param val : value of the argument
+      //! @param cstr : value of the argument
       //------------------------------------------------------------------------
       Arg( const char *cstr ) : ArgBase<std::string>( cstr )
       {

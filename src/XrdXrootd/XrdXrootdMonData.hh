@@ -77,6 +77,13 @@ struct XrdXrootdMonBurr
         XrdXrootdMonRedir  info[sizeof(XrdXrootdMonRedir)]; //This is really [n]
        };
 
+struct XrdXrootdMonGS
+      {XrdXrootdMonHeader hdr;
+       int                tBeg;     // time(0) of the first record
+       int                tEnd;     // time(0) of the last  record
+       kXR_int64          sID;      // Server id in lower 48 bits
+};                                  // Information provider top 8 bits.
+
 struct XrdXrootdMonMap
        {XrdXrootdMonHeader hdr;
         kXR_unt32          dictid;
@@ -96,14 +103,24 @@ const kXR_char XROOTD_MON_WINDOW        = 0xe0;
 const kXR_char XROOTD_MON_MAPIDNT       = '=';
 const kXR_char XROOTD_MON_MAPPATH       = 'd';
 const kXR_char XROOTD_MON_MAPFSTA       = 'f'; // The "f" stream
+const kXR_char XROOTD_MON_MAPGSTA       = 'g'; // The "g" stream
 const kXR_char XROOTD_MON_MAPINFO       = 'i';
 const kXR_char XROOTD_MON_MAPMIGR       = 'm'; // Internal use only!
 const kXR_char XROOTD_MON_MAPPURG       = 'p';
 const kXR_char XROOTD_MON_MAPREDR       = 'r';
 const kXR_char XROOTD_MON_MAPSTAG       = 's'; // Internal use only!
 const kXR_char XROOTD_MON_MAPTRCE       = 't';
+const kXR_char XROOTD_MON_MAPTOKN       = 'T';
 const kXR_char XROOTD_MON_MAPUSER       = 'u';
+const kXR_char XROOTD_MON_MAPUEAC       = 'U'; // User experiment/activity
 const kXR_char XROOTD_MON_MAPXFER       = 'x';
+
+const kXR_char XROOTD_MON_GSCCM         = 'M'; // pfc: Cache context mgt info
+const kXR_char XROOTD_MON_GSPFC         = 'C'; // pfc: Cache monitoring  info
+const kXR_char XROOTD_MON_GSTCP         = 'T'; // TCP connection statistics
+const kXR_char XROOTD_MON_GSTPC         = 'P'; // TPC Third Party Copy
+const kXR_char XROOTD_MON_GSTHR         = 'R'; // IO activity from the throttle plugin
+const kXR_char XROOTD_MON_GSOSS         = 'O'; // IO activity from a generic OSS plugin
 
 // The following bits are insert in the low order 4 bits of the MON_REDIRECT
 // entry code to indicate the actual operation that was requestded.
@@ -137,6 +154,10 @@ const int      XROOTD_MON_SRCMASK       = 0x000000f;
 const int      XROOTD_MON_TRGMASK       = 0x7fffff0;
 const int      XROOTD_MON_NEWSTID       = 0x8000000;
 
+const long long XROOTD_MON_SIDMASK      = 0x0000ffffffffffff;
+const long long XROOTD_MON_PIDMASK      = 0xff;
+const long long XROOTD_MON_PIDSHFT      = 56;
+
 /******************************************************************************/
 /*           " f "   S t r e a m   S p e c i f i c   R e c o r d s            */
 /******************************************************************************/
@@ -161,6 +182,7 @@ enum  recTval {isClose = 0,   // Record for close
 enum  recFval {forced  =0x01, // If recFlag == isClose close due to disconnect
                hasOPS  =0x02, // If recFlag == isClose MonStatXFR + MonStatOPS
                hasSSQ  =0x04, // If recFlag == isClose XFR + OPS  + MonStatSSQ
+               hasCSE  =0x04, // If recFlag == isClose XFR + OPS  + MonStatSSQ
                hasLFN  =0x01, // If recFlag == isOpen  the lfn is present
                hasRW   =0x02, // If recFlag == isOpen  file opened r/w
                hasSID  =0x01  // if recFlag == isTime sID is present (new rec)
@@ -213,6 +235,18 @@ XrdXrootdMonFileLFN ufn;      //  Present ONLY if recFlag & hasLFN is TRUE
 
 // The following data is collected on a per file basis
 //
+struct XrdXrootdMonStatPRW    //  8 Bytes
+{
+long long           rBytes;   // Bytes read  from file so far using pgread()
+int                 rCount;   // Number of operations
+int                 rRetry;   // Number of pgread  retries (pages)
+long long           wBytes;   // Bytes written to file so far using pgwrite()
+int                 wCount;   // Number of operations
+int                 wRetry;   // Number of pgwrite retries (corrections)
+int                 wcsErr;   // Number of pgwrite checksum errors
+int                 wcsUnc;   // Number of pgwrite uncorrected checksums
+};
+
 struct XrdXrootdMonStatOPS    // 48 Bytes
 {
 int                 read;     // Number of read()  calls

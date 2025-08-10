@@ -41,23 +41,30 @@ class XrdPollE : public XrdPoll
 {
 public:
 
-       void Disable(XrdLink *lp, const char *etxt=0);
+       void Disable(XrdPollInfo &pInfo, const char *etxt=0);
 
-       int   Enable(XrdLink *lp);
+       int   Enable(XrdPollInfo &pInfo);
 
        void Start(XrdSysSemaphore *syncp, int &rc);
 
-            XrdPollE(struct epoll_event *ptab, int numfd, int pfd)
-                       {PollTab = ptab; PollMax = numfd; PollDfd = pfd;}
+            XrdPollE(struct epoll_event *ptab, int numfd, int pfd, int wfd)
+                    : WaitFdSem(0)
+                      {PollTab = ptab; PollMax = numfd; PollDfd = pfd;
+                       WaitFd = wfd;
+                      }
+
            ~XrdPollE();
 
 protected:
-       void  Exclude(XrdLink *lp);
-       int   Include(XrdLink *lp);
+       void  Exclude(XrdPollInfo &pInfo);
+       int   Include(XrdPollInfo &pInfo);
 const  char *x2Text(unsigned int evf, char *buff);
 
 private:
-void remFD(XrdLink *lp, unsigned int events);
+int  AddWaitFd();
+void HandleWaitFd(const unsigned int events);
+void remFD(XrdPollInfo &pInfo, unsigned int events);
+void Wait4Poller();
 
 #ifdef EPOLLONESHOT
    static const int ePollOneShot = EPOLLONESHOT;
@@ -70,5 +77,7 @@ void remFD(XrdLink *lp, unsigned int events);
 struct epoll_event *PollTab;
        int          PollDfd;
        int          PollMax;
+       int          WaitFd;
+XrdSysSemaphore     WaitFdSem;
 };
 #endif

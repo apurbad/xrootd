@@ -27,8 +27,8 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <stdio.h>
-#include <string.h>
+#include <cstdio>
+#include <cstring>
 #include <arpa/inet.h>
 #include <sys/types.h>
 
@@ -36,7 +36,6 @@
 #include "XrdOuc/XrdOucERoute.hh"
 #include "XrdOuc/XrdOucErrInfo.hh"
 #include "XrdSfs/XrdSfsDio.hh"
-#include "XrdSfs/XrdSfsXio.hh"
 #include "XrdSsi/XrdSsiAlert.hh"
 #include "XrdSsi/XrdSsiFileReq.hh"
 #include "XrdSsi/XrdSsiFileResource.hh"
@@ -102,7 +101,7 @@ int             XrdSsiFileReq::freeMax = 256;
 /*                              A c t i v a t e                               */
 /******************************************************************************/
   
-void XrdSsiFileReq::Activate(XrdOucBuffer *oP, XrdSfsXioHandle *bR, int rSz)
+void XrdSsiFileReq::Activate(XrdOucBuffer *oP, XrdSfsXioHandle bR, int rSz)
 {
    EPNAME("Activate");
 
@@ -470,11 +469,11 @@ void XrdSsiFileReq::Finalize()
    switch(urState)
          // Request is being scheduled, so we can simply abort it.
          //
-         {case isNew:    DEBUGXQ("Aborting request processing");
-                         urState = isAbort;
+         {case isNew:    urState = isAbort;
                          cbInfo  = 0;
                          sessN   = "???";
                          Stats.Bump(Stats.ReqAborts);
+                         DEBUGXQ("Aborting request processing");
                          return;
                          break;
 
@@ -487,6 +486,7 @@ void XrdSsiFileReq::Finalize()
                          mHelper.UnLock();
                          wt4fin.Wait();
                         }
+                         sessN   = "n/a";
                          return;
 
           // Request is bound so we can finish right off.
@@ -499,13 +499,15 @@ void XrdSsiFileReq::Finalize()
                          Stats.Bump(Stats.ReqFinished);
                          if (cancel) Stats.Bump(Stats.ReqCancels);
                          Finished(cancel); // This object may be deleted!
+                         sessN   = "n/a";
                          return;
                          break;
 
           // The following two cases may happen but it's safe to ignore them.
           //
           case isAbort:
-          case isDone:   return;
+          case isDone:   sessN = "bad";
+                         return;
                          break;
           default:       break;
          }
@@ -533,7 +535,7 @@ char *XrdSsiFileReq::GetRequest(int &rLen)
 //
    rLen = reqSize;
    if (oucBuff) return oucBuff->Data();
-   return sfsBref->Buffer();
+   return XrdSfsXio::Buffer(sfsBref);
 }
 
 /******************************************************************************/
@@ -789,10 +791,10 @@ void XrdSsiFileReq::Recycle()
 {
 
 // If we have an oucbuffer then we need to recycle it, otherwise if we have
-// and sfs buffer, put it on the defered release queue.
+// and sfs buffer, put it on the deferred release queue.
 //
         if (oucBuff) {oucBuff->Recycle(); oucBuff = 0;}
-   else if (sfsBref) {sfsBref->Recycle(); sfsBref = 0;}
+   else if (sfsBref) {XrdSfsXio::Reclaim(sfsBref); sfsBref = 0;}
    reqSize = 0;
 
 // Add to queue unless we have too many of these. If we add it back to the
@@ -826,7 +828,7 @@ void XrdSsiFileReq::RelRequestBuffer()
 // Release buffers
 //
         if (oucBuff) {oucBuff->Recycle(); oucBuff = 0;}
-   else if (sfsBref) {sfsBref->Recycle(); sfsBref = 0;}
+   else if (sfsBref) {XrdSfsXio::Reclaim(sfsBref); sfsBref = 0;}
    reqSize = 0;
 }
 

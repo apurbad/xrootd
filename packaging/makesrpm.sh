@@ -4,22 +4,6 @@
 # Author: Lukasz Janyst <ljanyst@cern.ch> (10.03.2011)
 #-------------------------------------------------------------------------------
 
-RCEXP='^[0-9]+\.[0-9]+\.[0-9]+\-rc.*$'
-CERNEXP='^[0-9]+\.[0-9]+\.[0-9]+\-[0-9]+\.CERN.*$'
-
-#-------------------------------------------------------------------------------
-# Find a program
-#-------------------------------------------------------------------------------
-function findProg()
-{
-  for prog in $@; do
-    if test -x "`which $prog 2>/dev/null`"; then
-      echo $prog
-      break
-    fi
-  done
-}
-
 #-------------------------------------------------------------------------------
 # Print help
 #-------------------------------------------------------------------------------
@@ -39,9 +23,10 @@ function printHelp()
 #-------------------------------------------------------------------------------
 # Parse the commandline, if only we could use getopt... :(
 #-------------------------------------------------------------------------------
-SOURCEPATH="../"
+SOURCEPATH=$(realpath $(dirname $0)/..)
 OUTPUTPATH="."
 PRINTHELP=0
+RPM_NAME="xrootd-ceph"
 
 while test ${#} -ne 0; do
   if test x${1} = x--help; then
@@ -65,7 +50,7 @@ while test ${#} -ne 0; do
       echo "--version parameter needs an argument" 1>&2
       exit 1
     fi
-    USER_VERSION="--version ${2}"
+    VERSION="${2}"
     shift
   elif test x${1} = x--define; then
     if test ${#} -lt 2; then
@@ -108,12 +93,12 @@ fi
 #-------------------------------------------------------------------------------
 # Check if we have all the necassary components
 #-------------------------------------------------------------------------------
-if test x`findProg rpmbuild` = x; then
+if ! command -v rpmbuild 2>/dev/null; then
   echo "[!] Unable to find rpmbuild, aborting..." 1>&2
   exit 1
 fi
 
-if test x`findProg git` = x; then
+if ! command -v git 2>/dev/null; then
   echo "[!] Unable to find git, aborting..." 1>&2
   exit 1
 fi
@@ -126,15 +111,9 @@ if test ! -d $SOURCEPATH/.git; then
   exit 2
 fi
 
-#-------------------------------------------------------------------------------
-# Check the version number
-#-------------------------------------------------------------------------------
-if test ! -x $SOURCEPATH/genversion.sh; then
-  echo "[!] Unable to find the genversion script" 1>&2
-  exit 3
-fi
+: ${VERSION:=$(git --git-dir=$SOURCEPATH/.git describe)}
+: ${RELEASE:=1}
 
-VERSION=`$SOURCEPATH/genversion.sh --print-only $USER_VERSION $SOURCEPATH 2>/dev/null`
 if test $? -ne 0; then
   echo "[!] Unable to figure out the version number" 1>&2
   exit 4
@@ -142,39 +121,17 @@ fi
 
 echo "[i] Working with version: $VERSION"
 
-if test x${VERSION:0:1} = x"v"; then
-  VERSION=${VERSION:1}
-fi
+#-------------------------------------------------------------------------------
+# Sanitize version to work with RPMs
+# https://docs.fedoraproject.org/en-US/packaging-guidelines/Versioning/
+#-------------------------------------------------------------------------------
 
-#-------------------------------------------------------------------------------
-# Deal with release candidates
-#-------------------------------------------------------------------------------
-RELEASE=1
-if test x`echo $VERSION | egrep $RCEXP` != x; then
-  RELEASE=0.`echo $VERSION | sed 's/.*-rc/rc/'`
-  VERSION=`echo $VERSION | sed 's/-rc.*//'`
-fi
+VERSION=${VERSION#v} # remove "v" prefix
+VERSION=${VERSION/-rc/~rc} # release candidates use ~ in RPMs
+VERSION=${VERSION/-g*/} # snapshots versions not supported well, filter out
+VERSION=${VERSION/-/.post} # handle git describe for post releases
+VERSION=${VERSION//-/.} # replace remaining dashes with dots
 
-#-------------------------------------------------------------------------------
-# Deal with CERN releases
-#-------------------------------------------------------------------------------
-if test x`echo $VERSION | egrep $CERNEXP` != x; then
-  RELEASE=`echo $VERSION | sed 's/.*-//'` 
-  VERSION=`echo $VERSION | sed 's/-.*\.CERN//'`
-fi
-
-#-------------------------------------------------------------------------------
-# In case of user version check if the release number has been provided
-#-------------------------------------------------------------------------------
-if test x"$USER_VERSION" != x; then
-  TMP=`echo $VERSION | sed 's#.*-##g'`
-  if test $TMP != $VERSION; then
-    RELEASE=$TMP
-    VERSION=`echo $VERSION | sed 's#-[^-]*$##'`
-  fi
-fi
-
-VERSION=`echo $VERSION | sed 's/-/./g'`
 echo "[i] RPM compliant version: $VERSION-$RELEASE"
 
 #-------------------------------------------------------------------------------
@@ -240,63 +197,6 @@ if test $? -ne 0; then
 fi
 
 #-------------------------------------------------------------------------------
-# Make sure submodules are in place
-#-------------------------------------------------------------------------------
-git submodule init
-git submodule update --recursive
-git submodule foreach git pull origin master
-
-#-------------------------------------------------------------------------------
-# Add XrdClHttp sub-module to our tarball
-#-------------------------------------------------------------------------------
-cd src/XrdClHttp
-
-if [ -z ${TAG+x} ]; then
-  COMMIT=`git log --pretty=format:"%H" -1`
-else
-  COMMIT=$TAG
-fi
-
-git archive --prefix=xrootd/src/XrdClHttp/ --format=tar $COMMIT > $RPMSOURCES/xrdcl-http.tar
-if test $? -ne 0; then
-  echo "[!] Unable to create the xrdcl-http source tarball" 1>&2
-  exit 6
-fi
-
-tar --concatenate --file $RPMSOURCES/xrootd.tar $RPMSOURCES/xrdcl-http.tar
-if test $? -ne 0; then
-  echo "[!] Unable to add xrdcl-http to xrootd tarball" 1>&2
-  exit 6
-fi
-
-cd - > /dev/null
-
-#-------------------------------------------------------------------------------
-# Add XrdCeph sub-module to our tarball
-#-------------------------------------------------------------------------------
-cd src/XrdCeph
-
-if [ -z ${TAG+x} ]; then
-  COMMIT=`git log --pretty=format:"%H" -1`
-else
-  COMMIT=$TAG
-fi
-
-git archive --prefix=xrootd/src/XrdCeph/ --format=tar $COMMIT > $RPMSOURCES/xrootd-ceph.tar
-if test $? -ne 0; then
-  echo "[!] Unable to create the xrootd-ceph source tarball" 1>&2
-  exit 6
-fi
-
-tar --concatenate --file $RPMSOURCES/xrootd.tar $RPMSOURCES/xrootd-ceph.tar
-if test $? -ne 0; then
-  echo "[!] Unable to add xrootd-ceph to xrootd tarball" 1>&2
-  exit 6
-fi
-
-cd - > /dev/null
-
-#-------------------------------------------------------------------------------
 # gzip the tarball
 #-------------------------------------------------------------------------------
 gzip -9fn $RPMSOURCES/xrootd.tar
@@ -305,7 +205,7 @@ gzip -9fn $RPMSOURCES/xrootd.tar
 # Check if we need some other versions
 #-------------------------------------------------------------------------------
 OTHER_VERSIONS=`cat $TEMPDIR/xrootd.spec | \
-    egrep '^Source[0-9]+:[[:space:]]*xrootd-.*.gz$' |\
+    grep -E '^Source[0-9]+:[[:space:]]*xrootd-.*.gz$' |\
     awk  '{ print $2; }'`
 
 for VER in $OTHER_VERSIONS; do

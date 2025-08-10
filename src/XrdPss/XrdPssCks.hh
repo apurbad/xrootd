@@ -30,7 +30,7 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <errno.h>
+#include <cerrno>
 
 #include "XrdCks/XrdCks.hh"
 #include "XrdCks/XrdCksData.hh"
@@ -78,7 +78,7 @@ struct csInfo
 
 csInfo *Find(const char *Name);
 
-static const int csMax = 4;
+static const int csMax = 8;
 csInfo           csTab[csMax];
 int              csLast;
 };

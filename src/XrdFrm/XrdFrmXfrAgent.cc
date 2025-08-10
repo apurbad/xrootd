@@ -28,8 +28,8 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <stdlib.h>
-#include <string.h>
+#include <cstdlib>
+#include <cstring>
 #include <strings.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -189,7 +189,7 @@ void XrdFrmXfrAgent::List(XrdOucStream &Request, char *Tok)
    if (!(*Tok)) {StgAgent.List(Items, n); GetAgent.List(Items, n);}
       else do {if ((agentP = Agent(*Tok))) agentP->List(Items, n);
               } while(*(++Tok));
-   cout <<endl;
+   std::cout <<std::endl;
 }
 
 /******************************************************************************/

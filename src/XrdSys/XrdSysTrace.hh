@@ -39,7 +39,7 @@ class XrdSysLogger;
 
 namespace Xrd
 {
-enum Fmt {dec=0, hex};
+enum Fmt {dec=0, hex=2, hex1=3, oct=4, oct1=5};
 }
 
 #define SYSTRACE(obj, usr, epn, txt, dbg) \
@@ -53,7 +53,11 @@ XrdSysTrace& Beg(const char *usr=0, const char *epn=0, const char *txt=0);
 
 XrdSysTrace *End() {return this;}
 
-void         SetLogger(XrdSysLogger *logp) {logP = logp;}
+void         SetLogger(XrdSysLogger *logp);
+
+typedef void (*msgCB_t)(const char *tid, const char *msg, bool dbgmsg);
+
+void         SetLogger(msgCB_t cbP);
 
 inline bool  Tracing(int mask) {return (mask & What) != 0;}
 
@@ -84,17 +88,13 @@ XrdSysTrace& operator<<(long double val)
 
 XrdSysTrace& operator<<(void* val);
 
-XrdSysTrace& operator<<(Xrd::Fmt val)
-                       {     if (val == Xrd::hex) doHex = true;
-                        else if (val == Xrd::dec) doHex = false;
-                        return *this;
-                       }
+XrdSysTrace& operator<<(Xrd::Fmt val) {doFmt = val; return *this;}
 
 XrdSysTrace& operator<<(XrdSysTrace *stp);
 
              XrdSysTrace(const char *pfx, XrdSysLogger *logp=0, int tf=0)
                         : What(tf), logP(logp), iName(pfx), dPnt(0),
-                          dFree(txtMax), vPnt(1), doHex(false) {}
+                          dFree(txtMax), vPnt(1), doFmt(Xrd::dec) {}
             ~XrdSysTrace() {}
 
 private:
@@ -105,13 +105,15 @@ static const int iovMax =  16;
 static const int pfxMax = 256;
 static const int txtMax = 256;
 
+static const int doOne  =0x01;
+
 XrdSysMutex      myMutex;
 XrdSysLogger    *logP;
 const char      *iName;
 short            dPnt;
 short            dFree;
 short            vPnt;
-bool             doHex;
+Xrd::Fmt         doFmt;
 struct iovec     ioVec[iovMax];
 char             pBuff[pfxMax];
 char             dBuff[txtMax];

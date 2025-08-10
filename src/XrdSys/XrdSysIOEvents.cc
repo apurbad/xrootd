@@ -28,10 +28,10 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <errno.h>
-#include <stdio.h>
-#include <stdlib.h>
+#include <cstdio>
+#include <cstdlib>
   
+#include "XrdSys/XrdSysE2T.hh"
 #include "XrdSys/XrdSysFD.hh"
 #include "XrdSys/XrdSysIOEvents.hh"
 #include "XrdSys/XrdSysHeaders.hh"
@@ -39,8 +39,24 @@
 #include "XrdSys/XrdSysPthread.hh"
 
 /******************************************************************************/
+/*                            L o c a l   D a t a                             */
+/******************************************************************************/
+
+namespace
+{
+// Status code to name array corresponding to:
+// enum Status   {isClear = 0, isCBMode, isDead};
+//
+   const char *statName[] = {"isClear", "isCBMode", "isDead"};
+}
+  
+/******************************************************************************/
 /*                         L o c a l   D e f i n e s                          */
 /******************************************************************************/
+
+#define STATUS statName[(int)chStat]
+
+#define STATUSOF(x) statName[(int)(x->chStat)]
 
 #define SINGLETON(dlvar, theitem)\
                theitem ->dlvar .next == theitem
@@ -69,7 +85,7 @@
 
 #define DO_TRACE(x,fd,y) \
                 {PollerInit::traceMTX.Lock(); \
-                 cerr <<"IOE fd " <<fd <<' ' <<#x <<": " <<y <<endl; \
+                 std::cerr <<"IOE fd "<<fd<<' '<<#x <<": "<<y<<'\n'<< std::flush; \
                  PollerInit::traceMTX.UnLock();}
 
 #define TRACING PollerInit::doTrace
@@ -91,6 +107,8 @@
   
        time_t       XrdSys::IOEvents::Poller::maxTime
                     = (sizeof(time_t) == 8 ? 0x7fffffffffffffffLL : 0x7fffffff);
+
+       pid_t        XrdSys::IOEvents::Poller::parentPID = getpid();
  
 /******************************************************************************/
 /*                         L o c a l   C l a s s e s                          */
@@ -153,18 +171,22 @@ public:
     ~PollerErr1() {}
 
 protected:
-void Begin(XrdSysSemaphore *syncp, int &rc, const char **eTxt) {}
+void Begin(XrdSysSemaphore *syncp, int &rc, const char **eTxt)
+          {(void)syncp; (void)rc; (void)eTxt;}
 
-void Exclude(Channel *cP, bool &isLocked, bool dover=1) {}
+void Exclude(Channel *cP, bool &isLocked, bool dover=1)
+            {(void)cP; (void)isLocked; (void)dover;}
 
 bool Include(Channel *cP, int &eNum, const char **eTxt, bool &isLocked)
-            {if (!(eNum = GetFault(cP))) eNum = EPROTO;
+            {(void)isLocked;
+             if (!(eNum = GetFault(cP))) eNum = EPROTO;
              if (eTxt) *eTxt = "initializing channel";
              return false;
             }
 
 bool Modify (Channel *cP, int &eNum, const char **eTxt, bool &isLocked)
-            {if (!(eNum = GetFault(cP))) eNum = EPROTO;
+            {(void)isLocked;
+             if (!(eNum = GetFault(cP))) eNum = EPROTO;
              if (eTxt) *eTxt = "modifying channel";
              return false;
             }
@@ -283,6 +305,10 @@ void XrdSys::IOEvents::Channel::Delete()
    Poller *myPoller;
    bool isLocked = true;
 
+// Do some tracing
+//
+   IF_TRACE(Delete,chFD,"status="<<STATUS);
+
 // Lock ourselves during the delete process. If the channel is disassociated
 // or the real poller is set to the error poller then this channel is clean
 // and can be deleted (i.e. the channel ran through Detach()).
@@ -310,6 +336,7 @@ void XrdSys::IOEvents::Channel::Delete()
            chMutex.UnLock();
           } else {
            XrdSysSemaphore cbDone(0);
+           IF_TRACE(Delete,chFD,"waiting for callback");
            chStat = isDead;
            chCBA  = (void *)&cbDone;
            chMutex.UnLock();
@@ -318,6 +345,7 @@ void XrdSys::IOEvents::Channel::Delete()
       }
 // It is now safe to release the storage
 //
+   IF_TRACE(Delete,chFD,"chan="<< std::hex<<(void *)this<< std::dec);
    delete this;
 }
   
@@ -858,7 +886,7 @@ int XrdSys::IOEvents::Poller::GetRequest()
    do {rlen = read(reqFD, pipeBuff, pipeBlen);} 
       while(rlen < 0 && errno == EINTR);
    if (rlen <= 0)
-      {cerr <<"Poll: " <<strerror(errno) <<" reading from request pipe" <<endl;
+      {std::cerr <<"Poll: "<<XrdSysE2T(errno)<<" reading from request pipe\n"<< std::flush;
        return 0;
       }
 
@@ -1018,7 +1046,9 @@ void XrdSys::IOEvents::Poller::Stop()
 
 // First we must stop the poller thread in an orderly fashion.
 //
+   adMutex.UnLock();
    SendCmd(cmdbuff);
+   adMutex.Lock();
 
 // Close the pipe communication mechanism
 //
@@ -1061,6 +1091,11 @@ bool XrdSys::IOEvents::Poller::TmoAdd(XrdSys::IOEvents::Channel *cP, int tmoSet)
    time_t tNow;
    Channel *ncP;
    bool setRTO, setWTO;
+
+// Do some tracing
+//
+   IF_TRACE(TmoAdd,cP->chFD,"chan="<< std::hex<<(void*)cP<< std::dec
+            <<" inTOQ="<<BOOLNAME(cP->inTOQ)<<" status="<<STATUSOF(cP));
 
 // Remove element from timeout queue if it is there
 //
@@ -1120,6 +1155,11 @@ bool XrdSys::IOEvents::Poller::TmoAdd(XrdSys::IOEvents::Channel *cP, int tmoSet)
 
 void XrdSys::IOEvents::Poller::TmoDel(XrdSys::IOEvents::Channel *cP)
 {
+
+// Do some tracing
+//
+   IF_TRACE(TmoDel,cP->chFD,"chan="<< std::hex<<(void*)cP<< std::dec
+            <<" inTOQ="<<BOOLNAME(cP->inTOQ)<<" status="<<STATUSOF(cP));
 
 // Get the timeout queue lock and remove the channel from the queue
 //

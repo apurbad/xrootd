@@ -29,8 +29,8 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <stdlib.h>
-#include <string.h>
+#include <cstdlib>
+#include <cstring>
 #ifndef WIN32
 #include <strings.h>
 #include <unistd.h>
@@ -53,7 +53,7 @@ class XrdNet
 public:
 
 //------------------------------------------------------------------------------
-//! Accept incomming TCP connection. This is the preferred method for TCP.
+//! Accept incoming TCP connection. This is the preferred method for TCP.
 //!
 //! @param  myAddr   the address object to contain connection information.
 //! @param  opts     processing options:
@@ -73,7 +73,7 @@ int             Accept(XrdNetAddr &myAddr,
                        int timeout=-1);
 
 //------------------------------------------------------------------------------
-//! Accept incomming TCP or UDP connection. This method should only be used for
+//! Accept incoming TCP or UDP connection. This method should only be used for
 //! UDP-style networks. The previous method is preferred for TCP-style networks.
 //!
 //! @param  myPeer   the peer object to contain connection information.
@@ -85,6 +85,7 @@ int             Accept(XrdNetAddr &myAddr,
 //!                  XRDNET_NODNTRIM  - ALL: don't trim domain name in myPeer
 //!                  XRDNET_NOEMSG    - ALL: supress printing error messages
 //!                  XRDNET_NORLKUP   - ALL: avoid doing reverse DNS look-up
+//!                  XRDNET_USETLS    - ALL: enable TLS upon connection
 //! @param  timeout  maximum seconds to wait for a conection. When negative,
 //!                  the default, no time limit applies.
 //! @return !0       Successful connection occurred, myPeer holds information.

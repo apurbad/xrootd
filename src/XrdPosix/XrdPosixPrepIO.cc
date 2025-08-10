@@ -1,6 +1,6 @@
 /******************************************************************************/
 /*                                                                            */
-/*                     X r d P o s i x P r e p I O . h h                      */
+/*                     X r d P o s i x P r e p I O . c c                      */
 /*                                                                            */
 /* (c) 2016 by the Board of Trustees of the Leland Stanford, Jr., University  */
 /*                            All Rights Reserved                             */
@@ -28,10 +28,22 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
+#include "XrdOuc/XrdOucPrivateUtils.hh"
 #include "XrdPosix/XrdPosixObjGuard.hh"
 #include "XrdPosix/XrdPosixPrepIO.hh"
+#include "XrdPosix/XrdPosixStats.hh"
 #include "XrdPosix/XrdPosixTrace.hh"
 
+/******************************************************************************/
+/*                               G l o b a l s                                */
+/******************************************************************************/
+
+namespace XrdPosixGlobals
+{
+extern XrdOucCache   *theCache;
+extern XrdPosixStats  Stats;
+};
+  
 /******************************************************************************/
 /*                               D i s a b l e                                */
 /******************************************************************************/
@@ -41,7 +53,9 @@ void XrdPosixPrepIO::Disable()
    EPNAME("PrepIODisable");
    XrdPosixObjGuard objGuard(fileP);
 
-   DEBUG("Disabling defered open "<<fileP->Origin());
+   if(DEBUGON) {
+     DEBUG("Disabling deferred open " << obfuscateAuth(fileP->Origin()));
+   }
 
    openRC = -ESHUTDOWN;
 }
@@ -73,25 +87,29 @@ bool XrdPosixPrepIO::Init(XrdOucCacheIOCB *iocbP)
 //
    if (fileP->clFile.IsOpen()) return true;
 
+// Count number of opens after the open was deferred (successful or not)
+//
+   if (XrdPosixGlobals::theCache)
+       XrdPosixGlobals::theCache->Statistics.Count(
+         (XrdPosixGlobals::theCache->Statistics.X.OpenDefers));
+
 // Open the file. It is too difficult to do an async open here as there is a
 // possible pending async request and doing both is not easy at all.
 //
    Status = fileP->clFile.Open((std::string)fileP->Origin(), clFlags, clMode);
+   XrdPosixGlobals::Stats.Count((XrdPosixGlobals::Stats.X.Opens));
 
-// If all went well, then we need to do a Stat() call on the underlying file
+// Make sure all went well. If so, do a Stat() call on the underlying file
 //
    if (Status.IsOK()) fileP->Stat(Status);
-
-// Make sure all went well
-//
-   if (!Status.IsOK())
-      {openRC = XrdPosixMap::Result(Status, false);
-       if (DEBUGON && errno != ENOENT && errno != ELOOP)
-          {std::string eTxt = Status.ToString();
-           DEBUG(eTxt<<" deferred open "<<fileP->Origin());
-          }
-       return false;
-      }
+      else {openRC = XrdPosixMap::Result(Status, fileP->ecMsg, false);
+            if (DEBUGON && errno != ENOENT && errno != ELOOP)
+               {std::string eTxt = Status.ToString();
+                DEBUG(eTxt<<" deferred open "<< obfuscateAuth(fileP->Origin()));
+               }
+            XrdPosixGlobals::Stats.Count(XrdPosixGlobals::Stats.X.OpenErrs);
+            return false;
+           }
 
 // Inform the cache that we have now have a new I/O object
 //

@@ -28,17 +28,18 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
   
-#include <ctype.h>
-#include <errno.h>
+#include <cctype>
 #include <netdb.h>
-#include <stdio.h>
+#include <cstdio>
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <sys/types.h>
 
 #include "XrdNet/XrdNetAddr.hh"
 #include "XrdNet/XrdNetCache.hh"
+#include "XrdNet/XrdNetIdentity.hh"
 #include "XrdNet/XrdNetUtils.hh"
+#include "XrdSys/XrdSysE2T.hh"
 
 /******************************************************************************/
 /*                 P l a t f o r m   D e p e n d e n c i e s                  */
@@ -85,19 +86,28 @@ struct addrinfo   *XrdNetAddr::huntHintsUDP = XrdNetAddr::Hints(2, SOCK_DGRAM);
 // The following must be initialzed after all of the hint structures!
 //
 bool               XrdNetAddr::useIPV4      = OnlyIPV4();
+bool               XrdNetAddr::dynDNS       = false;
 
 /******************************************************************************/
 /*                           C o n s t r u c t o r                            */
 /******************************************************************************/
-  
+
 XrdNetAddr::XrdNetAddr(int port) : XrdNetAddrInfo()
 {
-   char buff[1024];
+   const char *fqn = XrdNetIdentity::FQN();
 
-// Get our host name and initialize this object with it
+// The host name might not be resolvable. If we have an fqn then either the
+// name was manually set or we are using an IP address because reverse
+// lookup did not work. If we have an fqn, then use it as the name. Otherwise,
+// use localhost as that is always a safe fallback.
 //
-   gethostname(buff, sizeof(buff));
-   Set(buff, port);
+   if (!fqn || Set(fqn, port))
+      {Set("localhost", port);
+       if (fqn)
+          {if (hostName) free(hostName);
+           hostName = strdup(fqn);
+          }
+      }
 }
 
 /******************************************************************************/
@@ -163,6 +173,42 @@ int XrdNetAddr::Port(int pNum)
    return pNum;
 }
   
+/******************************************************************************/
+/*                              R e g i s t e r                               */
+/******************************************************************************/
+  
+bool XrdNetAddr::Register(const char *hName)
+{
+   XrdNetAddr *aListVec = 0;
+   int i, aListNum;
+
+// Step one is to make sure the incoming name is not an address
+//
+   if (!isHostName(hName)) return false;
+
+// The next step is to get all of the IP addresses registered for this name
+//
+   if (XrdNetUtils::GetAddrs(hName, &aListVec, aListNum,
+                      XrdNetUtils::allIPMap, XrdNetUtils::NoPortRaw))
+      return false;
+
+// In order to use the given name, one of the IP addresses in the list must
+// match our address. This is about as secure we can get.
+//
+   for (i = 0; i < aListNum; i++) {if (Same(&aListVec[i])) break;}
+   delete [] aListVec;
+
+// If we didn't find a match, report it
+//
+   if (i >= aListNum) return false;
+
+// Replace current hostname with the wanted one
+//
+   if (hostName) free(hostName);
+   hostName = strdup(hName);
+   return true;
+}
+
 /******************************************************************************/
 /*                                   S e t                                    */
 /******************************************************************************/
@@ -267,11 +313,13 @@ const char *XrdNetAddr::Set(const char *hSpec, int pNum)
             n = getaddrinfo(iP, 0, hostHints, &rP);
             if (n || !rP)
                {if (rP) freeaddrinfo(rP);
+                if (n == EAI_NONAME && dynDNS)
+                   return "Dynamic name or service not yet registered";
                 return (n ? gai_strerror(n) : "host not found");
                }
             memcpy(&IP.Addr, rP->ai_addr, rP->ai_addrlen);
             protType = (IP.v6.sin6_family == AF_INET6 ? PF_INET6 : PF_INET);
-            if (rP->ai_canonname) hostName = strdup(rP->ai_canonname);
+            if (rP->ai_canonname) hostName = LowCase(strdup(rP->ai_canonname));
             freeaddrinfo(rP);
            }
 
@@ -357,15 +405,11 @@ const char *XrdNetAddr::Set(const char *hSpec, int &numIP, int maxIP,
 
 const char *XrdNetAddr::Set(const struct sockaddr *sockP, int sockFD)
 {
-// Make sure we won't loose any bits of sockFD (we should use an int)
-//
-   if (sockFD >=0 && (sockFD & 0xffff0000) != 0) return "FD is out of range";
-
 // Clear translation if set
 //
    if (hostName)             {free(hostName);  hostName = 0;}
    if (sockAddr != &IP.Addr) {delete unixPipe; sockAddr = &IP.Addr;}
-   sockNum = static_cast<unsigned short>(sockFD);
+   sockNum = sockFD;
 
 // Copy the address based on address family
 //
@@ -397,35 +441,28 @@ const char *XrdNetAddr::Set(const struct sockaddr *sockP, int sockFD)
   
 const char *XrdNetAddr::Set(int sockFD, bool peer)
 {
+   SOCKLEN_t aSize = static_cast<SOCKLEN_t>(sizeof(IP));
    int rc;
-
-// Make sure we won't loose any bits of sockFD (we should use an int)
-//
-   if ((sockFD & 0xffff0000) != 0) return "FD is out of range";
 
 // Clear translation if set
 //
    if (hostName)             {free(hostName);  hostName = 0;}
    if (sockAddr != &IP.Addr) {delete unixPipe; sockAddr = &IP.Addr;}
-   addrSize = sizeof(sockaddr_in6);
-   sockNum = static_cast<unsigned short>(sockFD);
+   sockNum = sockFD;
 
 // Get the address on the appropriate side of this socket
 //
-   if (peer) rc = getpeername(sockFD, &IP.Addr, &addrSize);
-      else   rc = getsockname(sockFD, &IP.Addr, &addrSize);
+   if (peer) rc = getpeername(sockFD, &IP.Addr, &aSize);
+      else   rc = getsockname(sockFD, &IP.Addr, &aSize);
    if (rc < 0)
       {addrSize = 0;
-       return strerror(errno);
+       return XrdSysE2T(errno);
       }
 
-// Set the correct address size
+// Set the correct address size and protocol family
 //
-   if (IP.Addr.sa_family == AF_INET)
-      {addrSize = sizeof(sockaddr_in);  protType = PF_INET;
-      } else {
-       addrSize = sizeof(sockaddr_in6); protType = PF_INET6;
-      }
+   addrSize = aSize;
+   protType = (IP.Addr.sa_family == AF_INET ? PF_INET : PF_INET6);
 
 // All done
 //
@@ -456,7 +493,7 @@ const char *XrdNetAddr::Set(struct addrinfo *rP, int Port, bool mapit)
 // Cleanup pre-existing information
 //
    if (hostName) free(hostName);
-   hostName = (rP->ai_canonname ? strdup(rP->ai_canonname) : 0);
+   hostName = (rP->ai_canonname ? LowCase(strdup(rP->ai_canonname)) : 0);
    if (sockAddr != &IP.Addr) {delete unixPipe; sockAddr = &IP.Addr;}
    IP.v6.sin6_port = htons(static_cast<short>(Port));
    sockNum = 0;
@@ -476,6 +513,12 @@ void XrdNetAddr::SetCache(int keeptime)
    theCache.SetKT(keeptime);
    dnsCache = (keeptime > 0 ? &theCache : 0);
 }
+
+/******************************************************************************/
+/*                             S e t D y n D N S                              */
+/******************************************************************************/
+  
+void XrdNetAddr::SetDynDNS(bool onoff) {dynDNS = onoff;}
 
 /******************************************************************************/
 /*                               S e t I P V 4                                */
@@ -527,4 +570,25 @@ void XrdNetAddr::SetIPV6()
 // Inform NetUtils that we changed mode
 //
    XrdNetUtils::SetAuto(XrdNetUtils::allIPMap);
+}
+
+/******************************************************************************/
+/*                           S e t L o c a t i o n                            */
+/******************************************************************************/
+  
+void XrdNetAddr::SetLocation(XrdNetAddrInfo::LocInfo &loc)
+{
+// Copy in the new location information but preserve the flags
+//
+   addrLoc = loc;
+}
+
+/******************************************************************************/
+/*                                S e t T L S                                 */
+/******************************************************************************/
+  
+void XrdNetAddr::SetTLS(bool val)
+{
+   if (val) protFlgs |=  isTLS;
+      else  protFlgs &= ~isTLS;
 }

@@ -26,9 +26,9 @@ FileSystem::newFile(char *user,
       unique_sfs_ptr chain_file_ptr(chain_file);
       // We should really be giving out shared_ptrs to m_throttle, but alas, no boost.
 #if __cplusplus >= 201103L
-      return static_cast<XrdSfsFile*>(new File(user, monid, std::move(chain_file_ptr), m_throttle, m_eroute));
+      return static_cast<XrdSfsFile*>(new File(user, std::move(chain_file_ptr), m_throttle, m_eroute));
 #else
-      return static_cast<XrdSfsFile*>(new File(user, monid, chain_file_ptr, m_throttle, m_eroute));
+      return static_cast<XrdSfsFile*>(new File(user, chain_file_ptr, m_throttle, m_eroute));
 #endif
    }
    return NULL;
@@ -56,6 +56,12 @@ FileSystem::chmod(const char             *Name,
 }
 
 void
+FileSystem::Connect(const XrdSecEntity *client)
+{
+   m_sfs_ptr->Connect(client);
+}
+
+void
 FileSystem::Disc(const XrdSecEntity *client)
 {
    m_sfs_ptr->Disc(client);
@@ -78,12 +84,26 @@ FileSystem::exists(const char                *fileName,
 }
 
 int
+FileSystem::FAttr(      XrdSfsFACtl      *faReq,
+                        XrdOucErrInfo    &eInfo,
+                  const XrdSecEntity     *client)
+{
+   return m_sfs_ptr->FAttr(faReq, eInfo, client);
+}
+
+int
 FileSystem::fsctl(const int               cmd,
                   const char             *args,
                         XrdOucErrInfo    &out_error,
                   const XrdSecEntity     *client)
 {
    return m_sfs_ptr->fsctl(cmd, args, out_error, client);
+}
+
+int
+FileSystem::getChkPSize()
+{
+   return m_sfs_ptr->getChkPSize();
 }
 
 int
@@ -97,6 +117,15 @@ const char *
 FileSystem::getVersion()
 {
    return XrdVERSION;
+}
+
+int
+FileSystem::gpFile(      gpfFunc          &gpAct,
+                         XrdSfsGPFile     &gpReq,
+                         XrdOucErrInfo    &eInfo,
+                   const XrdSecEntity     *client)
+{
+   return m_sfs_ptr->gpFile(gpAct, gpReq, eInfo, client);
 }
 
 int

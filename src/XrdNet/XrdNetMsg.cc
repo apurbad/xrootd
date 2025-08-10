@@ -28,8 +28,8 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <errno.h>
-#include <sys/poll.h>
+#include <cerrno>
+#include <poll.h>
 
 #include "XrdNet/XrdNet.hh"
 #include "XrdNet/XrdNetMsg.hh"
@@ -90,6 +90,28 @@ int XrdNetMsg::Send(const char *Buff, int Blen, const char *dest, int tmo)
        while (retc < 0 && errno == EINTR);
 
    return (retc < 0 ? retErr(errno, theDest) : 0);
+}
+
+/******************************************************************************/
+  
+int XrdNetMsg::Send(const char *dest, const XrdNetSockAddr &netSA,
+                    const char *Buff, int Blen, int tmo)
+{
+   int aSize, retc;
+
+   if (!Blen && !(Blen = strlen(Buff))) return  0;
+
+   if (netSA.Addr.sa_family == AF_INET) aSize = sizeof(netSA.v4);
+      else if (netSA.Addr.sa_family == AF_INET6) aSize = sizeof(netSA.v6);
+              else return -1;
+
+   if (tmo >= 0 && !OK2Send(tmo, dest)) return 1;
+
+   do {retc = sendto(FD, (Sokdata_t)Buff, Blen, 0, &netSA.Addr, aSize);}
+       while (retc < 0 && errno == EINTR);
+
+   if (retc >= 0) return 1;
+   return (EWOULDBLOCK == errno || EAGAIN == errno ? 1 : -1);
 }
 
 /******************************************************************************/

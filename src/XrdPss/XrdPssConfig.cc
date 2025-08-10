@@ -29,9 +29,9 @@
 /******************************************************************************/
 
 #include <unistd.h>
-#include <ctype.h>
-#include <stdio.h>
-#include <string.h>
+#include <cctype>
+#include <cstdio>
+#include <cstring>
 #include <strings.h>
 #include <sys/param.h>
 #include <sys/types.h>
@@ -46,27 +46,32 @@
 
 #include "XrdPss/XrdPss.hh"
 #include "XrdPss/XrdPssTrace.hh"
+#include "XrdPss/XrdPssUrlInfo.hh"
+#include "XrdPss/XrdPssUtils.hh"
 
 #include "XrdSys/XrdSysError.hh"
+#include "XrdSys/XrdSysFD.hh"
 #include "XrdSys/XrdSysHeaders.hh"
 #include "XrdSys/XrdSysPlatform.hh"
 #include "XrdSys/XrdSysPthread.hh"
 
 #include "XrdOuc/XrdOuca2x.hh"
-#include "XrdOuc/XrdOucCache2.hh"
+#include "XrdOuc/XrdOucCache.hh"
 #include "XrdOuc/XrdOucEnv.hh"
 #include "XrdOuc/XrdOucExport.hh"
 #include "XrdOuc/XrdOucN2NLoader.hh"
-#include "XrdOuc/XrdOucPinLoader.hh"
 #include "XrdOuc/XrdOucPsx.hh"
 #include "XrdOuc/XrdOucStream.hh"
 #include "XrdOuc/XrdOucTList.hh"
 #include "XrdOuc/XrdOucUtils.hh"
-#include "XrdOuc/XrdOucCache2.hh"
 
 #include "XrdPosix/XrdPosixConfig.hh"
 #include "XrdPosix/XrdPosixXrootd.hh"
 #include "XrdPosix/XrdPosixXrootdPath.hh"
+
+#include "XrdSecsss/XrdSecsssID.hh"
+
+#include "XrdXrootd/XrdXrootdGStream.hh"
 
 /******************************************************************************/
 /*                               d e f i n e s                                */
@@ -83,7 +88,7 @@
 
 #define TS_DBG(x,m)    if (!strcmp(x,var)) {SysTrace.What |= m; return 0;}
 
-/*******x**********************************************************************/
+/******************************************************************************/
 /*                               G l o b a l s                                */
 /******************************************************************************/
 
@@ -96,6 +101,7 @@ XrdOucPListAnchor XrdPssSys::XPList;
 XrdNetSecurity   *XrdPssSys::Police[XrdPssSys::PolNum] = {0, 0};
 
 XrdOucTList *XrdPssSys::ManList   =  0;
+      char  *XrdPssSys::fileOrgn  =  0;
 const char  *XrdPssSys::protName  =  "root:";
 const char  *XrdPssSys::hdrData   =  "";
 int          XrdPssSys::hdrLen    =  0;
@@ -104,10 +110,11 @@ int          XrdPssSys::Workers   = 16;
 int          XrdPssSys::Trace     =  0;
 int          XrdPssSys::dcaCTime  =  0;
 
-bool         XrdPssSys::outProxy  = false;
-bool         XrdPssSys::pfxProxy  = false;
 bool         XrdPssSys::xLfn2Pfn  = false;
 bool         XrdPssSys::dcaCheck  = false;
+bool         XrdPssSys::dcaWorld  = false;
+bool         XrdPssSys::deferID   = false;
+bool         XrdPssSys::reProxy   = false;
 
 namespace XrdProxy
 {
@@ -117,6 +124,18 @@ extern XrdSysError      eDest;
 
 extern XrdOucSid       *sidP;
 
+extern XrdOucEnv       *envP;
+
+extern XrdSecsssID     *idMapper; // -> Auth ID mapper
+
+extern int              rpFD;
+
+extern bool             idMapAll;
+
+extern bool             outProxy; // True means outgoing proxy
+
+extern bool             xrdProxy; // True means dest using xroot protocol
+
 extern XrdSysTrace      SysTrace;
 
 static const int maxHLen = 1024;
@@ -125,6 +144,10 @@ static const int maxHLen = 1024;
 namespace
 {
 XrdOucPsx *psxConfig;
+
+XrdSecsssID::authType sssMap;      // persona setting
+
+std::vector<const char *> protVec;    // Additional wanted protocols
 }
 
 using namespace XrdProxy;
@@ -133,7 +156,7 @@ using namespace XrdProxy;
 /*                             C o n f i g u r e                              */
 /******************************************************************************/
   
-int XrdPssSys::Configure(const char *cfn)
+int XrdPssSys::Configure(const char *cfn, XrdOucEnv *envP)
 {
 /*
   Function: Establish configuration at start up time.
@@ -155,13 +178,16 @@ int XrdPssSys::Configure(const char *cfn)
 //
    XrdOucEnv::Export("XRDXROOTD_NOPOSC", "1");
 
-// Create a configurator
+// Create a configurator. It will be deleted when we are done.
 //
-   psxConfig = new XrdOucPsx(myVersion, cfn, eDest.logger()); // Deleted later
+   psxConfig = new XrdOucPsx(myVersion, cfn, eDest.logger(), envP);
 
 // Set debug level if so wanted
 //
-   if (getenv("XRDDEBUG")) psxConfig->traceLvl = 4;
+   if (getenv("XRDDEBUG"))
+      {psxConfig->traceLvl = 4;
+       SysTrace.What |=  TRACEPSS_Debug;
+      }
 
 // Set the defaault number of worker threads for the client
 //
@@ -173,7 +199,11 @@ int XrdPssSys::Configure(const char *cfn)
 
 // Set default number of event loops
 //
-   XrdPosixConfig::SetEnv("ParallelEvtLoop", 3);
+   XrdPosixConfig::SetEnv("ParallelEvtLoop", 10);
+
+// Turn off the fork handler as we always exec after forking.
+//
+   XrdPosixConfig::SetEnv("RunForkHandler", 0);
 
 // Process the configuration file
 //
@@ -181,10 +211,14 @@ int XrdPssSys::Configure(const char *cfn)
 
 // Make sure we have some kind of origin
 //
-   if (!ManList && !outProxy)
+   if (!ManList && !outProxy && !fileOrgn)
       {eDest.Emsg("Config", "Origin for proxy service not specified.");
        return 1;
       }
+
+// Check if we should configure authentication security mapping
+//
+   if (sssMap && !ConfigMapID()) return 1;
 
 // Handle the local root here
 //
@@ -201,6 +235,28 @@ int XrdPssSys::Configure(const char *cfn)
        psxConfig->xLfn2Pfn = false;
       }
 
+// If we have a cache, indicate so in the feature set
+//
+   if(psxConfig->hasCache()) myFeatures |= XRDOSS_HASCACH;
+
+// If we need to reproxy, then open the directory where the reproxy information
+// will ne placed. The path is in the Env.
+//
+   if (reProxy)
+      {char *rPath;
+       if (!envP || !(rPath = envP->Get("tpc.rpdir")))
+          {eDest.Say("Config warning: ignoring 'pss.reproxy'; TPC is not enabled!");
+           reProxy = false;
+           myFeatures &= ~XRDOSS_HASRPXY;
+          } else {
+           rpFD = XrdSysFD_Open(rPath, O_DIRECTORY);
+           if (rpFD < 0)
+              {eDest.Emsg("Config", "to open reproxy directory", rPath);
+               return 1;
+              }
+          }
+      }
+
 // Finalize the configuration
 //
    if (!(psxConfig->ConfigSetup(eDest))) return 1;
@@ -213,14 +269,14 @@ int XrdPssSys::Configure(const char *cfn)
 //
    if (psxConfig->xLfn2Pfn) xLfn2Pfn = (theN2N = psxConfig->theN2N) != 0;
 
-// If we have a version 2 cache then save it and check if we need to tell
+// If we have a cache then save it and check if we need to tell
 // xrootd we allow a redirect on a read (this is complicated).
-//
-   if (psxConfig->theCache2 && dcaCTime)
-      {char buff[32];
-       sprintf(buff, "%d", dcaCTime);
-       XrdOucEnv::Export("XRDXROOTD_CACHERDRDR", buff);
-      }
+// ??? Why are we doing this
+// if (psxConfig->theCache2 && dcaCTime)
+//    {char buff[32];
+//     sprintf(buff, "%d", dcaCTime);
+//     XrdOucEnv::Export("XRDXROOTD_CACHERDRDR", buff);
+//    }
 
 // All done with the configurator
 //
@@ -248,20 +304,52 @@ int XrdPssSys::Configure(const char *cfn)
        return 1;
       }
 
+// Add any other protocols to the recognized list of protocol names
+//
+   if (protVec.size())
+      {for (int i = 0; i < (int)protVec.size(); i++)
+           {if (!XrdPosixXrootPath::AddProto(protVec[i]))
+               {eDest.Emsg("Config", "Unable to add", protVec[i],
+                                     "protocol to protocol list.");
+                return 1;
+               }
+           }
+       protVec.clear();
+      }
+
 // Construct the redirector name:port (we might not have one) export it
 //
    const char *outeq = (outProxy ? "= " : "");
    if (ManList) sprintf(theRdr, "%s%s:%d", outeq, ManList->text, ManList->val);
-      else strcpy(theRdr, outeq);
+      else if (fileOrgn) sprintf(theRdr, "%s%s", outeq, fileOrgn);
+              else strcpy(theRdr, outeq);
    XrdOucEnv::Export("XRDXROOTD_PROXY",  theRdr);
-   XrdOucEnv::Export("XRDXROOTD_ORIGIN", theRdr); // Backward compatability
+   XrdOucEnv::Export("XRDXROOTD_ORIGIN", theRdr); // Backward compatibility
+   if (HostArena) XrdOucEnv::Export("XRDXROOTD_PROXYARENA", HostArena); 
 
 // Construct the contact URL header
 //
    if (ManList)               //<prot><id>@<host>:<port>/<path>
-      {hdrLen = sprintf(theRdr, "%s%%s%s:%d/%%s",
-                        protName, ManList->text, ManList->val);
+      {hdrLen = sprintf(theRdr, "%s%%s%s:%d/%s%%s",
+                        protName, ManList->text, ManList->val,
+                        (HostArena ? HostArena : ""));
        hdrData = strdup(theRdr);
+      } else {
+       if (fileOrgn)
+//??      {if (!(myFeatures & XRDOSS_HASCACH))
+//            {eDest.Emsg("Config", "File origins only supported for caching proxies.");
+//             return 1;
+//            }
+          {hdrLen = sprintf(theRdr, "%s%s%%s", protName, fileOrgn);
+           hdrData = strdup(theRdr);
+          }
+      }
+
+// Export the URL
+//
+   if (hdrData && *hdrData)
+      {snprintf(theRdr, sizeof(theRdr), hdrData, "", "");
+       XrdOucEnv::Export("XRDXROOTD_PROXYURL", theRdr);
       }
 
 // Check if we have any r/w exports as this will determine whether or not we
@@ -280,6 +368,70 @@ int XrdPssSys::Configure(const char *cfn)
 /******************************************************************************/
 /*                     P r i v a t e   F u n c t i o n s                      */
 /******************************************************************************/
+/******************************************************************************/
+/*                           C o n f i g M a p I D                            */
+/******************************************************************************/
+  
+bool XrdPssSys::ConfigMapID()
+{
+   XrdSecsssCon *conTracker;
+   bool isOK, Debug = (SysTrace.What & TRACEPSS_Debug) != 0;
+
+// If this is a generic static ID mapping, we are done
+//
+   if (sssMap == XrdSecsssID::idStatic) return true;
+
+// For optimzation we also note if we have a cache in he way of the map
+//
+   deferID = psxConfig->hasCache();
+
+// Now that we did the cache thing, currently we don't support client personas
+// with a cache because aren't able to tell which client will be used.
+//
+   if (deferID)
+      {eDest.Emsg("Config", "Client personas are not supported for "
+                            "caching proxy servers.");
+       return false;
+      }
+
+// If this server is only a forwarding proxy server, we can't support client
+// personas either because we don't control the URL. However, if we have an
+// origin then simply warn that the client persona applies to the origin.
+//
+   if (outProxy)
+      {if (!ManList)
+          {eDest.Emsg("Config", "Client personas are not supported for "
+                                "strictly forwarding proxy servers.");
+           return false;
+          }
+       eDest.Say("Config warning: client personas only apply to "
+                 "the origin server!");
+      }
+
+// We need to get a connection tracker object from the posix interface.
+// However, we only need it if we are actually mapping id's.
+//
+   if (sssMap == XrdSecsssID::idStaticM) conTracker = 0;
+      else conTracker = XrdPosixConfig::conTracker(Debug);
+
+// Get an mapper object
+//
+   idMapper = new XrdSecsssID(sssMap, 0, conTracker, &isOK);
+   if (!isOK)
+      {eDest.Emsg("Config", "Unable to render persona; persona mapper failed!");
+       return false;
+      }
+
+// If ths is a server persona then we don't need the mapper; abandon it.
+//
+   if (sssMap == XrdSecsssID::idStaticM) idMapper = 0;
+      else XrdPssUrlInfo::setMapID(true);
+
+// We are all done
+//
+   return true;
+}
+
 /******************************************************************************/
 /*                            C o n f i g P r o c                             */
 /******************************************************************************/
@@ -305,6 +457,8 @@ int XrdPssSys::ConfigProc(const char *Cfn)
        return 1;
       }
    Config.Attach(cfgFD);
+   static const char *cvec[] = { "*** pss (oss) plugin config:", 0 };
+   Config.Capture(cvec);
 
 // Now start reading records until eof.
 //
@@ -315,7 +469,7 @@ int XrdPssSys::ConfigProc(const char *Cfn)
             if (ConfigXeq(var+4, Config)) {Config.Echo(); NoGo = 1;}
         }
 
-// Now check if any errors occured during file i/o
+// Now check if any errors occurred during file i/o
 //
    if ((retc = Config.LastError()))
       NoGo = eDest.Emsg("Config", retc, "read config file", Cfn);
@@ -354,8 +508,16 @@ int XrdPssSys::ConfigXeq(char *var, XrdOucStream &Config)
    TS_PSX("inetmode",      ParseINet);
    TS_Xeq("origin",        xorig);
    TS_Xeq("permit",        xperm);
+   TS_Xeq("persona",       xpers);
    TS_PSX("setopt",        ParseSet);
    TS_PSX("trace",         ParseTrace);
+
+   if (!strcmp("reproxy", var))
+      {myFeatures |= XRDOSS_HASRPXY;
+       reProxy = true;
+       Config.GetWord(); // Force echo
+       return 0;
+      }
 
    // Copy the variable name as this may change because it points to an
    // internal buffer in Config. The vagaries of effeciency. Then get value.
@@ -368,6 +530,7 @@ int XrdPssSys::ConfigXeq(char *var, XrdOucStream &Config)
 
    // Match directives that take a single argument
    //
+   TS_String("hostarena",  HostArena);
    TS_String("localroot",  LocalRoot);
 
    // No match found, complain.
@@ -375,41 +538,6 @@ int XrdPssSys::ConfigXeq(char *var, XrdOucStream &Config)
    eDest.Say("Config warning: ignoring unknown directive '",var,"'.");
    Config.Echo();
    return 0;
-}
-  
-/******************************************************************************/
-/*                             g e t D o m a i n                              */
-/******************************************************************************/
-
-const char *XrdPssSys::getDomain(const char *hName)
-{
-   const char *dot = index(hName, '.');
-
-   if (dot) return dot+1;
-   return hName;
-}
-  
-/******************************************************************************/
-/*                               v a l P r o t                                */
-/******************************************************************************/
-
-const char *XrdPssSys::valProt(const char *pname, int &plen, int adj)
-{
-   static  struct pEnt {const char *pname; int pnlen;} pTab[] =
-                       {{ "http://", 7},  { "https://", 8},
-                        { "root://", 7},//{ "roots://", 8},
-                        {"xroot://", 8} //{"xroots://", 9},
-                       };
-   static int pTNum = sizeof(pTab)/sizeof(pEnt);
-   int i;
-
-// Find a match
-//
-   for (i = 0; i < pTNum; i++)
-       {if (!strncmp(pname, pTab[i].pname, pTab[i].pnlen-adj)) break;}
-   if (i >= pTNum) return 0;
-   plen = pTab[i].pnlen-adj;
-   return pTab[i].pname;
 }
   
 /******************************************************************************/
@@ -468,9 +596,11 @@ do{for (i = 0; i < numopts; i++) if (!strcmp(Xopts[i].Key, val)) break;
 
 /* Function: xdca
 
-   Purpose:  To parse the directive: dca [recheck {<tm> | off}]
+   Purpose:  To parse the directive: dca [group|world] [recheck {<tm> | off}]
 
              <tm>      recheck for applicability every <tm> interval
+             world     When specified, files are made world deadable.
+                       Otherwise, they are only made group readable.
 
    Output: 0 upon success or 1 upon failure.
 */
@@ -484,28 +614,29 @@ int XrdPssSys::xdca(XrdSysError *errp, XrdOucStream &Config)
 //
    dcaCheck = true;
    dcaCTime = 0;
+   dcaWorld = false;
 
 // If no options then we are done
 //
-    if (!(val = Config.GetWord())) return 0;
+   while((val = Config.GetWord()))
+        {     if (!strcmp(val, "world")) dcaWorld = true;
+         else if (!strcmp(val, "group")) dcaWorld = false;
+         else if (!strcmp(val, "recheck"))
+                 {if (!strcmp(val, "off")) dcaCTime = 0;
+                     else {if (!(val = Config.GetWord()))
+                              {errp->Emsg("Config",
+                                          "dca recheck value not specified");
+                               return 1;
+                              }
+                           if (XrdOuca2x::a2tm(*errp,"dca recheck",val,
+                                               &dcaCTime,10,maxsz)) return 1;
+                          }
+                 }
+         else {errp->Emsg("Config","invalid dca option -", val); return 1;}
+        }
 
-// Only one keyword we support
+// All done
 //
-   if (strcmp(val, "recheck"))
-       {errp->Emsg("Config","invalid dca option -", val); return 1;}
-
-//  Get the parameter
-//
-    if (!(val = Config.GetWord()))
-       {errp->Emsg("Config","dca recheck value not specified"); return 1;}
-
-// Check for "off"
-//
-   if (!strcmp(val, "off")) {dcaCTime = 0; return 0;}
-
-// Get the parameter
-//
-   if (XrdOuca2x::a2tm(*errp,"dca recheck",val,&dcaCTime,10,maxsz)) return 1;
    return 0;
 }
   
@@ -564,10 +695,8 @@ int XrdPssSys::xexp(XrdSysError *Eroute, XrdOucStream &Config)
 
 /* Function: xorig
 
-   Purpose:  Parse: origin {= [<dest>] | <dest>}
-   Purpose:  Parse: origin [<prot>] {= [<dest>] | <dest>}
+   Purpose:  Parse: origin {=[<prot>,<prot>,...] [<dest>] | <dest>}
 
-                                                                                 d
    where:    <dest> <host>[+][:<port>|<port>] or a URL of the form
                     <prot>://<dest>[:<port>] where <prot> is one
                     http, https, root, xroot
@@ -589,22 +718,61 @@ int XrdPssSys::xorig(XrdSysError *errp, XrdOucStream &Config)
 
 // Check for outgoing proxy
 //
-   if (!strcmp(val, "="))
-      {pfxProxy = outProxy = true;
+   if (*val == '=')
+      {outProxy = true;
+       if (*(val+1))
+          {std::vector<char *> pVec;
+           char *pData = strdup(val+1);
+           const char *pName;
+           protVec.clear();
+           if (!XrdPssUtils::Vectorize(pData, pVec, ','))
+              {errp->Emsg("Config", "Malformed forwarding specification");
+               free(pData);
+               return 1;
+              }
+           protVec.reserve(pVec.size());
+           for (int i = 0; i < (int)pVec.size(); i++)
+               {int n = strlen(pVec[i]);
+                if (!(pName = XrdPssUtils::valProt(pVec[i], n, 3)))
+                   {errp->Emsg("Config","Unsupported forwarding protocol -",pVec[i]);
+                    free(pData);
+                    return 1;
+                   }
+                protVec.push_back(pName);
+               }
+           free(pData);
+          }
        if (!(val = Config.GetWord())) return 0;
       }
-      else pfxProxy = outProxy = false;
+      else outProxy = false;
+
+// We must always cleanup the file origin if it exists
+//
+   if (fileOrgn) {free(fileOrgn); fileOrgn = 0;}
+
+// Check if dest is some local filesystem
+//
+   if (*val == '/')
+      {char *vP = val +strlen(val) - 1;
+       while(*vP == '/'&& vP != val) {*vP-- = 0;}
+       if (ManList) {delete ManList; ManList = 0;}
+       protName = "file://";
+       fileOrgn = strdup(val);
+       return 0;
+      }
+
 
 // Check if the <dest> is a url, if so, the protocol, must be supported
 //
    if ((colon = index(val, ':')) && *(colon+1) == '/' && *(colon+2) == '/')
       {int pnlen;
-       protName = valProt(val, pnlen);
+       protName = XrdPssUtils::valProt(val, pnlen);
        if (!protName)
           {errp->Emsg("Config", "Unsupported origin protocol -", val);
            return 1;
           }
        if (*val == 'x') protName++;
+       xrdProxy = (*val == 'r');
        val += pnlen;
        if ((slash = index(val, '/')))
           {if (*(slash+1))
@@ -617,12 +785,13 @@ int XrdPssSys::xorig(XrdSysError *errp, XrdOucStream &Config)
        protName = "root://";
        mval = strdup(val);
        isURL = false;
+       xrdProxy = true;
       }
 
 // Check if there is a port number. This could be as ':port' or ' port'.
 //
     if (!(val = index(mval,':')) && !isURL) val = Config.GetWord();
-       else {*val = '\0'; val++;}
+       else if (val) {*val = '\0'; val++;}
 
 // At this point, make sure we actually have a host name
 //
@@ -640,7 +809,17 @@ int XrdPssSys::xorig(XrdSysError *errp, XrdOucStream &Config)
                     {errp->Emsg("Config", "unable to find tcp service", val);
                      port = 0;
                     }
-       } else errp->Emsg("Config","origin port not specified for",mval);
+       } else {
+         if (protName) {
+           // use default port for protocol
+           port = *protName == 'h' ? (strncmp(protName, "https", 5) == 0 ? 443 : 80) : 1094;
+         } else {
+           // assume protocol is root(s)://
+           port = 1094;
+         }
+         errp->Say("Config warning: origin port not specified, using port ",
+           std::to_string(port).c_str(), " as default for ", protName);
+       }
 
 // If port is invalid or missing, fail this
 //
@@ -665,8 +844,10 @@ int XrdPssSys::xorig(XrdSysError *errp, XrdOucStream &Config)
 // We now set the default dirlist flag based on whether the origin is in or out
 // of domain. Composite listings are normally disabled for out of domain nodes.
 //
-   if (!index(mval, '.') || !strcmp(getDomain(mval), getDomain(myHost)))
-      XrdPosixXrootd::setEnv("DirlistDflt", 1);
+   if (!index(mval, '.')
+   || (!strcmp(XrdPssUtils::getDomain(mval), XrdPssUtils::getDomain(myHost))
+       && !strcmp(protName, "http://") && !strcmp(protName, "https://")))
+      XrdPosixConfig::SetEnv("DirlistDflt", 1);
 
 // All done
 //
@@ -710,5 +891,72 @@ do {if (!(val = Config.GetWord()))
             }
         }
 
+    return 0;
+}
+  
+/******************************************************************************/
+/*                                 x p e r s                                  */
+/******************************************************************************/
+
+/* Function: xpers
+
+   Purpose:  To parse the directive: persona {client | server} [options]
+
+   options:  [[non]strict] [[no]verify]
+
+                    client    proxy client's identity via sss authentication
+                    server    use server's identity at end point
+                    strict    all requests must use the client persona
+                    nonstrict certain requests can use a server persona
+                    noverify  do not verify endpoint
+                    verify    verify endpoint
+
+   Output: 0 upon success or !0 upon failure.
+*/
+
+int XrdPssSys::xpers(XrdSysError *Eroute, XrdOucStream &Config)
+{   char *val;
+    bool isClient = false, strict = false;
+    int doVer = -1;
+
+// Make sure a parameter was specified
+//
+   if (!(val = Config.GetWord()))
+      {Eroute->Emsg("Config", "persona not specified"); return 1;}
+
+// Check for persona
+//
+        if (!strcmp(val, "client")) isClient = true;
+   else if (!strcmp(val, "server")) isClient = false;
+   else {Eroute->Emsg("Config", "Invalid persona - ", val); return 1;}
+
+// Process the subsequent options
+//
+   while ((val = Config.GetWord()))
+         {     if (!strcmp(val, "strict"     )) strict = true;
+          else if (!strcmp(val, "nonstrict"  )) strict = false;
+          else if (!strcmp(val, "verify"     )) doVer  = 1;
+          else if (!strcmp(val, "noverify"   )) doVer  = 0;
+          else {Eroute->Emsg("Config", "Invalid persona option - ", val);
+                return 1;
+               }
+      }
+
+// Resolve options vs persona
+//
+   if (isClient)
+      {idMapAll = (strict ? true : false);
+       if (doVer < 0) doVer = 1;
+      }
+
+// Now record the information for future processin
+//
+   if (isClient) sssMap = (doVer ? XrdSecsssID::idMappedM
+                                 : XrdSecsssID::idMapped);
+      else       sssMap = (doVer ? XrdSecsssID::idStaticM
+                                 : XrdSecsssID::idStatic);
+
+// All done
+//
     return 0;
 }

@@ -30,11 +30,12 @@
 
 #ifndef WIN32
 #include <unistd.h>
-#include <errno.h>
+#include <cctype>
+#include <cerrno>
 #include <fcntl.h>
 #include <poll.h>
-#include <stdio.h>
-#include <stdlib.h>
+#include <cstdio>
+#include <cstdlib>
 #include <strings.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -43,10 +44,10 @@
 #include <sys/stat.h>
 #include <sys/un.h>
 #else
-#include <errno.h>
+#include <cerrno>
 #include <fcntl.h>
-#include <stdio.h>
-#include <stdlib.h>
+#include <cstdio>
+#include <cstdlib>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <Winsock2.h>
@@ -239,9 +240,9 @@ int XrdNetSocket::Open(const char *inpath, int port, int flags, int windowsz)
    if ((eText = SockInfo.Set(inpath,(port < 0 ? XrdNetAddr::PortInSpec:port))))
       {ErrCode = EHOSTUNREACH;
        if (eroute)
-          {char buff[256];
-           snprintf(buff, sizeof(buff), "'; %s", eText);
-           eroute->Emsg("Open", "Unable to create socket for '", epath, buff);
+          {char buff[512];
+           snprintf(buff,sizeof(buff),"'%s'; %c%s",epath,tolower(*eText),eText+1);
+           eroute->Emsg("Open", "Unable to create socket for", buff);
           }
        return -1;
       }
@@ -346,7 +347,9 @@ int XrdNetSocket::setOpts(int xfd, int opts, XrdSysError *eDest)
 {
    int rc = 0;
    const int one = 1;
+#if defined(__linux__) || defined(__GNU__)
    const int szint = sizeof(int);
+#endif
    const SOCKLEN_t szone = (SOCKLEN_t)sizeof(one);
    static int tcpprotid = XrdNetUtils::ProtoID("tcp");
    static struct linger liopts = {1, XRDNETSOCKET_LINGER};
@@ -370,7 +373,7 @@ int XrdNetSocket::setOpts(int xfd, int opts, XrdSysError *eDest)
           {rc = 1;
            if (eDest) eDest->Emsg("setOpts", errno, "set socket KEEPALIVE");
           }
-#ifdef __linux__
+#if defined(__linux__) || defined(__GNU__)
            else if (opts & XRDNET_SERVER) // Following are inherited in Linux
       {if (XrdNetSocketCFG::ka_Idle
        &&  setsockopt(xfd,SOL_TCP,TCP_KEEPIDLE,&XrdNetSocketCFG::ka_Idle,szint))
@@ -424,6 +427,23 @@ int XrdNetSocket::setWindow(int xfd, int Windowsz, XrdSysError *eDest)
 }
 
 /******************************************************************************/
+/*                              S o c k N a m e                               */
+/******************************************************************************/
+
+int XrdNetSocket::SockName(char *buff, int blen)
+{
+
+// Make sure we have something here
+//
+   if (SockFD < 0) {*buff = 0; return ENOTSOCK;}
+
+// Format the name
+//
+   if (!SockInfo.Format(buff, blen)) return EINVAL;
+   return 0;
+}
+  
+/******************************************************************************/
 /*                            s o c k e t P a t h                             */
 /******************************************************************************/
 
@@ -476,7 +496,7 @@ char *XrdNetSocket::socketPath(XrdSysError *Say, char *fnbuff,
            return 0;
           }
        if (access(fnbuff, W_OK))
-          {Say->Emsg("cratePath", errno, "access path", fnbuff);
+          {Say->Emsg("createPath", errno, "access path", fnbuff);
            return 0;
           }
       } else chmod(fnbuff, mode); // This may fail on some platforms

@@ -28,13 +28,12 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
   
-#include <errno.h>
 #include <fcntl.h>
 #include <grp.h>
-#include <string.h>
-#include <time.h>
+#include <cstring>
+#include <ctime>
 #include <pwd.h>
-#include <stdio.h>
+#include <cstdio>
 #include <unistd.h>
 #include <sys/param.h>
 #include <sys/types.h>
@@ -52,6 +51,8 @@
 #include "XrdOuc/XrdOucExport.hh"
 #include "XrdOuc/XrdOucTList.hh"
 #include "XrdOuc/XrdOucTokenizer.hh"
+#include "XrdSys/XrdSysE2T.hh"
+#include "XrdSys/XrdSysPlatform.hh"
 #include "XrdSys/XrdSysTimer.hh"
 
 using namespace XrdFrc;
@@ -283,7 +284,6 @@ int XrdFrmAdmin::Find()
    else if (Abbrev(Opt.Args[0], "mmapped",   4)) return FindMmap(Spec);
    else if (Abbrev(Opt.Args[0], "nocs",      4)) return FindNocs(Spec);
    else if (Abbrev(Opt.Args[0], "nochksum",  8)) return FindNocs(Spec);
-   else if (Abbrev(Opt.Args[0], "nolkfiles", 4)) return FindNolk(Spec);
    else if (Abbrev(Opt.Args[0], "pinned",    3)) return FindPins(Spec);
    else if (Abbrev(Opt.Args[0], "unmigrated",4)) return FindUnmi(Spec);
 
@@ -711,7 +711,6 @@ int XrdFrmAdmin::xeqArgs(char *Cmd)
                          }
                  CmdTab[] = {{"audit",  5, 5, &XrdFrmAdmin::Audit},
                              {"chksum", 6, 6, &XrdFrmAdmin::Chksum},
-                             {"convert",7, 7, &XrdFrmAdmin::Convert},
                              {"exit",   4, 4, &XrdFrmAdmin::Quit},
                              {"find",   1, 4, &XrdFrmAdmin::Find},
                              {"help",   1, 4, &XrdFrmAdmin::Help},
@@ -823,9 +822,7 @@ void XrdFrmAdmin::Emsg(int ec, const char *tx2, const char *tx3,
    char buff[128];
 
    if (!ec) Say.Say(tx2, tx3, tx4, tx5);
-      else {strcpy(buff+2, strerror(ec));
-            if (strncmp(buff+2, "Unknown", 7)) buff[2] = tolower(buff[2]);
-               else sprintf(buff+2, "error %d", ec);
+      else {strcpy(buff+2, XrdSysE2T(ec));
             buff[0] = ';'; buff[1] = ' ';
             Say.Say("frm_admin: Unable to ", tx2, tx3, tx4, tx5, buff);
            }

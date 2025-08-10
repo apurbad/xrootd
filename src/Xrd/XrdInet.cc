@@ -27,10 +27,10 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <ctype.h>
-#include <errno.h>
+#include <cctype>
+#include <cerrno>
 #include <netdb.h>
-#include <stdio.h>
+#include <cstdio>
 #include <unistd.h>
 #include <sys/types.h>
 
@@ -42,9 +42,8 @@
 #include "XrdSys/XrdSysError.hh"
 
 #include "Xrd/XrdInet.hh"
-#include "Xrd/XrdLink.hh"
+#include "Xrd/XrdLinkCtl.hh"
 
-#define XRD_TRACE XrdTrace->
 #include "Xrd/XrdTrace.hh"
 
 #include "XrdNet/XrdNetAddr.hh"
@@ -89,7 +88,7 @@ XrdLink *XrdInet::Accept(int opts, int timeout, XrdSysSemaphore *theSem)
          if (!(anum%60)) eDest->Emsg("Accept", "Unable to accept connections!");
         }
 
-// If authorization was defered, tell call we accepted the connection but
+// If authorization was deferred, tell call we accepted the connection but
 // will be doing a background check on this connection.
 //
    if (theSem) theSem->Post();
@@ -111,12 +110,12 @@ XrdLink *XrdInet::Accept(int opts, int timeout, XrdSysSemaphore *theSem)
 
 // Allocate a new network object
 //
-   if (!(lp = XrdLink::Alloc(myAddr, lnkopts)))
+   if (!(lp = XrdLinkCtl::Alloc(myAddr, lnkopts)))
       {eDest->Emsg("Accept", ENOMEM, "allocate new link for", myAddr.Name(unk));
        close(myAddr.SockFD());
       } else {
-       TRACE(NET, "Accepted connection from " <<myAddr.SockFD()
-                  <<'@' <<myAddr.Name(unk));
+       TRACE(NET, "Accepted connection on port " <<Portnum <<" from "
+                  <<myAddr.SockFD() <<'@' <<myAddr.Name(unk));
       }
 
 // All done
@@ -196,7 +195,7 @@ XrdLink *XrdInet::Connect(const char *host, int port, int opts, int tmo)
 
 // Return a link object
 //
-   if (!(lp = XrdLink::Alloc(myAddr, lnkopts)))
+   if (!(lp = XrdLinkCtl::Alloc(myAddr, lnkopts)))
       {eDest->Emsg("Connect", ENOMEM, "allocate new link to", myAddr.Name(unk));
        close(myAddr.SockFD());
       } else {

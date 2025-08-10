@@ -42,10 +42,12 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <dirent.h>
+#include <cerrno>
 
 namespace
 {
-#if defined(__linux__) && defined(SOCK_CLOEXEC) && defined(O_CLOEXEC)
+#if ( defined(__linux__) || defined(__GNU__) ) && defined(SOCK_CLOEXEC) && defined(O_CLOEXEC)
 inline int  XrdSysFD_Accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen)
                  {return accept4(sockfd, addr, addrlen, SOCK_CLOEXEC);}
 
@@ -63,6 +65,14 @@ inline int  XrdSysFD_Open(const char *path, int flags)
 
 inline int  XrdSysFD_Open(const char *path, int flags, mode_t mode)
                  {return open(path, flags|O_CLOEXEC, mode);}
+
+inline DIR* XrdSysFD_OpenDir(const char *path)
+                 {int fd;
+                  if ((fd = open(path, O_RDONLY|O_CLOEXEC)) < 0) return 0;
+                  DIR *dP = fdopendir(fd);
+                  if (!dP) {int rc = errno; close(fd); errno = rc;}
+                  return dP;
+                 }
 
 inline int  XrdSysFD_Pipe(int pipefd[2])
                  {return pipe2(pipefd, O_CLOEXEC);}
@@ -109,6 +119,15 @@ inline int  XrdSysFD_Open(const char *path, int flags, mode_t mode)
                   return newfd;
                  }
 
+inline DIR* XrdSysFD_OpenDir(const char *path)
+                 {int fd = XrdSysFD_Open(path, O_RDONLY);
+                  if (fd < 0) return 0;
+                  fcntl(fd, F_SETFD, FD_CLOEXEC);
+                  DIR *dP = fdopendir(fd);
+                  if (!dP) {int rc = errno; close(fd); errno = rc;}
+                  return dP;
+                 }
+
 inline int  XrdSysFD_Pipe(int pipefd[2])
                  {int rc = pipe(pipefd);
                   if (!rc) {fcntl(pipefd[0], F_SETFD, FD_CLOEXEC);
@@ -131,6 +150,10 @@ inline int  XrdSysFD_Socketpair(int domain, int type, int protocol, int sfd[2])
                   return rc;
                  }
 #endif
+
+// openat is part of POSIX.1-2008; in Linux, BSD, and Solaris
+inline int  XrdSysFD_Openat(int dirfd, const char *pathname, int flags)
+                 {return openat(dirfd, pathname, flags | O_CLOEXEC);}
 
 inline bool XrdSysFD_Yield(int fd)
                   {int fdFlags = fcntl(fd, F_GETFD);

@@ -44,16 +44,17 @@
 #if !defined(__APPLE__) && !defined(__CYGWIN__)
 #include <link.h>
 #endif
-#include <stdio.h>
+#include <cstdio>
 #include <strings.h>
 #include <sys/types.h>
-#include <errno.h>
+#include <cerrno>
 #else
 #include "XrdSys/XrdWin32.hh"
 #endif
   
 #include "XrdSys/XrdSysError.hh"
 #include "XrdSys/XrdSysHeaders.hh"
+#include "XrdSys/XrdSysPlatform.hh"
 #include "XrdSys/XrdSysPlugin.hh"
 #include "XrdVersion.hh"
 #include "XrdVersionPlugin.hh"
@@ -84,10 +85,12 @@ XrdSysPlugin::cvResult XrdSysPlugin::badVersion(XrdVersionInfo &urInfo,
    const char *path;
    char buff1[512], buff2[128];
 
-   if (minv > 99) minv = 99;
+   if (minv < 0) strcpy(buff2, "y");
+      else sprintf(buff2, "%d", minv);
+
    snprintf(buff1, sizeof(buff1), "version %s is incompatible with %s "
-                                  "(must be %c= %d.%d.x)",
-                                   myInfo->vStr, urInfo.vStr, mmv, majv, minv);
+                                  "(must be %c= %d.%s.x)",
+                                   myInfo->vStr, urInfo.vStr, mmv, majv, buff2);
 
    path = msgSuffix(" in ", buff2, sizeof(buff2));
 
@@ -170,7 +173,7 @@ XrdSysPlugin::cvResult XrdSysPlugin::chkVersion(XrdVersionInfo &urInfo,
    if (myInfo->vNum == XrdVNUMUNK || urInfo.vNum == XrdVNUMUNK)
       {if (eDest)
           {char mBuff[128];
-           sprintf(buff, "%s%s is using %s%s version",
+           snprintf(buff, sizeof(buff), "%s%s is using %s%s version",
                    (myInfo->vNum == XrdVNUMUNK ? "unreleased ":""),myInfo->vStr,
                    (urInfo.vNum  == XrdVNUMUNK ? "unreleased ":""),urInfo.vStr);
            msgSuffix(" in ", mBuff, sizeof(mBuff));
@@ -188,31 +191,29 @@ XrdSysPlugin::cvResult XrdSysPlugin::chkVersion(XrdVersionInfo &urInfo,
 
 // The major version must always be compatible
 //
-   if ((vinP->vMajLow >= 0 && pMajor <  vinP->vMajLow)
-   ||  (vinP->vMajLow <  0 && pMajor != vMajor))
+   if (vinP->vMajLow >= 0 && pMajor <  vinP->vMajLow)
       return badVersion(urInfo, '>', vinP->vMajLow, vinP->vMinLow);
 
-// The major version may not be greater than our versin
+   if (vinP->vMajLow <  0 && pMajor != vMajor)
+      return badVersion(urInfo, '=', vMajor, -1);
+
+// The plugin version may not be greater than our version)
 //
-   if (pMajor > vMajor) return badVersion(urInfo, '<', vMajor, vMinor);
+   if (pMajor > vMajor || (pMajor == vMajor && pMinor > vMinor))
+      return badVersion(urInfo, '<', vMajor, vMinor);
 
 // If we do not need to check minor versions then we are done
 //
-   if (vinP->vMinLow > 99) return cvClean;
-
-// In no case can the plug-in mnor version be greater than our version
-//
-   if (pMajor == vMajor && pMinor > vMinor)
-      return badVersion(urInfo, '<', vMajor, vMinor);
+   if (vinP->vMinLow < 0) return cvClean;
 
 // Verify compatible minor versions
 //
-   if ((vinP->vMinLow >= 0 && pMinor >= vinP->vMinLow)
-   ||  (vinP->vMinLow <  0 && pMinor == vMinor)) return cvClean;
+   if (pMajor == vinP->vMajLow && pMinor < vinP->vMinLow)
+      return badVersion(urInfo, '>', vinP->vMajLow, vinP->vMinLow);
 
-// Incompatible versions
+// Compatible versions
 //
-   return badVersion(urInfo, '>', vinP->vMajLow, vinP->vMinLow);
+   return cvClean;
 }
 
 /******************************************************************************/
@@ -248,20 +249,21 @@ void *XrdSysPlugin::Find(const char *libpath)
 }
 
 /******************************************************************************/
-/*                             g e t P l u g i n                              */
+/*                            g e t L i b r a r y                             */
 /******************************************************************************/
-
-void *XrdSysPlugin::getPlugin(const char *pname, int optional)
+  
+void *XrdSysPlugin::getLibrary(bool allMsgs, bool global)
 {
-   return getPlugin(pname, optional, false);
-}
+   void *myHandle;
+   int   flags;
 
-void *XrdSysPlugin::getPlugin(const char *pname, int optional, bool global)
-{
-   XrdVERSIONINFODEF(urInfo, unknown, XrdVNUMUNK, "");
-   void *ep, *myHandle;
-   cvResult cvRC;
-   int flags;
+// Check if we should use the preload list
+//
+   if (!(myHandle = libHandle) && plList) myHandle = Find(libPath);
+
+// If already open, return the handle
+//
+   if (myHandle) return myHandle;
 
 // If no path is given then we want to just search the executable. This is easy
 // for some platforms and more difficult for others. So, we do the best we can.
@@ -276,26 +278,48 @@ void *XrdSysPlugin::getPlugin(const char *pname, int optional, bool global)
 #endif
       }
 
-// Check if we should use the preload list
+// Try to open this library or the executable image
 //
-   if (!(myHandle = libHandle) && plList) myHandle = Find(libPath);
+   if ((myHandle = dlopen(libPath, flags))) libHandle = myHandle;
+      else {const char *eTxt = dlerror();
+            if (strcasestr(eTxt, "no such file")) errno = ENOENT;
+               else errno = ENOEXEC;
+            if (allMsgs || errno != ENOENT) libMsg(eTxt, " loading ");
+           }
+
+// All done
+//
+   return myHandle;
+}
+
+/******************************************************************************/
+/*                             g e t P l u g i n                              */
+/******************************************************************************/
+
+void *XrdSysPlugin::getPlugin(const char *pname, int optional)
+{
+   return getPlugin(pname, optional, false);
+}
+
+void *XrdSysPlugin::getPlugin(const char *pname, int optional, bool global)
+{
+   XrdVERSIONINFODEF(urInfo, unknown, XrdVNUMUNK, "");
+   void *ep, *myHandle;
+   cvResult cvRC;
 
 // Open whatever it is we need to open
 //
-   if (!myHandle)
-      {if ((myHandle = dlopen(libPath, flags))) libHandle = myHandle;
-          else {if (optional < 2) libMsg(dlerror(), " loading "); return 0;}
-      }
+   if (!(myHandle = getLibrary(optional < 2, global))) return 0;
 
 // Get the symbol. In the environment we have defined, null values are not
 // allowed and we will issue an error.
 //
    if (!(ep = dlsym(myHandle, pname)))
-      {if (optional < 2) libMsg(dlerror(), " plugin %s in ", pname);
+      {if (optional < 2) libMsg(dlerror(), " symbol %s in ", pname);
        return 0;
       }
 
-// Check if we need to verify version compatability
+// Check if we need to verify version compatibility
 //
    if ((cvRC = chkVersion(urInfo, pname, myHandle)) == cvBad) return 0;
 
@@ -307,7 +331,7 @@ void *XrdSysPlugin::getPlugin(const char *pname, int optional, bool global)
        msgSuffix(" from ", buff, sizeof(buff));
        msgCnt--;
             if (cvRC == cvClean)
-               {const char *wTxt=(urInfo.vNum == XrdVNUMUNK ? "unreleased ":0);
+               {const char *wTxt=(urInfo.vNum == XrdVNUMUNK ? "unreleased ":"");
                 Inform("loaded ", wTxt, urInfo.vStr, buff, libPath);
                }
        else if (cvRC == cvMissing)
@@ -374,7 +398,7 @@ XrdSysPlugin::cvResult XrdSysPlugin::libMsg(const char *txt1, const char *txt2,
 //
         if (mSym)
            {if (!txt1 || strstr(txt1, "undefined"))
-               {txt1 = "Unable to find ";
+               {txt1 = "Unable to find";
                 snprintf(nBuff, sizeof(nBuff), txt2, mSym);
                } else {
                 strcpy(nBuff, fndg);
@@ -472,7 +496,7 @@ bool XrdSysPlugin::VerCmp(XrdVersionInfo &vInfo1,
       else mTxt = " which is incompatible!";
 
    if (!noMsg)
-      cerr <<"Plugin: " <<v1buff <<" is using " <<v2buff <<mTxt <<endl;
+      std::cerr <<"Plugin: " <<v1buff <<" is using " <<v2buff <<mTxt <<std::endl;
 
    return (*mTxt == 0);
 }

@@ -29,41 +29,47 @@
 /******************************************************************************/
 
 #include <unistd.h>
-#include <ctype.h>
-#include <errno.h>
+#include <cctype>
+#include <cerrno>
 #include <fcntl.h>
 #include <netdb.h>
-#include <stdlib.h>
+#include <cstdlib>
 #include <strings.h>
-#include <stdio.h>
+#include <cstdio>
 #include <netinet/in.h>
 #include <sys/param.h>
 #include <sys/stat.h>
 
 #include "XrdVersion.hh"
+#include "XProtocol/XProtocol.hh"
 
 #include "XrdCks/XrdCks.hh"
 
 #include "XrdNet/XrdNetUtils.hh"
 
+#include "XrdSfs/XrdSfsFlags.hh"
+
 #include "XrdOfs/XrdOfs.hh"
+#include "XrdOfs/XrdOfsConfigCP.hh"
 #include "XrdOfs/XrdOfsConfigPI.hh"
 #include "XrdOfs/XrdOfsEvs.hh"
+#include "XrdOfs/XrdOfsFSctl_PI.hh"
 #include "XrdOfs/XrdOfsPoscq.hh"
 #include "XrdOfs/XrdOfsStats.hh"
 #include "XrdOfs/XrdOfsTPC.hh"
+#include "XrdOfs/XrdOfsTPCConfig.hh"
 #include "XrdOfs/XrdOfsTrace.hh"
 
 #include "XrdOss/XrdOss.hh"
 
 #include "XrdOuc/XrdOuca2x.hh"
 #include "XrdOuc/XrdOucEnv.hh"
-#include "XrdSys/XrdSysError.hh"
-#include "XrdSys/XrdSysHeaders.hh"
 #include "XrdOuc/XrdOucNSWalk.hh"
 #include "XrdOuc/XrdOucStream.hh"
-#include "XrdOuc/XrdOucTrace.hh"
 #include "XrdOuc/XrdOucUtils.hh"
+
+#include "XrdSys/XrdSysError.hh"
+#include "XrdSys/XrdSysHeaders.hh"
 
 #include "XrdNet/XrdNetAddr.hh"
 
@@ -79,7 +85,9 @@
 
 extern XrdOfsStats OfsStats;
 
-extern XrdOucTrace OfsTrace;
+extern XrdSysTrace OfsTrace;
+
+extern XrdOfs*     XrdOfsFS;
   
 class  XrdOss;
 extern XrdOss     *XrdOfsOss;
@@ -89,10 +97,13 @@ class  XrdScheduler;
 
 XrdVERSIONINFO(XrdOfs,XrdOfs);
 
+namespace XrdOfsTPCParms
+{
+extern XrdOfsTPCConfig  Cfg;
+}
+
 namespace
 {
-XrdOfsTPC::iParm  Parms;          // TPC parameters
-
 int SetMode(const char *path, mode_t mode) {return chmod(path, mode);}
 }
 
@@ -136,11 +147,9 @@ int XrdOfs::Configure(XrdSysError &Eroute, XrdOucEnv *EnvInfo) {
 
   Output:   0 upon success or !0 otherwise.
 */
-//?extern XrdOss *XrdOssGetSS(XrdSysLogger *, const char *, const char *,
-//?                           const char   *, XrdOucEnv  *, XrdVersionInfo &);
    char *var;
    const char *tmp;
-   int  i, j, cfgFD, retc, NoGo = 0;
+   int   cfgFD, retc, NoGo = 0;
    XrdOucEnv myEnv;
    XrdOucStream Config(&Eroute, getenv("XRDINSTANCE"), &myEnv, "=====> ");
 
@@ -168,7 +177,7 @@ int XrdOfs::Configure(XrdSysError &Eroute, XrdOucEnv *EnvInfo) {
 
 // Allocate a our plugin configurator
 //
-   ofsConfig = XrdOfsConfigPI::New(ConfigFN, &Config, &Eroute);
+   ofsConfig = XrdOfsConfigPI::New(ConfigFN, &Config, &Eroute, 0, this);
 
 // If there is no config file, return with the defaults sets.
 //
@@ -181,6 +190,8 @@ int XrdOfs::Configure(XrdSysError &Eroute, XrdOucEnv *EnvInfo) {
               return Eroute.Emsg("Config", errno, "open config file",
                                  ConfigFN);
            Config.Attach(cfgFD);
+           static const char *cvec[] = {"*** ofs plugin config:",0};
+           Config.Capture(cvec);
 
            // Now start reading records until eof.
            //
@@ -196,7 +207,7 @@ int XrdOfs::Configure(XrdSysError &Eroute, XrdOucEnv *EnvInfo) {
                             }
                 }
 
-           // Now check if any errors occured during file i/o
+           // Now check if any errors occurred during file i/o
            //
            if ((retc = Config.LastError()))
            NoGo = Eroute.Emsg("Config", -retc, "read config file",
@@ -208,21 +219,10 @@ int XrdOfs::Configure(XrdSysError &Eroute, XrdOucEnv *EnvInfo) {
 //
    if (ossRW == ' ') ossRW = 'w';
 
-// Check if redirection wanted
+// Adjust the umask to correspond to the maximum mode allowed
 //
-   if (getenv("XRDREDIRECT")) i  = isManager;
-      else i = 0;
-   if (getenv("XRDRETARGET")) i |= isServer;
-   if (getenv("XRDREDPROXY")) i |= isProxy;
-   if (i)
-      {if ((j = Options & haveRole) && (i ^ j))
-          {free(myRole); myRole = strdup(theRole(i));
-           Eroute.Say("Config warning: command line role options override "
-                       "config file; 'all.role", myRole, "' in effect.");
-          }
-       Options &= ~(haveRole);
-       Options |= i;
-      }
+   mode_t uMask = 0777 & (~(dMask[1] | fMask[1]));
+   umask(uMask);
 
 // Export our role if we actually have one
 //
@@ -247,10 +247,11 @@ int XrdOfs::Configure(XrdSysError &Eroute, XrdOucEnv *EnvInfo) {
        ofsConfig->Default(XrdOfsConfigPI::theCksLib, buff, 0);
       }
 
-// Configure third party copy but only if we are not a manager
+// Configure third party copy but only if we are not a manager. Phase 1 needs
+// to be done before we load the plugins as they may need this info.
 //
    if ((Options & ThirdPC) && !(Options & isManager))
-      NoGo |= ConfigTPC(Eroute);
+      NoGo |= ConfigTPC(Eroute, EnvInfo);
 
 // We need to do pre-initialization for event recording as the oss needs some
 // environmental information from that initialization to initialize the frm,
@@ -264,23 +265,52 @@ int XrdOfs::Configure(XrdSysError &Eroute, XrdOucEnv *EnvInfo) {
    int piOpts = XrdOfsConfigPI::allXXXLib;
    if (!(Options & Authorize)) piOpts &= ~XrdOfsConfigPI::theAutLib;
 
+// We need to export plugins to other protocols which means we need to
+// record them in the outmost environment. So get it.
+//
+   XrdOucEnv *xrdEnv = 0;
+   if (EnvInfo) xrdEnv = (XrdOucEnv*)EnvInfo->GetPtr("xrdEnv*");
+
 // Now load all of the required plugins
 //
-   if (!ofsConfig->Load(piOpts, this, EnvInfo)) NoGo = 1;
+   if (!ofsConfig->Load(piOpts, EnvInfo)) NoGo = 1;
       else {ofsConfig->Plugin(XrdOfsOss);
+            ossFeatures = XrdOfsOss->Features();
+            if (ossFeatures & XRDOSS_HASNOSF)  FeatureSet |= XrdSfs::hasNOSF;
+            if (ossFeatures & XRDOSS_HASCACH)
+               {FeatureSet |= XrdSfs::hasCACH;
+                if (xrdEnv) xrdEnv->Put("XrdCache", "T"); // Existence check
+               }
+            if (ossFeatures & XRDOSS_HASNAIO)  FeatureSet |= XrdSfs::hasNAIO;
+            if (xrdEnv) xrdEnv->PutPtr("XrdOss*", XrdOfsOss);
             ofsConfig->Plugin(Cks);
             CksPfn = !ofsConfig->OssCks();
             CksRdr = !ofsConfig->LclCks();
             if (ofsConfig->Plugin(prepHandler))
                {prepAuth = ofsConfig->PrepAuth();
-                if (EnvInfo) EnvInfo->Put("XRD_PrepHandler", "1");
-                   else XrdOucEnv::Export("XRD_PrepHandler", "1");
+                FeatureSet |= XrdSfs::hasPRP2;
                }
             if (Options & Authorize)
                {ofsConfig->Plugin(Authorization);
                 XrdOfsTPC::Init(Authorization);
+                if (xrdEnv) xrdEnv->PutPtr("XrdAccAuthorize*",Authorization);
+                FeatureSet |= XrdSfs::hasAUTZ;
                }
            }
+
+// If a cache has been configured then that cache may want to interact with
+// the cache-specific FSctl() operation. We check if a plugin was provided.
+//
+   if (ossFeatures & XRDOSS_HASCACH)
+      FSctl_PC = (XrdOfsFSctl_PI*)EnvInfo->GetPtr("XrdFSCtl_PC*");
+
+// Configure third party copy phase 2, but only if we are not a manager.
+//
+   if ((Options & ThirdPC) && !(Options & isManager)) NoGo |= ConfigTPC(Eroute);
+
+// Extract out the export list should it have been supplied by the oss plugin
+//
+   ossRPList = (XrdOucPListAnchor *)EnvInfo->GetPtr("XrdOssRPList*");
 
 // Initialize redirection.  We type te herald here to minimize confusion
 //
@@ -292,6 +322,27 @@ int XrdOfs::Configure(XrdSysError &Eroute, XrdOucEnv *EnvInfo) {
           }
       }
 
+// Initialize the FSctl plugin if we have one. Note that we needed to defer
+// until now because we needed to configure the cms plugin first (see above).
+//
+   if (ofsConfig->Plugin(FSctl_PI) && !ofsConfig->ConfigCtl(Finder, EnvInfo))
+      {Eroute.Emsg("Config", "Unable to configure FSctl plugin.");
+       NoGo = 1;
+      }
+
+// Initialize the cache FSctl handler if we have one. The same deferal applies.
+//
+   if (FSctl_PC)
+      {struct XrdOfsFSctl_PI::Plugins thePI = {Authorization, Finder,
+                                               XrdOfsOss, XrdOfsFS};
+       XrdOucEnv pcEnv;                                    
+       pcEnv.PutPtr("XrdOfsHandle*", dummyHandle);
+       if (!FSctl_PC->Configure(ConfigFN, 0, &pcEnv, thePI))
+          {Eroute.Emsg("Config", "Unable to configure cache FSctl handler.");
+           NoGo = 1;
+          }
+      }
+
 // Initialize th Evr object if we are an actual server
 //
    if (!(Options & isManager) && !evrObject.Init(Balancer)) NoGo = 1;
@@ -299,35 +350,46 @@ int XrdOfs::Configure(XrdSysError &Eroute, XrdOucEnv *EnvInfo) {
 // Turn off forwarding if we are not a pure remote redirector or a peer
 //
    if (Options & Forwarding)
-      if (!(Options & isPeer)
-      && (Options & (isServer | isProxy)))
-         {Eroute.Say("Config warning: forwarding turned off; not a pure manager");
+      {const char *why = 0;
+       if (!(Options & Authorize)) why = "authorization not enabled";
+           else if (!(Options & isPeer) && (Options & (isServer | isProxy)))
+                   why = "not a pure manager";
+       if (why)
+         {Eroute.Say("Config warning: forwarding turned off; ", why);
           Options &= ~(Forwarding);
           fwdCHMOD.Reset(); fwdMKDIR.Reset(); fwdMKPATH.Reset();
           fwdMV.Reset();    fwdRM.Reset();    fwdRMDIR.Reset();
           fwdTRUNC.Reset();
          }
+      }
 
 // If we need to send notifications, initialize the interface
 //
    if (!NoGo && evsObject) NoGo = evsObject->Start(&Eroute);
 
+// If the OSS plugin is really a proxy. If it is, it will export its origin.
+// We also suppress translating lfn to pfn (usually done via osslib +cksio).
+// Note: consulting the ENVAR below is historic and remains for compatibility
+// Otherwise we can configure checkpointing if we are a data server.
+//
+   if (ossFeatures & XRDOSS_HASPRXY || getenv("XRDXROOTD_PROXY"))
+      {OssIsProxy = 1;
+       CksPfn = false;
+       FeatureSet |= XrdSfs::hasPRXY;
+      } else if (!(Options & isManager) && !XrdOfsConfigCP::Init()) NoGo = 1;
+
+// Indicate wheter oss implements pgrw or it has to be simulated
+//
+   OssHasPGrw = (ossFeatures & XRDOSS_HASPGRW) != 0;
+
 // If POSC processing is enabled (as by default) do it. Warning! This must be
 // the last item in the configuration list as we need a working filesystem.
 // Note that in proxy mode we always disable posc!
 //
-   if (getenv("XRDXROOTD_NOPOSC"))
+   if (OssIsProxy || getenv("XRDXROOTD_NOPOSC"))
       {if (poscAuto != -1 && !NoGo)
           Eroute.Say("Config POSC has been disabled by the osslib plugin.");
       } else if (poscAuto != -1 && !NoGo) NoGo |= ConfigPosc(Eroute);
-
-// If the OSS plugin is really a proxy. If it is, it will export its origin.
-// We also suppress translating lfn to pfn (usually done via osslib +cksio).
-//
-   if (getenv("XRDXROOTD_PROXY"))
-      {OssIsProxy = 1;
-       CksPfn = false;
-      }
 
 // Setup statistical monitoring
 //
@@ -525,6 +587,7 @@ int XrdOfs::ConfigPosc(XrdSysError &Eroute)
 
 // All done
 //
+   if (!NoGo) FeatureSet |= XrdSfs::hasPOSC;
    return NoGo;
 }
 
@@ -601,35 +664,74 @@ int XrdOfs::ConfigRedir(XrdSysError &Eroute, XrdOucEnv *EnvInfo)
 /*                             C o n f i g T P C                              */
 /******************************************************************************/
   
-int XrdOfs::ConfigTPC(XrdSysError &Eroute)
+  
+int XrdOfs::ConfigTPC(XrdSysError &Eroute, XrdOucEnv *envP)
 {
+   XrdOfsTPCConfig &Cfg = XrdOfsTPCParms::Cfg;
 
 // Check if we need to configure rge credentials directory
 //
-   if (Parms.fCreds)
-      {char *cpath = Parms.cpath;
-       if (!(Parms.cpath = ConfigTPCDir(Eroute, cpath))) return 1;
+   if (Cfg.fCreds)
+      {char *cpath = Cfg.cPath;
+       if (!(Cfg.cPath = ConfigTPCDir(Eroute, ".ofs/.tpccreds/", cpath)))
+          return 1;
        free(cpath);
+      }
+
+// Construct the reproxy path. We always do this as need to solve the cart-horse
+// problem of plugin loading. If we don't need it it will be ignored later.
+//
+   if (!(Cfg.rPath = ConfigTPCDir(Eroute, ".ofs/.tpcproxy"))) return 1;
+   if (envP) envP->Put("tpc.rpdir", Cfg.rPath);
+
+// Check if TPC monitoring is wanted and set it up
+//
+   Cfg.tpcMon = (XrdXrootdTpcMon*)envP->GetPtr("TpcMonitor*");
+
+// All done
+//
+   return 0;
+}
+
+/******************************************************************************/
+  
+int XrdOfs::ConfigTPC(XrdSysError &Eroute)
+{
+   XrdOfsTPCConfig &Cfg = XrdOfsTPCParms::Cfg;
+
+// If the oss plugin does not use a reproxy then remove it from the TPC config.
+// Otherwise, complete it.
+//
+   if (ossFeatures & XRDOSS_HASRPXY && Cfg.rPath)
+      {char rPBuff[1024];
+       reProxy = true;
+       snprintf(rPBuff,sizeof(rPBuff),"%s/%x-%%d.rpx",Cfg.rPath,int(time(0)));
+       free(Cfg.rPath);
+       Cfg.rPath = strdup(rPBuff);
+      } else {
+       if (Cfg.rPath) free(Cfg.rPath);
+       Cfg.rPath = 0;
       }
 
 // Initialize the TPC object
 //
-   XrdOfsTPC::Init(Parms);
+   XrdOfsTPC::Init();
 
 // Start TPC operations
 //
    return (XrdOfsTPC::Start() ? 0 : 1);
 }
-
 /******************************************************************************/
 /*                          C o n f i g T P C D i r                           */
 /******************************************************************************/
 
-char *XrdOfs::ConfigTPCDir(XrdSysError &Eroute, const char *xPath)
+char *XrdOfs::ConfigTPCDir(XrdSysError &Eroute, const char *sfx,
+                                                const char *xPath)
 {
   
    const int AMode = S_IRWXU|S_IRWXG|S_IROTH|S_IXOTH; // 775
    const int BMode = S_IRWXU|        S_IRGRP|S_IXGRP; // 750
+   const int nswOpt= XrdOucNSWalk::retFile | XrdOucNSWalk::retLink;
    const char *iName;
    char pBuff[MAXPATHLEN], *aPath;
    int rc;
@@ -637,12 +739,12 @@ char *XrdOfs::ConfigTPCDir(XrdSysError &Eroute, const char *xPath)
 // Construct the proper path to stored credentials
 //
    iName = XrdOucUtils::InstName(-1);
-   if (xPath) aPath = XrdOucUtils::genPath(xPath, iName, ".ofs/.tpccreds/");
+   if (xPath) aPath = XrdOucUtils::genPath(xPath, iName, sfx);
       else {if (!(aPath = getenv("XRDADMINPATH")))
                {XrdOucUtils::genPath(pBuff, MAXPATHLEN, "/tmp", iName);
                 aPath = pBuff;
                }
-            aPath = XrdOucUtils::genPath(aPath, (char *)0, ".ofs/.tpccreds/");
+            aPath = XrdOucUtils::genPath(aPath, (char *)0, sfx);
            }
 
 // Make sure directory path exists
@@ -661,9 +763,9 @@ char *XrdOfs::ConfigTPCDir(XrdSysError &Eroute, const char *xPath)
        return 0;
       }
 
-// list the contents of teh directory
+// list the contents of the directory
 //
-   XrdOucNSWalk nsWalk(&Eroute, aPath, 0, XrdOucNSWalk::retFile);
+   XrdOucNSWalk nsWalk(&Eroute, aPath, 0, nswOpt);
    XrdOucNSWalk::NSEnt *nsX, *nsP = nsWalk.Index(rc);
    if (rc)
       {Eroute.Emsg("Config", rc, "list TPC path", aPath);
@@ -708,6 +810,9 @@ int XrdOfs::ConfigXeq(char *var, XrdOucStream &Config,
     TS_XPI("ckslib",        theCksLib);
     TS_Xeq("cksrdsz",       xcrds);
     TS_XPI("cmslib",        theCmsLib);
+    TS_Xeq("crmode",        xcrm);
+    TS_XPI("ctllib",        theCtlLib);
+    TS_Xeq("dirlist",       xdirl);
     TS_Xeq("forward",       xforward);
     TS_Xeq("maxdelay",      xmaxd);
     TS_Xeq("notify",        xnot);
@@ -718,7 +823,12 @@ int XrdOfs::ConfigXeq(char *var, XrdOucStream &Config,
     TS_Xeq("role",          xrole);
     TS_Xeq("tpc",           xtpc);
     TS_Xeq("trace",         xtrace);
+    TS_Xeq("xattr",         xatr);
     TS_XPI("xattrlib",      theAtrLib);
+
+    // Process miscellaneous directives handled elsemwhere
+    //
+    if (!strcmp("chkpnt", var)) return (XrdOfsConfigCP::Parse(Config) ? 0 : 1);
 
     // Screen out the subcluster directive (we need to track that)
     //
@@ -772,6 +882,172 @@ int XrdOfs::xcrds(XrdOucStream &Config, XrdSysError &Eroute)
 }
   
 /******************************************************************************/
+/*                                  x c r m                                   */
+/******************************************************************************/
+  
+/* Function: xcrm
+
+   Purpose:  To parse the directive: crmode [dirs <mspec>] [files <mspec>]
+
+             <mspec>: common | legacy | [raw] <modes>
+
+             common  uses dirs 0700:0755 and files 0600:0644
+
+             legacy  uses dirs 0000:0775 and files 0000:0775
+
+             raw     Allows actual specification of mode bits without enforcing 
+                     default requirements. The resulting modes may not be 0.
+                     Otherwise, the specified values are made consistent with
+                     the default mode settings.
+
+             <modes>: <minv> | :<maxv> | <minv>:<maxv>
+
+             <minv>: The minimum mode value required (always set), see <mval>.
+             <maxv>: The maximum mode value to be enforced, see <mval>.
+
+             <mval>  is either an octal mode specifiation or a standard ls type
+                     mode specification (i.e. 'rwx'). The specification is in
+                     groups of 3 letters. The first group designates user mode,
+                     the scond group mode, and the last other mode. To disallow
+                     a mode specify a dash. Note that for files, the 'x'
+                     character must be a dash unless raw mode is enabled. It is
+                     impossible to disllow any mode for user except for raw mode.
+
+  Output: 0 upon success or !0 upon failure.
+*/
+
+int XrdOfs::xcrm(XrdOucStream &Config, XrdSysError &Eroute)
+{
+   static const mode_t dMin = 0700, dMax = 0775, fMin = 0600, fMax = 0664;
+   static const mode_t xBit = 0111, wBit = 0002;
+   const char *mtype;
+   char *colon, *val, *minM, *maxM;
+   mode_t mMask[2];
+   bool isDirs, isRaw;
+
+// Get the size
+//
+   if (!(val = Config.GetWord()) || !val[0])
+      {Eroute.Emsg("Config", "crmode argument not specified"); return 1;}
+
+// Process all of the specs
+//
+do{if (!strcmp("dirs", val)) {isDirs = true; mtype = "dirs mode";}
+      else if (!strcmp("files", val)) {isDirs = false; mtype = "files mode";}
+              else {Eroute.Emsg("Config", "invalid mode type - ", val);
+                    return 1;
+                   }
+
+   if (!(val = Config.GetWord()) || !val[0])
+      {Eroute.Emsg("Config", mtype, "value not specified"); return 1;}
+
+   if (!strcmp(val, "common"))
+      {if (isDirs) {dMask[0] = dMin; dMask[1] = dMax;}
+          else     {fMask[0] = fMin; fMask[1] = fMax;}
+       continue;
+      }
+
+   if (!strcmp(val, "legacy"))
+      {if (isDirs) {dMask[0] = 0; dMask[1] = 0775;}
+          else     {fMask[0] = 0; fMask[1] = 0775;}
+       continue;
+      }
+
+   if ((isRaw = !strcmp(val, "raw")))
+      {if (!(val = Config.GetWord()) || !val[0])
+          {Eroute.Emsg("Config", mtype, "value not specified"); return 1;}
+      }
+
+   colon = index(val, ':');
+   if (!colon || colon == val || *(colon+1) == 0)
+      {Eroute.Emsg("Config",mtype,"mode spec requires min and max values");
+       return 1;
+      }
+    minM = val; *colon = 0; maxM = colon + 1;
+
+    if (!XrdOucUtils::mode2mask(minM, mMask[0]))
+       {Eroute.Emsg("Config", mtype, "value is invalid -", minM);
+        return 1;
+       }
+
+    if (!XrdOucUtils::mode2mask(maxM, mMask[1]))
+       {Eroute.Emsg("Config", mtype, "value is invalid -", maxM);
+        return 1;
+       }
+
+   if (isDirs)
+      {if (isRaw) {dMask[0] = mMask[0]; dMask[1] = mMask[1];}
+          else {if ((mMask[0] | mMask[1]) & wBit)
+                   {Eroute.Say("Config warning: 'other' w-mode removed from dirs mode!");
+                    mMask[0] &= ~wBit; mMask[1] &= ~wBit;
+                   }
+                dMask[0] = (mMask[0] | dMin) & dMax;
+                dMask[1] = (mMask[1] | dMin) & dMax;
+               }
+       if ((dMask[0] & dMask[1]) != dMask[0])
+          {Eroute.Emsg("Config","dirs mode min and max values are inconsistent!");
+           return 1;
+          }
+      } else { // Files
+       if (isRaw) {fMask[0] = mMask[0]; fMask[1] = mMask[1];}
+          else {if ((mMask[0] | mMask[1]) & wBit)
+                   {Eroute.Say("Config warning: 'other' w-mode removed from files mode!");
+                    mMask[0] &= ~wBit; mMask[1] &= ~wBit;
+                   }
+                if ((mMask[0] | mMask[1]) & xBit)
+                   {Eroute.Say("Config warning: x-mode removed from files mode!");
+                    mMask[0] &= ~xBit; mMask[1] &= ~xBit;
+                   }
+                fMask[0] = (mMask[0] | fMin) & fMax;
+                fMask[1] = (mMask[1] | fMin) & fMax;
+               }
+       if ((fMask[0] & fMask[1]) != fMask[0])
+          {Eroute.Emsg("Config","files mode min and max values are inconsistent!");
+           return 1;
+          }
+      }
+   } while((val = Config.GetWord()) && val[0]);
+
+// All done, return success
+//
+   return 0;
+}
+  
+/******************************************************************************/
+/*                                 x d i r l                                  */
+/******************************************************************************/
+  
+/* Function: xdirl
+
+   Purpose:  To parse the directive: dirlist {local | remote}
+
+             local   processes directory listings locally. The oss plugin
+                     must be capable of doing this. This is the default.
+             remote  if clustering is enabled, directory listings are
+                     processed as directed by the cmsd.
+
+  Output: 0 upon success or !0 upon failure.
+*/
+
+int XrdOfs::xdirl(XrdOucStream &Config, XrdSysError &Eroute)
+{
+   char *val;
+
+// Get the parameter
+//
+   if (!(val = Config.GetWord()) || !val[0])
+      {Eroute.Emsg("Config", "dirlist parameter not specified"); return 1;}
+
+// Set appropriate option
+//
+        if (!strcmp(val, "local"))  DirRdr = false;
+   else if (!strcmp(val, "remote")) DirRdr = true;
+   else {Eroute.Emsg("Config", "Invalid dirlist parameter -", val); return 1;}
+
+   return 0;
+}
+  
+/******************************************************************************/
 /*                                  x e x p                                   */
 /******************************************************************************/
   
@@ -803,7 +1079,8 @@ int XrdOfs::xexp(XrdOucStream &Config, XrdSysError &Eroute, bool isExport)
 //
    while((val = Config.GetWord()))
         {for (int i = 0; i < numopts; i++)
-             if (!strcmp(val, rwtab[i].opname)) {isrw = rwtab[i].isRW; break;}
+             if (!strcmp(val, rwtab[i].opname))  isrw = rwtab[i].isRW;
+                else if (!strcmp(val, "cache")) {isrw = 0; break;}
         }
 
 // Handle result depending if this is an export or a defaults
@@ -858,11 +1135,11 @@ int XrdOfs::xforward(XrdOucStream &Config, XrdSysError &Eroute)
 
     *rHost = '\0';
     if (!(val = Config.GetWord()))
-       {Eroute.Emsg("Config", "foward option not specified"); return 1;}
+       {Eroute.Emsg("Config", "forward option not specified"); return 1;}
     if ((is2way = !strcmp("2way", val)) || !strcmp("1way", val)
     ||  (is3way = !strcmp("3way", val)))
        if (!(val = Config.GetWord()))
-          {Eroute.Emsg("Config", "foward operation not specified"); return 1;}
+          {Eroute.Emsg("Config", "forward operation not specified"); return 1;}
 
     if (is3way)
        {if (!strcmp("local", val)) rPort = -1;
@@ -877,7 +1154,7 @@ int XrdOfs::xforward(XrdOucStream &Config, XrdSysError &Eroute)
         strlcpy(rHost, val, sizeof(rHost));
        }
         if (!(val = Config.GetWord()))
-           {Eroute.Emsg("Config", "foward operation not specified"); return 1;}
+           {Eroute.Emsg("Config", "forward operation not specified"); return 1;}
        }
 
     while (val)
@@ -892,7 +1169,7 @@ int XrdOfs::xforward(XrdOucStream &Config, XrdSysError &Eroute)
                            }
                        }
                    if (i >= numopts)
-                      Eroute.Say("Config warning: ignoring invalid foward option '",val,"'.");
+                      Eroute.Say("Config warning: ignoring invalid forward option '",val,"'.");
                   }
           val = Config.GetWord();
          }
@@ -1302,7 +1579,7 @@ int XrdOfs::xrole(XrdOucStream &Config, XrdSysError &Eroute)
           default: Eroute.Emsg("Config", "invalid role -", Tok1, Tok2); rc = 1;
          }
 
-// Release storage and return if an error occured
+// Release storage and return if an error occurred
 //
    free(Tok1);
    if (Tok2) free(Tok2);
@@ -1334,13 +1611,15 @@ int XrdOfs::xrole(XrdOucStream &Config, XrdSysError &Eroute)
                                          [fcreds  [?]<auth> =<evar>]
                                          [fcpath <path>] [oids]
 
-                                     tpc redirect <host>:<port> [<cgi>]
+                                     tpc redirect [xdlg] <host>:<port> [<cgi>]
+
+             xdlg:  delegated | undelegated
 
              parms: [dn <name>] [group <grp>] [host <hn>] [vo <vo>]
 
              <dflt>  the default seconds a tpc authorization may be valid.
              <max>   the maximum seconds a tpc authorization may be valid.
-             cksum   checksum incomming files using <type> checksum.
+             cksum   checksum incoming files using <type> checksum.
              logok   log successful authorizations.
              allow   only allow destinations that match the specified
                      authentication specification.
@@ -1378,6 +1657,7 @@ int XrdOfs::xrole(XrdOucStream &Config, XrdSysError &Eroute)
 int XrdOfs::xtpc(XrdOucStream &Config, XrdSysError &Eroute)
 {
    char *val, pgm[1024];
+   XrdOfsTPCConfig &Parms = XrdOfsTPCParms::Cfg;
    *pgm = 0;
    int  reqType;
    bool rdrok = true;
@@ -1396,29 +1676,30 @@ int XrdOfs::xtpc(XrdOucStream &Config, XrdSysError &Eroute)
          if (!strcmp(val, "cksum"))
             {if (!(val = Config.GetWord()))
                 {Eroute.Emsg("Config","cksum type not specified"); return 1;}
-             if (Parms.Ckst) free(Parms.Ckst);
-             Parms.Ckst = strdup(val);
+             if (Parms.cksType) free(Parms.cksType);
+             Parms.cksType = strdup(val);
              continue;
             }
          if (!strcmp(val, "scan"))
             {if (!(val = Config.GetWord()))
                 {Eroute.Emsg("Config","scan type not specified"); return 1;}
-                  if (strcmp(val, "stderr")) Parms.Grab = -2;
-             else if (strcmp(val, "stdout")) Parms.Grab = -1;
-             else if (strcmp(val, "all"   )) Parms.Grab =  0;
+                  if (strcmp(val, "stderr")) Parms.errMon = -2;
+             else if (strcmp(val, "stdout")) Parms.errMon = -1;
+             else if (strcmp(val, "all"   )) Parms.errMon =  0;
              else {Eroute.Emsg("Config","invalid scan type -",val); return 1;}
              continue;
             }
-         if (!strcmp(val, "echo"))  {Parms.xEcho = 1; continue;}
-         if (!strcmp(val, "logok")) {Parms.Logok = 1; continue;}
-         if (!strcmp(val, "autorm")){Parms.autoRM = 1; continue;}
-         if (!strcmp(val, "oids"))  {Parms.oidsOK = 1; continue;}
+         if (!strcmp(val, "echo"))  {Parms.doEcho = true; continue;}
+         if (!strcmp(val, "logok")) {Parms.LogOK  = true; continue;}
+         if (!strcmp(val, "autorm")){Parms.autoRM = true; continue;}
+         if (!strcmp(val, "oids"))  {Parms.noids  = false;continue;}
          if (!strcmp(val, "pgm"))
             {if (!Config.GetRest(pgm, sizeof(pgm)))
                 {Eroute.Emsg("Config", "tpc command line too long"); return 1;}
              if (!*pgm)
                 {Eroute.Emsg("Config", "tpc program not specified"); return 1;}
-             Parms.Pgm = strdup( pgm );
+             if (Parms.XfrProg) free(Parms.XfrProg);
+             Parms.XfrProg = strdup( pgm );
              break;
             }
          if (!strcmp(val, "require"))
@@ -1445,18 +1726,18 @@ int XrdOfs::xtpc(XrdOucStream &Config, XrdSysError &Eroute)
          if (!strcmp(val, "ttl"))
             {if (!(val = Config.GetWord()))
                 {Eroute.Emsg("Config","tpc ttl value not specified"); return 1;}
-             if (XrdOuca2x::a2tm(Eroute,"tpc ttl default",val,&Parms.Dflttl,1))
+             if (XrdOuca2x::a2tm(Eroute,"tpc ttl default",val,&Parms.dflTTL,1))
                  return 1;
              if (!(val = Config.GetWord())) break;
              if (!(isdigit(*val))) {Config.RetToken(); continue;}
-             if (XrdOuca2x::a2tm(Eroute,"tpc ttl maximum",val,&Parms.Maxttl,1))
+             if (XrdOuca2x::a2tm(Eroute,"tpc ttl maximum",val,&Parms.maxTTL,1))
                  return 1;
              continue;
             }
          if (!strcmp(val, "xfr"))
             {if (!(val = Config.GetWord()))
                 {Eroute.Emsg("Config","tpc xfr value not specified"); return 1;}
-             if (XrdOuca2x::a2i(Eroute,"tpc xfr",val,&Parms.Xmax,1)) return 1;
+             if (XrdOuca2x::a2i(Eroute,"tpc xfr",val,&Parms.xfrMax,1)) return 1;
              continue;
             }
          if (!strcmp(val, "streams"))
@@ -1467,15 +1748,15 @@ int XrdOfs::xtpc(XrdOucStream &Config, XrdSysError &Eroute)
                 {*comma++ = 0;
                  if (!(*comma))
                     {Eroute.Emsg("Config","tpc streams max value missing"); return 1;}
-                 if (XrdOuca2x::a2i(Eroute,"tpc max streams",comma,&Parms.SMax,0,15))
+                 if (XrdOuca2x::a2i(Eroute,"tpc max streams",comma,&Parms.tcpSMax,0,15))
                     return 1;
                 }
-             if (XrdOuca2x::a2i(Eroute,"tpc streams",val,&Parms.Strm,0,15)) return 1;
+             if (XrdOuca2x::a2i(Eroute,"tpc streams",val,&Parms.tcpSTRM,0,15)) return 1;
              continue;
             }
          if (!strcmp(val, "fcreds"))
             {char aBuff[64];
-             Parms.fCreds = 1;
+             Parms.fCreds = true;
              if (!(val = Config.GetWord()) || (*val == '?' && *(val+1) == '\0'))
                 {Eroute.Emsg("Config","tpc fcreds auth not specified"); return 1;}
              if (strlen(val) >= sizeof(aBuff))
@@ -1488,10 +1769,10 @@ int XrdOfs::xtpc(XrdOucStream &Config, XrdSysError &Eroute)
              continue;
             }
          if (!strcmp(val, "fcpath"))
-            {if (Parms.cpath) {free(Parms.cpath); Parms.cpath = 0;}
-             if (!(val = Config.GetWord()))
+            {if (!(val = Config.GetWord()))
                 {Eroute.Emsg("Config","tpc fcpath arg not specified"); return 1;}
-             Parms.cpath = strdup(val);
+             if (Parms.cPath) free(Parms.cPath);
+             Parms.cPath = strdup(val);
              continue;
             }
          Eroute.Say("Config warning: ignoring invalid tpc option '",val,"'.");
@@ -1543,11 +1824,22 @@ int XrdOfs::xtpcr(XrdOucStream &Config, XrdSysError &Eroute)
    char hname[256];
    const char *cgi, *cgisep, *hBeg, *hEnd, *pBeg, *pEnd, *eText;
    char *val;
-   int  n, port;
+   int  n, port, dlgI;
+
+// Get the next token
+//
+   if (!(val = Config.GetWord()))
+      {Eroute.Emsg("Config", "tpc redirect host not specified"); return 1;}
+
+// See if this is for delegated or undelegated (all is the default)
+//
+   if (!strcmp(val, "delegated")) dlgI = 0;
+      else if (!strcmp(val, "undelegated")) dlgI = 1;
+           else dlgI = -1;
 
 // Get host and port
 //
-   if (!(val = Config.GetWord()))
+   if (dlgI >= 0 && !(val = Config.GetWord()))
       {Eroute.Emsg("Config", "tpc redirect host not specified"); return 1;}
 
 // Parse this as it may be complicated.
@@ -1593,19 +1885,23 @@ int XrdOfs::xtpcr(XrdOucStream &Config, XrdSysError &Eroute)
 // Check if there is cgi that must be included
 //
    if (!(cgi = Config.GetWord())) cgisep =  cgi = (char *)"";
-      else cgisep = (*cgi != '&' ? "?&" : "?");
+      else cgisep = (*cgi != '?' ? "?" : "");
 
 // Copy out the hostname to be used
 //
-   if (tpcRdrHost) {free(tpcRdrHost); tpcRdrHost = 0;}
+   int k = (dlgI < 0 ? 0 : dlgI);
+do{if (tpcRdrHost[k]) {free(tpcRdrHost[k]); tpcRdrHost[k] = 0;}
 
    n = strlen(hname) + strlen(cgisep) + strlen(cgi) + 1;
-   tpcRdrHost = (char *)malloc(n);
-   snprintf(tpcRdrHost, n, "%s%s%s", hname, cgisep, cgi);
-   tpcRdrPort = port;
+   tpcRdrHost[k] = (char *)malloc(n);
+   snprintf(tpcRdrHost[k], n, "%s%s%s", hname, cgisep, cgi);
+   tpcRdrPort[k] = port;
+   k++;
+  } while(dlgI < 0 && k < 2);
 
 // All done
 //
+   Options |= RdrTPC;
    return 0;
 }
   
@@ -1628,6 +1924,7 @@ int XrdOfs::xtrace(XrdOucStream &Config, XrdSysError &Eroute)
     static struct traceopts {const char *opname; int opval;} tropts[] =
        {{"aio",      TRACE_aio},
         {"all",      TRACE_ALL},
+        {"chkpnt",   TRACE_chkpnt},
         {"chmod",    TRACE_chmod},
         {"close",    TRACE_close},
         {"closedir", TRACE_closedir},
@@ -1676,6 +1973,78 @@ int XrdOfs::xtrace(XrdOucStream &Config, XrdSysError &Eroute)
 
 // All done
 //
+   return 0;
+}
+  
+/******************************************************************************/
+/*                                  x a t r                                   */
+/******************************************************************************/
+
+/* Function: xatr
+
+   Purpose:  To parse the directive: xattr [maxnsz <nsz>] [maxvsz <vsz>]
+
+                                           [uset {on|off}]
+
+             on       enables  user settable extended attributes.
+
+             off      disaables user settable extended attributes.
+
+             <nsz>    maximum length of an attribute name. The user
+                      specifiable limit will be 8 less.
+
+             <vsz>    maximum length of an attribute value.
+
+   Notes:    1. This directive is not cummalative.
+
+   Output: 0 upon success or !0 upon failure.
+*/
+
+int XrdOfs::xatr(XrdOucStream &Config, XrdSysError &Eroute)
+{
+   char *val;
+   static const int xanRsv = 7;
+   long long vtmp;
+   int maxN = kXR_faMaxNlen, maxV = kXR_faMaxVlen;
+   bool isOn = true;
+
+   while((val =  Config.GetWord()))
+        {     if (!strcmp("maxnsz", val))
+                 {if (!(val = Config.GetWord()))
+                     {Eroute.Emsg("Config","xattr maxnsz value not specified");
+                      return 1;
+                     }
+                  if (XrdOuca2x::a2sz(Eroute,"maxnsz",val,&vtmp,
+                                     xanRsv+1,kXR_faMaxNlen+xanRsv)) return 1;
+                  maxN = static_cast<int>(vtmp);
+                 }
+         else if (!strcmp("maxvsz", val))
+                 {if (!(val = Config.GetWord()))
+                     {Eroute.Emsg("Config","xattr maxvsz value not specified");
+                      return 1;
+                     }
+                  if (XrdOuca2x::a2sz(Eroute,"maxvsz",val,&vtmp,0,kXR_faMaxVlen))
+                     return 1;
+                  maxV = static_cast<int>(vtmp);
+                 }
+         else if (!strcmp("uset",   val))
+                 {if (!(val = Config.GetWord()))
+                     {Eroute.Emsg("Config","xattr uset value not specified");
+                      return 1;
+                     }
+                       if (!strcmp("on",     val)) isOn = true;
+                  else if (!strcmp("off",    val)) isOn = false;
+                  else {Eroute.Emsg("Config", "invalid xattr uset value -", val);
+                        return 1;
+                       }
+                 }
+         else {Eroute.Emsg("Config", "invalid xattr option -", val);
+               return 1;
+              }
+        }
+
+   usxMaxNsz = (isOn ? maxN-xanRsv : 0);
+   usxMaxVsz = maxV;
    return 0;
 }
   

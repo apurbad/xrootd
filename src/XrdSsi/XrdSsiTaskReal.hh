@@ -29,11 +29,10 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <stdio.h>
+#include <cstdio>
 
 #include "XrdSsi/XrdSsiErrInfo.hh"
 #include "XrdSsi/XrdSsiEvent.hh"
-#include "XrdSsi/XrdSsiPacer.hh"
 #include "XrdSsi/XrdSsiStream.hh"
 #include "XrdSsi/XrdSsiResponder.hh"
 
@@ -41,8 +40,8 @@ class XrdSsiRequest;
 class XrdSsiSessReal;
 class XrdSysSemaphore;
 
-class XrdSsiTaskReal : public XrdSsiEvent,     public XrdSsiPacer,
-                       public XrdSsiResponder, public XrdSsiStream
+class XrdSsiTaskReal : public XrdSsiEvent, public XrdSsiResponder,
+                       public XrdSsiStream
 {
 public:
 
@@ -64,14 +63,13 @@ int    ID() {return tskID;}
 inline
 void   Init(XrdSsiRequest *rP, unsigned short tmo=0)
            {rqstP = rP, tStat = isPend; tmOut = tmo; wPost = 0;
-            mhPend = false; defer = false;
+            mhPend = false; defer = 0;
             attList.next = attList.prev = this;
             if (mdResp) {delete mdResp; mdResp = 0;}
            }
 
 void   PostError();
 
-void   Redrive();
 const 
 char  *RequestID() {return rqstP->GetRequestID();}
 
@@ -90,12 +88,14 @@ void   SetTaskID(uint32_t tid, uint32_t sid)
                  snprintf(tident, sizeof(tident), "T %u#%u", sid, tid);
                 }
 
-bool   XeqEvent(XrdCl::XRootDStatus *status, XrdCl::AnyObject **respP);
+int    XeqEvent(XrdCl::XRootDStatus *status, XrdCl::AnyObject **respP);
+
+void   XeqEvFin();
 
        XrdSsiTaskReal(XrdSsiSessReal *sP)
                      : XrdSsiStream(XrdSsiStream::isPassive),
                        sessP(sP), mdResp(0), wPost(0), tskID(0),
-                       mhPend(false), defer(false)
+                       defer(0), mhPend(false)
                     {}
 
       ~XrdSsiTaskReal() {if (mdResp) delete mdResp;}
@@ -110,7 +110,6 @@ private:
 bool              Ask4Resp();
 respType          GetResp(XrdCl::AnyObject **respP, char *&dbuf, int &dlen);
 bool              RespErr(XrdCl::XRootDStatus *status);
-bool              XeqEnd(bool getLock);
 
 XrdSsiErrInfo     errInfo;
 XrdSsiSessReal   *sessP;
@@ -121,8 +120,8 @@ char             *dataBuff;
 int               dataRlen;
 TaskStat          tStat;
 uint32_t          tskID;
+int               defer;  // Number of oustanding defer requests
 unsigned short    tmOut;
 bool              mhPend;
-bool              defer;
 };
 #endif

@@ -30,7 +30,7 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <string.h>
+#include <cstring>
 #include <unistd.h>
 #include <sys/uio.h>
   
@@ -46,8 +46,6 @@ public:
 unsigned int  Backlog() {return inQ;}
 
 virtual  void DoIt();
-
-static   void Init(XrdSysError *eP, XrdScheduler *sP) {Say = eP; Sched = sP;}
 
          int  Send(const char *buff, int blen);
 
@@ -81,8 +79,6 @@ bool     QMsg(mBuff *theMsg);
 void     RelMsgs(mBuff *mP);
 void     Scuttle();
 
-static XrdScheduler *Sched;
-static XrdSysError  *Say;
 static unsigned int  qWarn;
 static unsigned int  qMax;
 static bool          qPerm;

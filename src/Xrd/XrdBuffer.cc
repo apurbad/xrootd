@@ -27,13 +27,10 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <time.h>
+#include <ctime>
 #include <unistd.h>
-#if !defined(__APPLE__) && !defined(__FreeBSD__)
-#include <malloc.h>
-#endif
-#include <stdio.h>
-#include <stdlib.h>
+#include <cstdio>
+#include <cstdlib>
 #include <sys/types.h>
 
 #include "XrdOuc/XrdOucUtils.hh"
@@ -41,9 +38,7 @@
 #include "XrdSys/XrdSysPlatform.hh"
 #include "XrdSys/XrdSysTimer.hh"
 #include "Xrd/XrdBuffer.hh"
-#include "XrdBuffXL.hh"
-
-#define XRD_TRACE XrdTrace->
+#include "Xrd/XrdBuffXL.hh"
 #include "Xrd/XrdTrace.hh"
 
 /******************************************************************************/
@@ -70,7 +65,8 @@ static const int minBuffSz = 1 << XRD_BUSHIFT;
 
 namespace XrdGlobal
 {
-XrdBuffXL xlBuff;
+       XrdBuffXL   xlBuff;
+extern XrdSysError Log;
 }
 
 using namespace XrdGlobal;
@@ -79,9 +75,7 @@ using namespace XrdGlobal;
 /*                           C o n s t r u c t o r                            */
 /******************************************************************************/
 
-XrdBuffManager::XrdBuffManager(XrdSysError *lP, XrdOucTrace *tP, int minrst) :
-                   XrdTrace(tP),
-                   XrdLog(lP),
+XrdBuffManager::XrdBuffManager(int minrst) :
                    slots(XRD_BUCKETS),
                    shift(XRD_BUSHIFT),
                    pagsz(getpagesize()),
@@ -136,7 +130,7 @@ void XrdBuffManager::Init()
 //
    if ((rc = XrdSysThread::Run(&tid, XrdReshaper, static_cast<void *>(this), 0,
                           "Buffer Manager reshaper")))
-      XrdLog->Emsg("BuffManager", rc, "create reshaper thread");
+      Log.Emsg("BuffManager", rc, "create reshaper thread");
 }
   
 /******************************************************************************/
@@ -178,7 +172,7 @@ XrdBuffer *XrdBuffManager::Obtain(int sz)
 // Allocate a chunk of aligned memory
 //
    pk = (mk < pagsz ? mk : pagsz);
-   if (!(memp = static_cast<char *>(memalign(pk, mk)))) return 0;
+   if (posix_memalign((void **)&memp, pk, mk)) return 0;
 
 // Wrap the memory with a buffer object
 //
@@ -328,7 +322,7 @@ void XrdBuffManager::Set(int maxmem, int minw)
   
 int XrdBuffManager::Stats(char *buff, int blen, int do_sync)
 {
-    static char statfmt[] = "<stats id=\"buff\"><reqs>%d</reqs>"
+    static const char statfmt[] = "<stats id=\"buff\"><reqs>%d</reqs>"
                 "<mem>%lld</mem><buffs>%d</buffs><adj>%d</adj>%s</stats>";
     char xlStats[1024];
     int nlen;

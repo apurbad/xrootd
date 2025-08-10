@@ -29,7 +29,7 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <string.h>
+#include <cstring>
 #include <dirent.h>
 #include <sys/types.h>
   
@@ -47,6 +47,7 @@ class XrdOss;
 class XrdOssDF;
 class XrdOssDir;
 class XrdOucEnv;
+class XrdOucPListAnchor;
 class XrdSysError;
 class XrdSysLogger;
 class XrdOucStream;
@@ -76,22 +77,31 @@ const   char       *FName() {return (const char *)fname;}
 
         int         autoStat(struct stat *buf);
 
-                    XrdOfsDirectory(const char *user, int MonID)
-                          : XrdSfsDirectory(user, MonID)
-                          {dp     = 0;
-                           tident = (user ? user : "");
-                           fname=0; atEOF=0;
-                          }
+                    XrdOfsDirectory(XrdOucErrInfo &eInfo, const char *user)
+                          : XrdSfsDirectory(eInfo), tident(user ? user : ""),
+                            fname(0), dp(0), atEOF(0) {}
+
 virtual            ~XrdOfsDirectory() {if (dp) close();}
 
 protected:
 const char    *tident;
 char          *fname;
-
-private:
 XrdOssDF      *dp;
 int            atEOF;
 char           dname[MAXNAMLEN];
+};
+
+class XrdOfsDirFull : public XrdOfsDirectory
+{
+public:
+                    XrdOfsDirFull(const char *user, int MonID)
+                          : XrdOfsDirectory(myEInfo, user), myEInfo(user, MonID)
+                          {}
+
+virtual            ~XrdOfsDirFull() {}
+
+private:
+XrdOucErrInfo  myEInfo; // Accessible only by reference error
 };
 
 /******************************************************************************/
@@ -99,6 +109,7 @@ char           dname[MAXNAMLEN];
 /******************************************************************************/
 
 class XrdOfsTPC;
+class XrdOucChkPnt;
   
 class XrdOfsFile : public XrdSfsFile
 {
@@ -109,6 +120,9 @@ public:
                                   mode_t               createMode,
                             const XrdSecEntity        *client,
                             const char                *opaque = 0);
+
+        int            checkpoint(XrdSfsFile::cpAct act,
+                                  struct iov *range=0, int n=0);
 
         int            close();
 
@@ -126,6 +140,24 @@ public:
         const char    *FName() {return (oh ? oh->Name() : "?");}
 
         int            getMmap(void **Addr, off_t &Size);
+
+        XrdSfsXferSize pgRead(XrdSfsFileOffset   offset,
+                              char              *buffer,
+                              XrdSfsXferSize     rdlen,
+                              uint32_t          *csvec,
+                              uint64_t           opts=0);
+
+        int            pgRead(XrdSfsAio *aioparm, uint64_t opts=0);
+
+
+        XrdSfsXferSize pgWrite(XrdSfsFileOffset   offset,
+                               char              *buffer,
+                               XrdSfsXferSize     wrlen,
+                               uint32_t          *csvec,
+                               uint64_t           opts=0);
+
+        int            pgWrite(XrdSfsAio *aioparm, uint64_t opts=0);
+
 
         int            read(XrdSfsFileOffset   fileOffset,   // Preread only
                             XrdSfsXferSize     amount);
@@ -155,21 +187,37 @@ public:
 
         int            getCXinfo(char cxtype[4], int &cxrsz);
 
-                       XrdOfsFile(const char *user, int MonID);
+                       XrdOfsFile(XrdOucErrInfo &eInfo, const char *user);
 
                       ~XrdOfsFile() {viaDel = 1; if (oh) close();}
 
 protected:
-       const char   *tident;
+
+const char    *tident;
+XrdOfsHandle  *oh;
+XrdOfsTPC     *myTPC;
+XrdOucChkPnt  *myCKP;
+int            dorawio;
+char           viaDel;
+bool           ckpBad;
 
 private:
 
 void           GenFWEvent();
+int            CreateCKP();
+};
 
-XrdOfsHandle  *oh;
-XrdOfsTPC     *myTPC;
-int            dorawio;
-char           viaDel;
+class XrdOfsFileFull : public XrdOfsFile
+{
+public:
+                    XrdOfsFileFull(const char *user, int MonID)
+                          : XrdOfsFile(myEInfo, user), myEInfo(user, MonID)
+                          {}
+
+virtual            ~XrdOfsFileFull() {}
+
+private:
+XrdOucErrInfo  myEInfo; // Accessible only by reference error
 };
 
 /******************************************************************************/
@@ -180,7 +228,9 @@ class XrdAccAuthorize;
 class XrdCks;
 class XrdCmsClient;
 class XrdOfsConfigPI;
+class XrdOfsFSctl_PI;
 class XrdOfsPoscq;
+struct XrdSfsFACtl;
   
 class XrdOfs : public XrdSfsFileSystem
 {
@@ -192,10 +242,16 @@ public:
 // Object allocation
 //
         XrdSfsDirectory *newDir(char *user=0, int MonID=0)
-                        {return (XrdSfsDirectory *)new XrdOfsDirectory(user,MonID);}
+                        {return new XrdOfsDirFull(user, MonID);}
+
+        XrdSfsDirectory *newDir(XrdOucErrInfo &eInfo)
+                        {return new XrdOfsDirectory(eInfo, eInfo.getErrUser());}
 
         XrdSfsFile      *newFile(char *user=0,int MonID=0)
-                        {return      (XrdSfsFile *)new XrdOfsFile(user, MonID);}
+                        {return new XrdOfsFileFull(user, MonID);}
+
+        XrdSfsFile      *newFile(XrdOucErrInfo &eInfo)
+                        {return new XrdOfsFile(eInfo, eInfo.getErrUser());}
 
 // Other functions
 //
@@ -212,16 +268,29 @@ public:
                              const XrdSecEntity     *client,
                              const char             *opaque = 0);
 
+        void           Connect(const XrdSecEntity     *client = 0);
+
+        void           Disc(const XrdSecEntity *client = 0);
+
         int            exists(const char                *fileName,
                                     XrdSfsFileExistence &exists_flag,
                                     XrdOucErrInfo       &out_error,
                               const XrdSecEntity        *client,
                               const char                *opaque = 0);
 
+        int            FAttr(      XrdSfsFACtl      *faReq,
+                                   XrdOucErrInfo    &eInfo,
+                             const XrdSecEntity     *client = 0);
+
+        int            FSctl(const int               cmd,
+                                   XrdSfsFSctl      &args,
+                                   XrdOucErrInfo    &eInfo,
+                             const XrdSecEntity     *client = 0);
+
         int            fsctl(const int               cmd,
                              const char             *args,
                                    XrdOucErrInfo    &out_error,
-                             const XrdSecEntity     *client);
+                             const XrdSecEntity     *client = 0);
 
         int            getStats(char *buff, int blen);
 
@@ -275,7 +344,7 @@ const   char          *getVersion();
                                 const char             *opaque = 0);
 // Management functions
 //
-virtual int            Configure(XrdSysError &); // Backward Compatability
+virtual int            Configure(XrdSysError &); // Backward Compatibility
 
 virtual int            Configure(XrdSysError &, XrdOucEnv *);
 
@@ -303,16 +372,22 @@ enum {Authorize = 0x0001,    // Authorization wanted
       haveRole  = 0x01F0,    // A role is present
       Forwarding= 0x1000,    // Fowarding wanted
       ThirdPC   = 0x2000,    // This party copy wanted
-      SubCluster= 0x4000     // all.subcluster directive encountered
+      SubCluster= 0x4000,    // all.subcluster directive encountered
+      RdrTPC    = 0x8000
      };                      // These are set in Options below
 
 int   Options;               // Various options
 int   myPort;                // Port number being used
 
+// Directory and file creation mode controls
+//
+mode_t            dMask[2];  // Min/Max directory mode
+mode_t            fMask[2];  // Min/Max file      mode
+
 // TPC related things
 //
-char             *tpcRdrHost;     // TPC redirect target or null if none
-int               tpcRdrPort;     // TPC redirect target port number
+char             *tpcRdrHost[2];  // TPC redirect target or null if none
+int               tpcRdrPort[2];  // TPC redirect target port number
 
 // Networking
 //
@@ -371,9 +446,12 @@ const char   *Split(const char *Args, const char **Opq, char *Path, int Plen);
 private:
   
 char             *myRole;
+XrdOfsFSctl_PI   *FSctl_PC;       //    ->FSctl plugin (cache specific)
+XrdOfsFSctl_PI   *FSctl_PI;       //    ->FSctl plugin
 XrdAccAuthorize  *Authorization;  //    ->Authorization   Service
 XrdCmsClient     *Balancer;       //    ->Cluster Local   Interface
 XrdOfsEvs        *evsObject;      //    ->Event Notifier
+XrdOucPListAnchor*ossRPList;      //    ->Oss exoprt list
 
 XrdOfsPoscq      *poscQ;          //    -> poscQ if  persist on close enabled
 char             *poscLog;        //    -> Directory for posc recovery log
@@ -392,35 +470,54 @@ bool              prepAuth;       // Prepare requires authorization
 char              OssIsProxy;     // !0 if we detect the oss plugin is a proxy
 char              myRType[4];     // Role type for consistency with the cms
 
-XrdVersionInfo   *myVersion;      // Version number compiled against
+uint64_t          ossFeatures;    // The oss features
+
+int               usxMaxNsz;      // Maximum length of attribute name
+int               usxMaxVsz;      // Maximum length of attribute value
 
 static XrdOfsHandle     *dummyHandle;
 XrdSysMutex              ocMutex; // Global mutex for open/close
+
+bool              DirRdr;         // Opendir() can be redirected.
+bool              reProxy;        // Reproxying required for TPC
+bool              OssHasPGrw;     // True: oss implements full rgRead/Write
 
 /******************************************************************************/
 /*                            O t h e r   D a t a                             */
 /******************************************************************************/
 
+// Internal file attribute methods
+//
+int ctlFADel(XrdSfsFACtl &faCtl, XrdOucEnv &faEnv, XrdOucErrInfo &einfo);
+int ctlFAGet(XrdSfsFACtl &faCtl, XrdOucEnv &faEnv, XrdOucErrInfo &einfo);
+int ctlFALst(XrdSfsFACtl &faCtl, XrdOucEnv &faEnv, XrdOucErrInfo &einfo);
+int ctlFASet(XrdSfsFACtl &faCtl, XrdOucEnv &faEnv, XrdOucErrInfo &einfo);
+
 // Common functions
 //
-        int   remove(const char type, const char *path,
-                     XrdOucErrInfo &out_error, const XrdSecEntity     *client,
-                     const char *opaque);
+int   remove(const char type, const char *path, XrdOucErrInfo &out_error,
+             const XrdSecEntity *client, const char *opaque);
 
 // Function used during Configuration
 //
 int           ConfigDispFwd(char *buff, struct fwdOpt &Fwd);
 int           ConfigPosc(XrdSysError &Eroute);
 int           ConfigRedir(XrdSysError &Eroute, XrdOucEnv *EnvInfo);
+int           ConfigTPC(XrdSysError &Eroute, XrdOucEnv *EnvInfo);
 int           ConfigTPC(XrdSysError &Eroute);
-char         *ConfigTPCDir(XrdSysError &Eroute, const char *xPath);
+char         *ConfigTPCDir(XrdSysError &Eroute, const char *sfx,
+                                                const char *xPath=0);
 const char   *Fname(const char *);
 int           Forward(int &Result, XrdOucErrInfo &Resp, struct fwdOpt &Fwd,
                       const char *arg1=0, const char *arg2=0,
                       XrdOucEnv  *Env1=0, XrdOucEnv  *Env2=0);
+int           FSctl(XrdOfsFile &file, int cmd, int alen, const char *args,
+                    const XrdSecEntity *client);
 int           Reformat(XrdOucErrInfo &);
 const char   *theRole(int opts);
 int           xcrds(XrdOucStream &, XrdSysError &);
+int           xcrm(XrdOucStream &, XrdSysError &);
+int           xdirl(XrdOucStream &, XrdSysError &);
 int           xexp(XrdOucStream &, XrdSysError &, bool);
 int           xforward(XrdOucStream &, XrdSysError &);
 int           xmaxd(XrdOucStream &, XrdSysError &);
@@ -432,5 +529,6 @@ int           xtpc(XrdOucStream &, XrdSysError &);
 int           xtpcal(XrdOucStream &, XrdSysError &);
 int           xtpcr(XrdOucStream &, XrdSysError &);
 int           xtrace(XrdOucStream &, XrdSysError &);
+int           xatr(XrdOucStream &, XrdSysError &);
 };
 #endif

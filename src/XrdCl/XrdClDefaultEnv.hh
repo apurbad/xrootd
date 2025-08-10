@@ -21,8 +21,10 @@
 
 #include "XrdSys/XrdSysPthread.hh"
 #include "XrdCl/XrdClEnv.hh"
+#include "XrdVersion.hh"
 
 class XrdOucPinLoader;
+struct EnvInitializer;
 
 namespace XrdCl
 {
@@ -43,11 +45,22 @@ namespace XrdCl
   //----------------------------------------------------------------------------
   class DefaultEnv: public Env
   {
-    public:
+      friend struct ::EnvInitializer;
+
       //------------------------------------------------------------------------
       //! Constructor
       //------------------------------------------------------------------------
       DefaultEnv();
+
+    public:
+
+      //------------------------------------------------------------------------
+      //! Get client version
+      //------------------------------------------------------------------------
+      inline static std::string GetVersion()
+      {
+        return XrdVERSION;
+      }
 
       //------------------------------------------------------------------------
       //! Get default client environment
@@ -141,6 +154,13 @@ namespace XrdCl
       static PlugInFactory *GetPlugInFactory( const std::string url );
 
       //------------------------------------------------------------------------
+      //! Re-initialize the logging
+      //------------------------------------------------------------------------
+      static void ReInitializeLogging();
+
+    private:
+
+      //------------------------------------------------------------------------
       //! Initialize the environment
       //------------------------------------------------------------------------
       static void Initialize();
@@ -150,12 +170,7 @@ namespace XrdCl
       //------------------------------------------------------------------------
       static void Finalize();
 
-      //------------------------------------------------------------------------
-      //! Re-initialize the logging
-      //------------------------------------------------------------------------
-      static void ReInitializeLogging();
 
-    private:
       static void SetUpLog();
 
       static XrdSysMutex        sInitMutex;
@@ -171,6 +186,7 @@ namespace XrdCl
       static TransportManager  *sTransportManager;
       static PlugInManager     *sPlugInManager;
   };
+
 }
 
 static struct EnvInitializer
@@ -179,5 +195,6 @@ static struct EnvInitializer
     ~EnvInitializer();
     static int counter;
 } initializer;
+
 
 #endif // __XRD_CL_DEFAULT_ENV_HH__

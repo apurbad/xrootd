@@ -29,12 +29,12 @@
 /******************************************************************************/
   
 #include <unistd.h>
-#include <ctype.h>
-#include <errno.h>
+#include <cctype>
+#include <cerrno>
 #include <fcntl.h>
-#include <stdlib.h>
+#include <cstdlib>
 #include <strings.h>
-#include <stdio.h>
+#include <cstdio>
 #include <sys/param.h>
 
 #include "XrdBwm/XrdBwm.hh"
@@ -106,6 +106,8 @@ int XrdBwm::Configure(XrdSysError &Eroute) {
               return Eroute.Emsg("Config", errno, "open config file",
                                  ConfigFN);
            Config.Attach(cfgFD);
+           static const char *cvec[] = { "*** bwm ofs plugin config:", 0 };
+           Config.Capture(cvec);
 
            // Now start reading records until eof.
            //
@@ -114,7 +116,7 @@ int XrdBwm::Configure(XrdSysError &Eroute) {
                     if (ConfigXeq(var+4,Config,Eroute)) {Config.Echo();NoGo=1;}
                 }
 
-           // Now check if any errors occured during file i/o
+           // Now check if any errors occurred during file i/o
            //
            if ((retc = Config.LastError()))
            NoGo = Eroute.Emsg("Config", -retc, "read config file",

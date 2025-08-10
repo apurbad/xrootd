@@ -27,11 +27,11 @@
 /******************************************************************************/
 
 #include <unistd.h>
-#include <ctype.h>
-#include <errno.h>
-#include <stdlib.h>
+#include <cctype>
+#include <cerrno>
+#include <cstdlib>
 #include <strings.h>
-#include <stdio.h>
+#include <cstdio>
 #include <sys/param.h>
 #include <pwd.h>
 #include <sys/types.h>
@@ -58,7 +58,7 @@
 /*                 T r a c i n g  I n i t  O p t i o n s                      */
 /******************************************************************************/
 #ifndef NODEBUG
-#define POPTS(t,y)    {if (t) {t->Beg(epname); cerr <<y; t->End();}}
+#define POPTS(t,y)    {if (t) {t->Beg(epname); std::cerr <<y; t->End();}}
 #else
 #define POPTS(t,y)
 #endif
@@ -1916,13 +1916,13 @@ XrdSecProtocol *XrdSecProtocolpwdObject(const char              mode,
       if (erp) 
          erp->setErrInfo(ENOMEM, msg);
       else 
-         cerr <<msg <<endl;
+         std::cerr <<msg <<std::endl;
       return (XrdSecProtocol *)0;
    }
    //
    // We are done
    if (!erp)
-      cerr << "protocol object instantiated" << endl;
+      std::cerr << "protocol object instantiated" << std::endl;
    return prot;
 }}
 
@@ -3537,7 +3537,7 @@ int XrdSecProtocolpwd::QueryCrypt(String &fn, String &pwhash)
 {
    // Retrieve crypt-like password-hash from $HOME/fn or from system password files,
    // if accessible.
-   // To avoid problems with NFS-root-squashing, if 'root' changes temporarly the
+   // To avoid problems with NFS-root-squashing, if 'root' changes temporarily the
    // uid/gid to those of the target user (usr).   
    // If OK, returns pass length and fill 'pass' with the password, null-terminated.
    // ('pass' is allocated externally to contain max lpwmax bytes).
@@ -3572,7 +3572,7 @@ int XrdSecProtocolpwd::QueryCrypt(String &fn, String &pwhash)
       XrdSysPrivGuard priv(uid, pw->pw_gid);
       bool go = priv.Valid();
       if (!go) {
-         PRINT("problems acquiring temporarly identity: "<<hs->User);
+         PRINT("problems acquiring temporarily identity: "<<hs->User);
       }
 
       // The file
@@ -3651,7 +3651,7 @@ int XrdSecProtocolpwd::QueryCrypt(String &fn, String &pwhash)
          } else
             pwhash = spw->sp_pwdp;
       } else {
-         NOTIFY("problems acquiring temporarly superuser privileges");
+         NOTIFY("problems acquiring temporarily superuser privileges");
       }
    }
 #else

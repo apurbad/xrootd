@@ -30,13 +30,17 @@
 
 #include <string>
 #include <vector>
-#include <time.h>
+#include <ctime>
+#include <mutex>
+#include <unordered_map>
+#include <memory>
 
 #include "XrdSys/XrdSysPthread.hh"
 
 class XrdSysError;
 class XrdOucTrace;
 class XrdThrottleTimer;
+class XrdXrootdGStream;
 
 class XrdThrottleManager
 {
@@ -46,6 +50,9 @@ friend class XrdThrottleTimer;
 public:
 
 void        Init();
+
+bool        OpenFile(const std::string &entity, std::string &open_error_message);
+bool        CloseFile(const std::string &entity);
 
 void        Apply(int reqsize, int reqops, int uid);
 
@@ -57,6 +64,12 @@ void        SetThrottles(float reqbyterate, float reqoprate, int concurrency, fl
 
 void        SetLoadShed(std::string &hostname, unsigned port, unsigned frequency)
             {m_loadshed_host = hostname; m_loadshed_port = port; m_loadshed_frequency = frequency;}
+
+void        SetMaxOpen(unsigned long max_open) {m_max_open = max_open;}
+
+void        SetMaxConns(unsigned long max_conns) {m_max_conns = max_conns;}
+
+void        SetMonitor(XrdXrootdGStream *gstream) {m_gstream = gstream;}
 
 //int         Stats(char *buff, int blen, int do_sync=0) {return m_pool.Stats(buff, blen, do_sync);}
 
@@ -115,10 +128,12 @@ std::vector<int> m_secondary_ops_shares;
 int         m_last_round_allocation;
 
 // Active IO counter
-int         m_io_counter;
+int         m_io_active;
 struct timespec m_io_wait;
+unsigned    m_io_total{0};
 // Stable IO counters - must hold m_compute_var lock when reading/writing;
-int         m_stable_io_counter;
+int m_stable_io_active;
+int m_stable_io_total{0}; // It would take ~3 years to overflow a 32-bit unsigned integer at 100Hz of IO operations.
 struct timespec m_stable_io_wait;
 
 // Load shed details
@@ -126,6 +141,17 @@ std::string m_loadshed_host;
 unsigned m_loadshed_port;
 unsigned m_loadshed_frequency;
 int m_loadshed_limit_hit;
+
+// Maximum number of open files
+unsigned long m_max_open{0};
+unsigned long m_max_conns{0};
+std::unordered_map<std::string, unsigned long> m_file_counters;
+std::unordered_map<std::string, unsigned long> m_conn_counters;
+std::unordered_map<std::string, std::unique_ptr<std::unordered_map<pid_t, unsigned long>>> m_active_conns;
+std::mutex m_file_mutex;
+
+// Monitoring handle, if configured
+XrdXrootdGStream* m_gstream{nullptr};
 
 static const char *TraceID;
 
@@ -141,7 +167,7 @@ public:
 void StopTimer()
 {
    struct timespec end_timer = {0, 0};
-#if defined(__linux__)
+#if defined(__linux__) || defined(__APPLE__) || defined(__GNU__) || (defined(__FreeBSD_kernel__) && defined(__GLIBC__))
    int retval = clock_gettime(clock_id, &end_timer);
 #else
    int retval = -1;
@@ -177,7 +203,7 @@ protected:
 XrdThrottleTimer(XrdThrottleManager & manager) :
    m_manager(manager)
 {
-#if defined(__linux__)
+#if defined(__linux__) || defined(__APPLE__) || defined(__GNU__) || (defined(__FreeBSD_kernel__) && defined(__GLIBC__))
    int retval = clock_gettime(clock_id, &m_timer);
 #else
    int retval = -1;
@@ -193,7 +219,7 @@ private:
 XrdThrottleManager &m_manager;
 struct timespec m_timer;
 
-static int clock_id;
+static clockid_t clock_id;
 };
 
 #endif

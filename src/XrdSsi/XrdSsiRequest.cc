@@ -27,15 +27,18 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <errno.h>
-#include <stdlib.h>
-#include <string.h>
+#include <cerrno>
+#include <cstdlib>
+#include <cstring>
 
-#include "XrdSsi/XrdSsiPacer.hh"
 #include "XrdSsi/XrdSsiRespInfo.hh"
 #include "XrdSsi/XrdSsiResponder.hh"
 #include "XrdSsi/XrdSsiRequest.hh"
 #include "XrdSsi/XrdSsiStream.hh"
+
+#ifndef ENODATA
+#define ENODATA ENOATTR
+#endif
   
 /******************************************************************************/
 /*                        S t a t i c   M e m b e r s                         */
@@ -53,7 +56,7 @@ XrdSsiMutex ubMutex(XrdSsiMutex::Recursive);
 XrdSsiRequest::XrdSsiRequest(const char *reqid, uint16_t tmo)
                             : reqID(reqid), rrMutex(&XrdSsi::ubMutex),
                               theRespond(0), rsvd1(0), epNode(0),
-                              detTTL(0), tOut(0), onClient(true), rsvd2(0) {}
+                              detTTL(0), tOut(0), onClient(true), flags(0) {}
   
 /******************************************************************************/
 /* Private:                     C l e a n U p                                */
@@ -171,7 +174,7 @@ void XrdSsiRequest::GetResponseData(char *buff, int  blen)
            {if (CopyData(buff, blen)) return;}
    else    errInfo.Set("Not a stream", ENODATA);
 
-// If we got here then an error occured during the setup, reflect the error
+// If we got here then an error occurred during the setup, reflect the error
 // via the callback (in the future we will schedule a new thread).
 //
    ProcessResponseData(errInfo, buff, -1, true);
@@ -188,16 +191,14 @@ void XrdSsiRequest::ReleaseRequestBuffer()
 }
 
 /******************************************************************************/
-/*                   R e s t a r t D a t a R e s p o n s e                    */
+/*                              S e t R e t r y                               */
 /******************************************************************************/
   
-XrdSsiRequest::RDR_Info XrdSsiRequest::RestartDataResponse
-                                      (XrdSsiRequest::RDR_How  rhow,
-                                       const char             *reqid
-                                      )
+void XrdSsiRequest::SetRetry(bool onoff)
 {
-   RDR_Info rInfo;
 
-   XrdSsiPacer::Run(rInfo, rhow, reqid);
-   return rInfo;
+// Set flag as needed
+//
+if (onoff) flags |=  isaRetry;
+   else    flags &= ~isaRetry;
 }

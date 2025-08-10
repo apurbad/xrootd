@@ -44,7 +44,7 @@ public:
 //
             XrdOucProg(XrdSysError *errobj=0, int efd=-1)
                       : eDest(errobj), myStream(0), myProc(0), ArgBuff(0),
-                        numArgs(0), theEFD(efd) {Arg[0] = 0;}
+                        Arg(&ArgBuff), numArgs(0), theEFD(efd) {}
 
            ~XrdOucProg();
 
@@ -65,34 +65,41 @@ int Feed(const char *data) {return Feed(data, (int)strlen(data));}
 // getStream() returns the stream created by Start(). Use the object to get
 // lines written by the started program.
 //
-XrdOucStream *getStream() {return myStream;}
+XrdOucStream *getStream() const {return myStream;}
+
+// Return true if this program is a local in-line executable.
+//
+bool isLocal() {return myProc != 0;}
 
 // Run executes the command that was passed via Setup(). You may pass
 // additional arguments to be appended to the existing ones. The
 // method also allows envars to be set in forked process via envV vector
 // which contains strings "var=val" and terminaes with a null pointer.
+// When using the form without a stream pointer, command output is thrown away.
 //
-int         Run(XrdOucStream *Sp, const char *argV[], int argc=0,
-                                  const char *envV[]=0);
+int          Run(XrdOucStream *Sp, const char *argV[], int argc=0,
+                                   const char *envV[]=0) const;
+
+int          Run(const char *argV[], int argC, const char *envV[]=0) const;
 
 // Run executes the command that was passed via Setup(). You may pass
 // up to four additional arguments that will be added to the end of any
 // existing arguments. The ending status code of the program is returned.
 //
 int          Run(XrdOucStream *Sp,  const char *arg1=0, const char *arg2=0,
-                                    const char *arg3=0, const char *arg4=0);
+                                    const char *arg3=0, const char *arg4=0) const;
 
 int          Run(const char *arg1=0, const char *arg2=0,
-                 const char *arg3=0, const char *arg4=0);
+                 const char *arg3=0, const char *arg4=0) const;
 
 int          Run(char *outBuff, int outBsz,
                  const char *arg1=0, const char *arg2=0,
-                 const char *arg3=0, const char *arg4=0);
+                 const char *arg3=0, const char *arg4=0) const;
 
 // RunDone should be called to drain the output stream and get the ending
 // status of the running process.
 //
-int          RunDone(XrdOucStream &cmd);
+int          RunDone(XrdOucStream &cmd) const;
 
 // Start executes the command that was passed via Setup(). The started
 // program is expected to linger so that you can send directives to it
@@ -115,14 +122,14 @@ int          Setup(const char *prog,
 /******************************************************************************/
   
 private:
+  void          Reset();
   int           Restart();
   XrdSysError  *eDest;
   XrdOucStream *myStream;
   int           (*myProc)(XrdOucStream *, char **, int);
   char         *ArgBuff;
-  char         *Arg[64];
+  char        **Arg;
   int           numArgs;
-  int           lenArgs;
   int           theEFD;
 };
 #endif

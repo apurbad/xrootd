@@ -58,6 +58,11 @@ namespace PyXRootD
       static PyObject* Prepare( FileSystem *self, PyObject *args, PyObject *kwds );
       static PyObject* GetProperty( FileSystem *self, PyObject *args, PyObject *kwds );
       static PyObject* SetProperty( FileSystem *self, PyObject *args, PyObject *kwds );
+      static PyObject* Cat( FileSystem *self, PyObject *args, PyObject *kwds );
+      static PyObject* SetXAttr( FileSystem *self, PyObject *args, PyObject *kwds );
+      static PyObject* GetXAttr( FileSystem *self, PyObject *args, PyObject *kwds );
+      static PyObject* DelXAttr( FileSystem *self, PyObject *args, PyObject *kwds );
+      static PyObject* ListXAttr( FileSystem *self, PyObject *args, PyObject *kwds );
 
     public:
       PyObject_HEAD
@@ -110,6 +115,16 @@ namespace PyXRootD
           (PyCFunction) PyXRootD::FileSystem::GetProperty, METH_VARARGS | METH_KEYWORDS, NULL },
       { "set_property",
           (PyCFunction) PyXRootD::FileSystem::SetProperty, METH_VARARGS | METH_KEYWORDS, NULL },
+      { "cat",
+          (PyCFunction) PyXRootD::FileSystem::Cat,         METH_VARARGS | METH_KEYWORDS, NULL },
+      { "set_xattr",
+          (PyCFunction) PyXRootD::FileSystem::SetXAttr,    METH_VARARGS | METH_KEYWORDS, NULL },
+      { "get_xattr",
+          (PyCFunction) PyXRootD::FileSystem::GetXAttr,    METH_VARARGS | METH_KEYWORDS, NULL },
+      { "del_xattr",
+          (PyCFunction) PyXRootD::FileSystem::DelXAttr,    METH_VARARGS | METH_KEYWORDS, NULL },
+      { "list_xattr",
+          (PyCFunction) PyXRootD::FileSystem::ListXAttr,    METH_VARARGS | METH_KEYWORDS, NULL },
       { NULL } /* Sentinel */
     };
 

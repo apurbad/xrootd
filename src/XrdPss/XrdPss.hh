@@ -30,10 +30,12 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <errno.h>
+#include <cerrno>
 #include <unistd.h>
 #include <sys/types.h>
+#include <vector>
 #include "XrdSys/XrdSysHeaders.hh"
+#include "XrdOuc/XrdOucECMsg.hh"
 #include "XrdOuc/XrdOucExport.hh"
 #include "XrdOuc/XrdOucName2Name.hh"
 #include "XrdOuc/XrdOucPList.hh"
@@ -51,11 +53,20 @@ int     Close(long long *retsz=0);
 int     Opendir(const char *, XrdOucEnv &);
 int     Readdir(char *buff, int blen);
 
+// Store the `buf` pointer in the directory object.  Future calls to `Readdir`
+// will, as a side-effect, fill in the corresponding `stat` information in
+// the memory referred to from the pointer.
+//
+// Returns -errno on failure; otherwise, returns 0 and stashes away the pointer.
+int     StatRet(struct stat *buf);
+
         // Constructor and destructor
-        XrdPssDir(const char *tid) : tident(tid), myDir(0) {}
+        XrdPssDir(const char *tid)
+                 : XrdOssDF(tid, XrdOssDF::DF_isDir|XrdOssDF::DF_isProxy),
+                   myDir(0) {}
+
        ~XrdPssDir() {if (myDir) Close();}
 private:
-const    char      *tident;
          DIR       *myDir;
 };
   
@@ -64,6 +75,7 @@ const    char      *tident;
 /******************************************************************************/
 
 struct XrdOucIOVec;
+class  XrdSecEntity;
 class  XrdSfsAio;
   
 class XrdPssFile : public XrdOssDF
@@ -81,8 +93,12 @@ int     Fstat(struct stat *);
 int     Fsync();
 int     Fsync(XrdSfsAio *aiop);
 int     Ftruncate(unsigned long long);
-off_t   getMmap(void **addr);
-int     isCompressed(char *cxidp=0);
+ssize_t pgRead (void* buffer, off_t offset, size_t rdlen,
+                uint32_t* csvec, uint64_t opts);
+int     pgRead (XrdSfsAio* aioparm, uint64_t opts);
+ssize_t pgWrite(void* buffer, off_t offset, size_t wrlen,
+                uint32_t* csvec, uint64_t opts);
+int     pgWrite(XrdSfsAio* aioparm, uint64_t opts);
 ssize_t Read(               off_t, size_t);
 ssize_t Read(       void *, off_t, size_t);
 int     Read(XrdSfsAio *aiop);
@@ -92,17 +108,31 @@ ssize_t Write(const void *, off_t, size_t);
 int     Write(XrdSfsAio *aiop);
  
          // Constructor and destructor
-         XrdPssFile(const char *tid) : tident(tid), tpcPath(0)
-                                       {fd = -1;}
+         XrdPssFile(const char *tid)
+                   : XrdOssDF(tid, XrdOssDF::DF_isFile|XrdOssDF::DF_isProxy),
+                     rpInfo(0), tpcPath(0), entity(0) {}
 
 virtual ~XrdPssFile() {if (fd >= 0) Close();
+                       if (rpInfo) delete(rpInfo);
                        if (tpcPath) free(tpcPath);
                       }
 
 private:
 
-const char *tident;
-      char *tpcPath;
+struct tprInfo
+      {char  *tprPath;
+       char  *dstURL;
+       size_t fSize;
+
+              tprInfo(const char *fn) : tprPath(strdup(fn)),dstURL(0),fSize(0)
+                                        {}
+             ~tprInfo() {if (tprPath) free(tprPath);
+                         if (dstURL)  free(dstURL);
+                        }
+      } *rpInfo;
+
+      char         *tpcPath;
+const XrdSecEntity *entity;
 };
 
 /******************************************************************************/
@@ -114,6 +144,7 @@ class XrdOucEnv;
 class XrdOucStream;
 class XrdOucTList;
 class XrdPssUrlInfo;
+class XrdSecsssID;
 class XrdSysError;
 
 struct XrdVersionInfo;
@@ -121,37 +152,44 @@ struct XrdVersionInfo;
 class XrdPssSys : public XrdOss
 {
 public:
-virtual XrdOssDF *newDir(const char *tident)
+virtual XrdOssDF *newDir(const char *tident) override
                        {return (XrdOssDF *)new XrdPssDir(tident);}
-virtual XrdOssDF *newFile(const char *tident)
+virtual XrdOssDF *newFile(const char *tident) override
                        {return (XrdOssDF *)new XrdPssFile(tident);}
 
-int       Chmod(const char *, mode_t mode, XrdOucEnv *eP=0);
+virtual void      Connect(XrdOucEnv &) override;
+
+virtual void      Disc(XrdOucEnv &) override;
+
+int       Chmod(const char *, mode_t mode, XrdOucEnv *eP=0) override;
+bool      ConfigMapID();
 virtual
-int       Create(const char *, const char *, mode_t, XrdOucEnv &, int opts=0);
-void      EnvInfo(XrdOucEnv *envP);
-int       Init(XrdSysLogger *, const char *);
-int       Lfn2Pfn(const char *Path, char *buff, int blen);
+int       Create(const char *, const char *, mode_t, XrdOucEnv &, int opts=0) override;
+void      EnvInfo(XrdOucEnv *envP) override;
+uint64_t  Features() override {return myFeatures;}
+int       Init(XrdSysLogger *, const char *) override {return -ENOTSUP;}
+int       Init(XrdSysLogger *, const char *, XrdOucEnv *envP) override;
+int       Lfn2Pfn(const char *Path, char *buff, int blen) override;
 const
-char     *Lfn2Pfn(const char *Path, char *buff, int blen, int &rc);
-int       Mkdir(const char *, mode_t mode, int mkpath=0, XrdOucEnv *eP=0);
-int       Remdir(const char *, int Opts=0, XrdOucEnv *eP=0);
+char     *Lfn2Pfn(const char *Path, char *buff, int blen, int &rc) override;
+int       Mkdir(const char *, mode_t mode, int mkpath=0, XrdOucEnv *eP=0) override;
+int       Remdir(const char *, int Opts=0, XrdOucEnv *eP=0) override;
 int       Rename(const char *, const char *,
-                 XrdOucEnv *eP1=0, XrdOucEnv *eP2=0);
-int       Stat(const char *, struct stat *, int opts=0, XrdOucEnv *eP=0);
-int       Truncate(const char *, unsigned long long, XrdOucEnv *eP=0);
-int       Unlink(const char *, int Opts=0, XrdOucEnv *eP=0);
+                 XrdOucEnv *eP1=0, XrdOucEnv *eP2=0) override;
+int       Stat(const char *, struct stat *, int opts=0, XrdOucEnv *eP=0) override;
+int       Stats(char *bp, int bl) override;
+int       Truncate(const char *, unsigned long long, XrdOucEnv *eP=0) override;
+int       Unlink(const char *, int Opts=0, XrdOucEnv *eP=0) override;
 
 static const int    PolNum = 2;
 enum   PolAct {PolPath = 0, PolObj = 1};
 
+static int   Info(int rc);
 static int   P2DST(int &retc, char *hBuff, int hBlen, PolAct pType,
                    const char *path);
 static int   P2OUT(char *pbuff, int pblen, XrdPssUrlInfo &uInfo);
 static int   P2URL(char *pbuff, int pblen, XrdPssUrlInfo &uInfo,
                    bool doN2N=true);
-static
-const  char *valProt(const char *pname, int &plen, int adj=0);
 
 static const char  *ConfigFN;       // -> Pointer to the config file name
 static const char  *myHost;
@@ -161,6 +199,7 @@ XrdOucPListAnchor   XPList;        // Exported path list
 
 static XrdNetSecurity *Police[PolNum];
 static XrdOucTList *ManList;
+static       char  *fileOrgn;
 static const char  *protName;
 static const char  *hdrData;
 static int          hdrLen;
@@ -169,31 +208,34 @@ static int          Workers;
 static int          Trace;
 static int          dcaCTime;
 
-static bool         outProxy; // True means outgoing proxy
-static bool         pfxProxy; // True means outgoing proxy is prefixed
 static bool         xLfn2Pfn;
 static bool         dcaCheck;
+static bool         dcaWorld;
+static bool         deferID;  // Defer ID mapping until needed
+static bool         reProxy;  // TPC requires reproxing
 
          XrdPssSys();
 virtual ~XrdPssSys() {}
 
 private:
 
+char              *HostArena;// -> path qualification for remote origins
 char              *LocalRoot;// -> pss Local n2n root, if any
 XrdOucName2Name   *theN2N;   // -> File mapper object
 unsigned long long DirFlags; // Defaults for exports
 XrdVersionInfo    *myVersion;// -> Compilation version
+XrdSecsssID       *idMapper; // -> Auth ID mapper
+uint64_t          myFeatures;// Our feature set
 
-int    Configure(const char *);
+int    Configure(const char *, XrdOucEnv *);
 int    ConfigProc(const char *ConfigFN);
 int    ConfigXeq(char*, XrdOucStream&);
-const
-char  *getDomain(const char *hName);
 int    xconf(XrdSysError *Eroute, XrdOucStream &Config);
 int    xdef( XrdSysError *Eroute, XrdOucStream &Config);
 int    xdca( XrdSysError *errp,   XrdOucStream &Config);
 int    xexp( XrdSysError *Eroute, XrdOucStream &Config);
 int    xperm(XrdSysError *errp,   XrdOucStream &Config);
+int    xpers(XrdSysError *errp,   XrdOucStream &Config);
 int    xorig(XrdSysError *errp,   XrdOucStream &Config);
 };
 #endif

@@ -20,14 +20,17 @@
 #define __XRD_CL_ASYNC_SOCKET_HANDLER_HH__
 
 #include "XrdCl/XrdClSocket.hh"
-#include "XrdCl/XrdClConstants.hh"
 #include "XrdCl/XrdClDefaultEnv.hh"
 #include "XrdCl/XrdClPoller.hh"
 #include "XrdCl/XrdClPostMasterInterfaces.hh"
 #include "XrdCl/XrdClTaskManager.hh"
-
-#include <sys/types.h>
-#include <sys/socket.h>
+#include "XrdCl/XrdClXRootDResponses.hh"
+#include "XrdCl/XrdClURL.hh"
+#include "XrdCl/XrdClAsyncMsgReader.hh"
+#include "XrdCl/XrdClAsyncHSReader.hh"
+#include "XrdCl/XrdClAsyncMsgWriter.hh"
+#include "XrdCl/XrdClAsyncHSWriter.hh"
+#include "XrdOuc/XrdOucCompiler.hh"
 
 namespace XrdCl
 {
@@ -39,40 +42,16 @@ namespace XrdCl
   //----------------------------------------------------------------------------
   class AsyncSocketHandler: public SocketHandler
   {
-      //------------------------------------------------------------------------
-      // We need an extra task for rescheduling of HS request that received
-      // a wait response.
-      //------------------------------------------------------------------------
-      class WaitTask: public XrdCl::Task
-      {
-        public:
-          WaitTask( XrdCl::AsyncSocketHandler *handler, XrdCl::Message *msg ):
-            pHandler( handler ), pMsg( msg )
-          {
-            std::ostringstream o;
-            o << "WaitTask for: 0x" << msg;
-            SetName( o.str() );
-          }
-
-          virtual time_t Run( time_t now )
-          {
-            pHandler->RetryHSMsg( pMsg );
-            return 0;
-          }
-
-        private:
-          XrdCl::AsyncSocketHandler *pHandler;
-          XrdCl::Message            *pMsg;
-      };
-
     public:
       //------------------------------------------------------------------------
       //! Constructor
       //------------------------------------------------------------------------
-      AsyncSocketHandler( Poller           *poller,
+      AsyncSocketHandler( const URL        &url,
+                          Poller           *poller,
                           TransportHandler *transport,
                           AnyObject        *channelData,
-                          uint16_t          subStreamNum );
+                          uint16_t          subStreamNum,
+                          Stream           *strm );
 
       //------------------------------------------------------------------------
       //! Destructor
@@ -98,17 +77,12 @@ namespace XrdCl
       //------------------------------------------------------------------------
       //! Connect to the currently set address
       //------------------------------------------------------------------------
-      Status Connect( time_t timeout );
+      XRootDStatus Connect( time_t timeout );
 
       //------------------------------------------------------------------------
       //! Close the connection
       //------------------------------------------------------------------------
-      Status Close();
-
-      //------------------------------------------------------------------------
-      //! Set a stream object to be notified about the status of the operations
-      //------------------------------------------------------------------------
-      void SetStream( Stream *stream );
+      XRootDStatus Close();
 
       //------------------------------------------------------------------------
       //! Handle a socket event
@@ -118,21 +92,21 @@ namespace XrdCl
       //------------------------------------------------------------------------
       //! Enable uplink
       //------------------------------------------------------------------------
-      Status EnableUplink()
+      XRootDStatus EnableUplink()
       {
         if( !pPoller->EnableWriteNotification( pSocket, true, pTimeoutResolution ) )
-          return Status( stFatal, errPollerError );
-        return Status();
+          return XRootDStatus( stFatal, errPollerError );
+        return XRootDStatus();
       }
 
       //------------------------------------------------------------------------
       //! Disable uplink
       //------------------------------------------------------------------------
-      Status DisableUplink()
+      XRootDStatus DisableUplink()
       {
         if( !pPoller->EnableWriteNotification( pSocket, false ) )
-          return Status( stFatal, errPollerError );
-        return Status();
+          return XRootDStatus( stFatal, errPollerError );
+        return XRootDStatus();
       }
 
       //------------------------------------------------------------------------
@@ -151,115 +125,118 @@ namespace XrdCl
         return pLastActivity;
       }
 
-    private:
+      //------------------------------------------------------------------------
+      //! Get the IP stack
+      //------------------------------------------------------------------------
+      std::string GetIpStack() const;
+
+      //------------------------------------------------------------------------
+      //! Get IP address
+      //------------------------------------------------------------------------
+      std::string GetIpAddr();
+
+      //------------------------------------------------------------------------
+      //! Get hostname
+      //------------------------------------------------------------------------
+      std::string GetHostName();
+
+    protected:
+
+      //------------------------------------------------------------------------
+      //! Convert Stream object and sub-stream number to stream name
+      //------------------------------------------------------------------------
+      static std::string ToStreamName( const URL &url, uint16_t strmnb );
 
       //------------------------------------------------------------------------
       // Connect returned
       //------------------------------------------------------------------------
-      void OnConnectionReturn();
+      virtual bool OnConnectionReturn() XRD_WARN_UNUSED_RESULT;
 
       //------------------------------------------------------------------------
       // Got a write readiness event
       //------------------------------------------------------------------------
-      void OnWrite();
+      bool OnWrite() XRD_WARN_UNUSED_RESULT;
 
       //------------------------------------------------------------------------
       // Got a write readiness event while handshaking
       //------------------------------------------------------------------------
-      void OnWriteWhileHandshaking();
-
-
-      Status WriteMessageAndRaw( Message *toWrite, Message *&sign );
-
-      Status WriteSeparately( Message *toWrite, Message *&sign );
-
-      //------------------------------------------------------------------------
-      // Write the current message
-      //------------------------------------------------------------------------
-      Status WriteCurrentMessage( Message *toWrite );
-
-      //------------------------------------------------------------------------
-      // Write the message, its signature and its body
-      //------------------------------------------------------------------------
-      Status WriteVMessage( Message   *toWrite,
-                            Message   *&sign,
-                            ChunkList *chunks,
-                            uint32_t  *asyncOffset );
+      bool OnWriteWhileHandshaking() XRD_WARN_UNUSED_RESULT;
 
       //------------------------------------------------------------------------
       // Got a read readiness event
       //------------------------------------------------------------------------
-      void OnRead();
+      bool OnRead() XRD_WARN_UNUSED_RESULT;
 
       //------------------------------------------------------------------------
       // Got a read readiness event while handshaking
       //------------------------------------------------------------------------
-      void OnReadWhileHandshaking();
+      bool OnReadWhileHandshaking() XRD_WARN_UNUSED_RESULT;
 
       //------------------------------------------------------------------------
-      // Read a message
+      // Handle the handshake message
       //------------------------------------------------------------------------
-      Status ReadMessage( Message *&toRead );
+      bool HandleHandShake( std::unique_ptr<Message> msg )
+                            XRD_WARN_UNUSED_RESULT;
+
+      //------------------------------------------------------------------------
+      // Prepare the next step of the hand-shake procedure
+      //------------------------------------------------------------------------
+      bool HandShakeNextStep( bool done ) XRD_WARN_UNUSED_RESULT;
 
       //------------------------------------------------------------------------
       // Handle fault
       //------------------------------------------------------------------------
-      void OnFault( Status st );
+      void OnFault( XRootDStatus st );
 
       //------------------------------------------------------------------------
       // Handle fault while handshaking
       //------------------------------------------------------------------------
-      void OnFaultWhileHandshaking( Status st );
+      void OnFaultWhileHandshaking( XRootDStatus st );
 
       //------------------------------------------------------------------------
       // Handle write timeout event
       //------------------------------------------------------------------------
-      void OnWriteTimeout();
+      bool OnWriteTimeout() XRD_WARN_UNUSED_RESULT;
 
       //------------------------------------------------------------------------
       // Handle read timeout event
       //------------------------------------------------------------------------
-      void OnReadTimeout();
+      bool OnReadTimeout() XRD_WARN_UNUSED_RESULT;
 
       //------------------------------------------------------------------------
       // Handle timeout event while handshaking
       //------------------------------------------------------------------------
-      void OnTimeoutWhileHandshaking();
+      bool OnTimeoutWhileHandshaking() XRD_WARN_UNUSED_RESULT;
 
       //------------------------------------------------------------------------
-      // Get signature for given message
+      // Handle header corruption in case of kXR_status response
       //------------------------------------------------------------------------
-      Status GetSignature( Message *toSign, Message *&sign );
+      void OnHeaderCorruption();
 
       //------------------------------------------------------------------------
-      // Initialize the iovec with given message
+      // Carry out the TLS hand-shake
+      //
+      // The TLS hand-shake is being initiated in HandleHandShake() by calling
+      // Socket::TlsHandShake(), however it returns suRetry the TLS hand-shake
+      // needs to be followed up by OnTlsHandShake().
+      //
+      // However, once the TLS connection has been established the server may
+      // decide to redo the TLS hand-shake at any time, this operation is handled
+      // under the hood by read and write requests and facilitated by
+      // Socket::MapEvent()
       //------------------------------------------------------------------------
-      inline void ToIov( Message &msg, iovec &iov );
+      XRootDStatus DoTlsHandShake();
 
       //------------------------------------------------------------------------
-      // Update iovec after write
+      // Handle read/write event if we are in the middle of a TLS hand-shake
       //------------------------------------------------------------------------
-      inline void UpdateAfterWrite( Message &msg, iovec &iov, int &bytesRead );
+      // Handle read/write event if we are in the middle of a TLS hand-shake
+      bool OnTLSHandShake() XRD_WARN_UNUSED_RESULT;
 
       //------------------------------------------------------------------------
-      // Add chunks to the given iovec
+      // Prepare a HS writer for sending and enable uplink
       //------------------------------------------------------------------------
-      inline uint32_t ToIov( ChunkList       *chunks,
-                             const uint32_t  *offset,
-                             iovec           *iov );
-
-      //------------------------------------------------------------------------
-      // Update raw data after write
-      //------------------------------------------------------------------------
-      inline void UpdateAfterWrite( ChunkList  *chunks,
-                                    uint32_t   *offset,
-                                    iovec      *iov,
-                                    int        &bytesWritten );
-
-      //------------------------------------------------------------------------
-      // Retry hand shake message
-      //------------------------------------------------------------------------
-      void RetryHSMsg( Message *msg );
+      bool SendHSMsg() XRD_WARN_UNUSED_RESULT;
 
       //------------------------------------------------------------------------
       // Extract the value of a wait response
@@ -271,12 +248,19 @@ namespace XrdCl
       inline kXR_int32 HandleWaitRsp( Message *rsp );
 
       //------------------------------------------------------------------------
-      //! Classify errno while reading/writing
-      //!
-      //! Once we are at R5, change Transport interface and use:
-      //!   Transport::ClassifyErrno
+      // Check if HS wait time elapsed
       //------------------------------------------------------------------------
-      Status ClassifyErrno( int error );
+      bool CheckHSWait() XRD_WARN_UNUSED_RESULT;
+
+      //------------------------------------------------------------------------
+      // Handler for read related socket events
+      //------------------------------------------------------------------------
+      inline bool EventRead( uint8_t type ) XRD_WARN_UNUSED_RESULT;
+
+      //------------------------------------------------------------------------
+      // Handler for write related socket events
+      //------------------------------------------------------------------------
+      inline bool EventWrite( uint8_t type ) XRD_WARN_UNUSED_RESULT;
 
       //------------------------------------------------------------------------
       // Data members
@@ -288,24 +272,22 @@ namespace XrdCl
       Stream                        *pStream;
       std::string                    pStreamName;
       Socket                        *pSocket;
-      Message                       *pIncoming;
-      Message                       *pHSIncoming;
-      Message                       *pOutgoing;
-      Message                       *pSignature;
-      Message                       *pHSOutgoing;
       XrdNetAddr                     pSockAddr;
-      HandShakeData                 *pHandShakeData;
+      std::unique_ptr<HandShakeData> pHandShakeData;
       bool                           pHandShakeDone;
       uint16_t                       pTimeoutResolution;
       time_t                         pConnectionStarted;
       time_t                         pConnectionTimeout;
-      bool                           pHeaderDone;
-      std::pair<IncomingMsgHandler*, bool> pIncHandler;
-      bool                           pOutMsgDone;
-      OutgoingMsgHandler            *pOutHandler;
-      uint32_t                       pIncMsgSize;
-      uint32_t                       pOutMsgSize;
       time_t                         pLastActivity;
+      time_t                         pHSWaitStarted;
+      time_t                         pHSWaitSeconds;
+      URL                            pUrl;
+      bool                           pTlsHandShakeOngoing;
+
+      std::unique_ptr<AsyncHSWriter>  hswriter;
+      std::unique_ptr<AsyncMsgReader> rspreader;
+      std::unique_ptr<AsyncHSReader>  hsreader;
+      std::unique_ptr<AsyncMsgWriter> reqwriter;
   };
 }
 

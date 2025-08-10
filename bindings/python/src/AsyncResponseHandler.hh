@@ -102,7 +102,7 @@ namespace PyXRootD
         //----------------------------------------------------------------------
         // Convert the host list
         //----------------------------------------------------------------------
-        PyObject *pyhostlist = PyList_New( 0 );
+        PyObject *pyhostlist = NULL;
         if ( hostList != NULL ) {
           pyhostlist = ConvertType<XrdCl::HostList>( hostList );
           if ( pyhostlist == NULL || PyErr_Occurred() ) {
@@ -118,6 +118,7 @@ namespace PyXRootD
         //----------------------------------------------------------------------
         // Build the callback arguments
         //----------------------------------------------------------------------
+        if (pyhostlist == NULL) pyhostlist = PyList_New( 0 );
         if (pyresponse == NULL) pyresponse = Py_BuildValue( "" );
         PyObject *args = Py_BuildValue( "(OOO)", pystatus, pyresponse, pyhostlist );
         if ( !args || PyErr_Occurred() ) {
@@ -158,7 +159,9 @@ namespace PyXRootD
         Py_XDECREF( pyhostlist );
         Py_XDECREF( callbackResult );
         if( finalrsp )
+        {
           Py_XDECREF( this->callback );
+        }
 
         PyGILState_Release( state );
 
@@ -247,7 +250,9 @@ namespace PyXRootD
         Py_XDECREF( pyresponse );
         Py_XDECREF( callbackResult );
         if( finalrsp )
+        {
           Py_XDECREF( this->callback );
+        }
 
         PyGILState_Release( state );
 

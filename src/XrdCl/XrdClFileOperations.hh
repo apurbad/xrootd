@@ -29,12 +29,13 @@
 #include "XrdCl/XrdClFile.hh"
 #include "XrdCl/XrdClOperations.hh"
 #include "XrdCl/XrdClOperationHandlers.hh"
+#include "XrdCl/XrdClCtx.hh"
 
 namespace XrdCl
 {
 
   //----------------------------------------------------------------------------
-  //! Base class for all file releated operations
+  //! Base class for all file related operations
   //!
   //! @arg Derived : the class that derives from this template (CRTP)
   //! @arg HasHndl : true if operation has a handler, false otherwise
@@ -53,17 +54,7 @@ namespace XrdCl
       //! @param f    : file on which the operation will be performed
       //! @param args : file operation arguments
       //------------------------------------------------------------------------
-      FileOperation( File *f, Arguments... args): ConcreteOperation<Derived, false, Response, Arguments...>( std::move( args )... ), file(f)
-      {
-      }
-
-      //------------------------------------------------------------------------
-      //! Constructor
-      //!
-      //! @param f    : file on which the operation will be performed
-      //! @param args : file operation arguments
-      //------------------------------------------------------------------------
-      FileOperation( File &f, Arguments... args): FileOperation( &f, std::move( args )... )
+      FileOperation( Ctx<File> f, Arguments... args): ConcreteOperation<Derived, false, Response, Arguments...>( std::move( args )... ), file( std::move( f ) )
       {
       }
 
@@ -94,7 +85,7 @@ namespace XrdCl
       //------------------------------------------------------------------------
       //! The file object itself
       //------------------------------------------------------------------------
-      File *file;
+      Ctx<File> file;
   };
 
   //----------------------------------------------------------------------------
@@ -118,7 +109,7 @@ namespace XrdCl
           //!
           //! @param file : the underlying XrdCl::File object
           //--------------------------------------------------------------------
-          ExResp( XrdCl::File &file ): file( file )
+          ExResp( const Ctx<File> &file ): file( file )
           {
           }
 
@@ -142,7 +133,7 @@ namespace XrdCl
           //--------------------------------------------------------------------
           //! The underlying XrdCl::File object
           //--------------------------------------------------------------------
-          XrdCl::File &file;
+          Ctx<File> file;
       };
 
     public:
@@ -150,20 +141,11 @@ namespace XrdCl
       //------------------------------------------------------------------------
       //! Constructor (@see FileOperation)
       //------------------------------------------------------------------------
-      OpenImpl( File *f, Arg<std::string> url, Arg<OpenFlags::Flags> flags,
+      OpenImpl( Ctx<File> f, Arg<std::string> url, Arg<OpenFlags::Flags> flags,
                 Arg<Access::Mode> mode = Access::None ) :
           FileOperation<OpenImpl, HasHndl, Resp<void>, Arg<std::string>, Arg<OpenFlags::Flags>,
-            Arg<Access::Mode>>( f, std::move( url ), std::move( flags ), std::move( mode ) )
-      {
-      }
-
-      //------------------------------------------------------------------------
-      //! Constructor (@see FileOperation)
-      //------------------------------------------------------------------------
-      OpenImpl( File &f, Arg<std::string> url, Arg<OpenFlags::Flags> flags,
-                Arg<Access::Mode> mode = Access::None ) :
-          FileOperation<OpenImpl, HasHndl, Resp<void>, Arg<std::string>, Arg<OpenFlags::Flags>,
-            Arg<Access::Mode>>( &f, std::move( url ), std::move( flags ), std::move( mode ) )
+            Arg<Access::Mode>>( std::move( f ), std::move( url ), std::move( flags ),
+            std::move( mode ) )
       {
       }
 
@@ -172,12 +154,12 @@ namespace XrdCl
       //!
       //! @arg from : state from which the object is being converted
       //!
-      //! @param op : the object that is being converted
+      //! @param open : the object that is being converted
       //------------------------------------------------------------------------
       template<bool from>
       OpenImpl( OpenImpl<from> && open ) :
-          FileOperation<OpenImpl, HasHndl, Resp<void>, Arg<std::string>,
-              Arg<OpenFlags::Flags>, Arg<Access::Mode>>( std::move( open ) )
+          FileOperation<OpenImpl, HasHndl, Resp<void>, Arg<std::string>, Arg<OpenFlags::Flags>,
+            Arg<Access::Mode>>( std::move( open ) )
       {
       }
 
@@ -191,18 +173,13 @@ namespace XrdCl
       //! Overload of operator>> defined in ConcreteOperation, we're adding
       //! additional capabilities by using ExResp factory (@see ExResp).
       //!
-      //! @param func : function/functor/lambda
+      //! @param hdlr : function/functor/lambda
       //------------------------------------------------------------------------
       template<typename Hdlr>
       OpenImpl<true> operator>>( Hdlr &&hdlr )
       {
-        // check if the resulting handler should be owned by us or by the user,
-        // if the user passed us directly a ResponseHandler it's owned by the
-        // user, otherwise we need to wrap the argument in a handler and in this
-        // case the resulting handler will be owned by us
-        constexpr bool own = !IsResponseHandler<Hdlr>::value;
         ExResp factory( *this->file );
-        return this->StreamImpl( factory.Create( hdlr ), own );
+        return this->StreamImpl( factory.Create( hdlr ) );
       }
 
       //------------------------------------------------------------------------
@@ -218,30 +195,29 @@ namespace XrdCl
       //------------------------------------------------------------------------
       //! RunImpl operation (@see Operation)
       //!
-      //! @param params :  container with parameters forwarded from
-      //!                  previous operation
-      //! @return       :  status of the operation
+      //! @param pipelineTimeout : pipeline timeout
+      //! @return                : status of the operation
       //------------------------------------------------------------------------
-      XRootDStatus RunImpl()
+      XRootDStatus RunImpl( PipelineHandler *handler, uint16_t pipelineTimeout )
       {
-        try
-        {
-          std::string      url   = std::get<UrlArg>( this->args ).Get();
-          OpenFlags::Flags flags = std::get<FlagsArg>( this->args ).Get();
-          Access::Mode     mode  = std::get<ModeArg>( this->args ).Get();
-          return this->file->Open( url, flags, mode, this->handler.get() );
-        }
-        catch( const PipelineException& ex )
-        {
-          return ex.GetError();
-        }
-        catch( const std::exception& ex )
-        {
-          return XRootDStatus( stError, ex.what() );
-        }
+        const std::string &url     = std::get<UrlArg>( this->args );
+        OpenFlags::Flags   flags   = std::get<FlagsArg>( this->args );
+        Access::Mode       mode    = std::get<ModeArg>( this->args );
+        uint16_t           timeout = pipelineTimeout < this->timeout ?
+                                     pipelineTimeout : this->timeout;
+        return this->file->Open( url, flags, mode, handler, timeout );
       }
   };
-  typedef OpenImpl<false> Open;
+
+  //----------------------------------------------------------------------------
+  //! Factory for creating ReadImpl objects
+  //----------------------------------------------------------------------------
+  inline OpenImpl<false> Open( Ctx<File> file, Arg<std::string> url, Arg<OpenFlags::Flags> flags,
+                               Arg<Access::Mode> mode = Access::None, uint16_t timeout = 0 )
+  {
+    return OpenImpl<false>( std::move( file ), std::move( url ), std::move( flags ),
+                            std::move( mode ) ).Timeout( timeout );
+  }
 
   //----------------------------------------------------------------------------
   //! Read operation (@see FileOperation)
@@ -280,26 +256,187 @@ namespace XrdCl
       //!                  previous operation
       //! @return       :  status of the operation
       //------------------------------------------------------------------------
-      XRootDStatus RunImpl()
+      XRootDStatus RunImpl( PipelineHandler *handler, uint16_t pipelineTimeout )
       {
-        try
-        {
-          uint64_t  offset = std::get<OffsetArg>( this->args ).Get();
-          uint32_t  size   = std::get<SizeArg>( this->args ).Get();
-          void     *buffer = std::get<BufferArg>( this->args ).Get();
-          return this->file->Read( offset, size, buffer, this->handler.get() );
-        }
-        catch( const PipelineException& ex )
-        {
-          return ex.GetError();
-        }
-        catch( const std::exception& ex )
-        {
-          return XRootDStatus( stError, ex.what() );
-        }
+        uint64_t  offset  = std::get<OffsetArg>( this->args ).Get();
+        uint32_t  size    = std::get<SizeArg>( this->args ).Get();
+        void     *buffer  = std::get<BufferArg>( this->args ).Get();
+        uint16_t  timeout = pipelineTimeout < this->timeout ?
+                            pipelineTimeout : this->timeout;
+        return this->file->Read( offset, size, buffer, handler, timeout );
       }
   };
-  typedef ReadImpl<false> Read;
+
+  //----------------------------------------------------------------------------
+  //! Factory for creating ReadImpl objects
+  //----------------------------------------------------------------------------
+  inline ReadImpl<false> Read( Ctx<File> file, Arg<uint64_t> offset, Arg<uint32_t> size,
+                               Arg<void*> buffer, uint16_t timeout = 0 )
+  {
+    return ReadImpl<false>( std::move( file ), std::move( offset ), std::move( size ),
+                            std::move( buffer ) ).Timeout( timeout );
+  }
+
+  //----------------------------------------------------------------------------
+  //! PgRead operation (@see FileOperation)
+  //----------------------------------------------------------------------------
+  template<bool HasHndl>
+  class PgReadImpl: public FileOperation<PgReadImpl, HasHndl, Resp<PageInfo>,
+      Arg<uint64_t>, Arg<uint32_t>, Arg<void*>>
+  {
+    public:
+
+      //------------------------------------------------------------------------
+      //! Inherit constructors from FileOperation (@see FileOperation)
+      //------------------------------------------------------------------------
+      using FileOperation<PgReadImpl, HasHndl, Resp<PageInfo>, Arg<uint64_t>,
+                          Arg<uint32_t>, Arg<void*>>::FileOperation;
+
+      //------------------------------------------------------------------------
+      //! Argument indexes in the args tuple
+      //------------------------------------------------------------------------
+      enum { OffsetArg, SizeArg, BufferArg };
+
+      //------------------------------------------------------------------------
+      //! @return : name of the operation (@see Operation)
+      //------------------------------------------------------------------------
+      std::string ToString()
+      {
+        return "PgRead";
+      }
+
+    protected:
+
+      //------------------------------------------------------------------------
+      //! RunImpl operation (@see Operation)
+      //!
+      //! @param params :  container with parameters forwarded from
+      //!                  previous operation
+      //! @return       :  status of the operation
+      //------------------------------------------------------------------------
+      XRootDStatus RunImpl( PipelineHandler *handler, uint16_t pipelineTimeout )
+      {
+        uint64_t  offset  = std::get<OffsetArg>( this->args ).Get();
+        uint32_t  size    = std::get<SizeArg>( this->args ).Get();
+        void     *buffer  = std::get<BufferArg>( this->args ).Get();
+        uint16_t  timeout = pipelineTimeout < this->timeout ?
+                            pipelineTimeout : this->timeout;
+        return this->file->PgRead( offset, size, buffer, handler, timeout );
+      }
+  };
+
+  //----------------------------------------------------------------------------
+  //! Factory for creating PgReadImpl objects
+  //----------------------------------------------------------------------------
+  inline PgReadImpl<false> PgRead( Ctx<File> file, Arg<uint64_t> offset,
+                                 Arg<uint32_t> size, Arg<void*> buffer,
+                                 uint16_t timeout = 0 )
+  {
+    return PgReadImpl<false>( std::move( file ), std::move( offset ), std::move( size ),
+                            std::move( buffer ) ).Timeout( timeout );
+  }
+
+  //----------------------------------------------------------------------------
+  //! RdWithRsp: factory for creating ReadImpl/PgReadImpl objects
+  //----------------------------------------------------------------------------
+  template<typename RSP> struct ReadTrait { };
+
+  template<> struct ReadTrait<ChunkInfo> { using RET = ReadImpl<false>; };
+
+  template<> struct ReadTrait<PageInfo> { using RET = PgReadImpl<false>; };
+
+  template<typename RSP> inline typename ReadTrait<RSP>::RET
+  RdWithRsp( Ctx<File> file, Arg<uint64_t> offset, Arg<uint32_t> size,
+             Arg<void*> buffer, uint16_t timeout = 0 );
+
+  template<> inline ReadImpl<false>
+  RdWithRsp<ChunkInfo>( Ctx<File> file, Arg<uint64_t> offset, Arg<uint32_t> size,
+                        Arg<void*> buffer, uint16_t timeout )
+  {
+    return Read( std::move( file ), std::move( offset ), std::move( size ),
+                 std::move( buffer ), timeout );
+  }
+
+  template<> inline PgReadImpl<false>
+  RdWithRsp<PageInfo>( Ctx<File> file, Arg<uint64_t> offset, Arg<uint32_t> size,
+                       Arg<void*> buffer, uint16_t timeout )
+  {
+    return PgRead( std::move( file ), std::move( offset ), std::move( size ),
+                   std::move( buffer ), timeout );
+  }
+
+  //----------------------------------------------------------------------------
+  //! PgWrite operation (@see FileOperation)
+  //----------------------------------------------------------------------------
+  template<bool HasHndl>
+  class PgWriteImpl: public FileOperation<PgWriteImpl, HasHndl, Resp<void>,
+      Arg<uint64_t>, Arg<uint32_t>, Arg<void*>, Arg<std::vector<uint32_t>>>
+  {
+    public:
+
+      //------------------------------------------------------------------------
+      //! Inherit constructors from FileOperation (@see FileOperation)
+      //------------------------------------------------------------------------
+      using FileOperation<PgWriteImpl, HasHndl, Resp<void>, Arg<uint64_t>,
+                          Arg<uint32_t>, Arg<void*>, Arg<std::vector<uint32_t>>>::FileOperation;
+
+      //------------------------------------------------------------------------
+      //! Argument indexes in the args tuple
+      //------------------------------------------------------------------------
+      enum { OffsetArg, SizeArg, BufferArg, CksumsArg };
+
+      //------------------------------------------------------------------------
+      //! @return : name of the operation (@see Operation)
+      //------------------------------------------------------------------------
+      std::string ToString()
+      {
+        return "PgWrite";
+      }
+
+    protected:
+
+      //------------------------------------------------------------------------
+      //! RunImpl operation (@see Operation)
+      //!
+      //! @param params :  container with parameters forwarded from
+      //!                  previous operation
+      //! @return       :  status of the operation
+      //------------------------------------------------------------------------
+      XRootDStatus RunImpl( PipelineHandler *handler, uint16_t pipelineTimeout )
+      {
+        uint64_t               offset = std::get<OffsetArg>( this->args ).Get();
+        uint32_t               size   = std::get<SizeArg>( this->args ).Get();
+        void                  *buffer = std::get<BufferArg>( this->args ).Get();
+        std::vector<uint32_t>  cksums = std::get<CksumsArg>( this->args ).Get();
+        uint16_t  timeout = pipelineTimeout < this->timeout ?
+                            pipelineTimeout : this->timeout;
+        return this->file->PgWrite( offset, size, buffer, cksums, handler, timeout );
+      }
+  };
+
+  //----------------------------------------------------------------------------
+  //! Factory for creating PgReadImpl objects
+  //----------------------------------------------------------------------------
+  inline PgWriteImpl<false> PgWrite( Ctx<File> file, Arg<uint64_t> offset,
+                                    Arg<uint32_t> size, Arg<void*> buffer,
+                                    Arg<std::vector<uint32_t>> cksums,
+                                    uint16_t timeout = 0 )
+  {
+    return PgWriteImpl<false>( std::move( file ), std::move( offset ), std::move( size ),
+                               std::move( buffer ), std::move( cksums ) ).Timeout( timeout );
+  }
+
+  //----------------------------------------------------------------------------
+  //! Factory for creating PgReadImpl objects
+  //----------------------------------------------------------------------------
+  inline PgWriteImpl<false> PgWrite( Ctx<File> file, Arg<uint64_t> offset,
+                                    Arg<uint32_t> size, Arg<void*> buffer,
+                                    uint16_t timeout = 0 )
+  {
+    std::vector<uint32_t> cksums;
+    return PgWriteImpl<false>( std::move( file ), std::move( offset ), std::move( size ),
+                               std::move( buffer ), std::move( cksums ) ).Timeout( timeout );
+  }
 
   //----------------------------------------------------------------------------
   //! Close operation (@see FileOperation)
@@ -331,12 +468,21 @@ namespace XrdCl
       //!                  previous operation
       //! @return       :  status of the operation
       //------------------------------------------------------------------------
-      XRootDStatus RunImpl()
+      XRootDStatus RunImpl( PipelineHandler *handler, uint16_t pipelineTimeout )
       {
-        return this->file->Close( this->handler.get() );
+        uint16_t timeout = pipelineTimeout < this->timeout ?
+                           pipelineTimeout : this->timeout;
+        return this->file->Close( handler, timeout );
       }
   };
-  typedef CloseImpl<false> Close;
+
+  //----------------------------------------------------------------------------
+  //! Factory for creating CloseImpl objects
+  //----------------------------------------------------------------------------
+  inline CloseImpl<false> Close( Ctx<File> file, uint16_t timeout = 0 )
+  {
+    return CloseImpl<false>( std::move( file ) ).Timeout( timeout );
+  }
 
   //----------------------------------------------------------------------------
   //! Stat operation (@see FileOperation)
@@ -373,21 +519,12 @@ namespace XrdCl
       //!                  previous operation
       //! @return       :  status of the operation
       //------------------------------------------------------------------------
-      XRootDStatus RunImpl()
+      XRootDStatus RunImpl( PipelineHandler *handler, uint16_t pipelineTimeout )
       {
-        try
-        {
-          bool force = std::get<ForceArg>( this->args ).Get();
-          return this->file->Stat( force, this->handler.get() );
-        }
-        catch( const PipelineException& ex )
-        {
-          return ex.GetError();
-        }
-        catch( const std::exception& ex )
-        {
-          return XRootDStatus( stError, ex.what() );
-        }
+        bool     force   = std::get<ForceArg>( this->args ).Get();
+        uint16_t timeout = pipelineTimeout < this->timeout ?
+                           pipelineTimeout : this->timeout;
+        return this->file->Stat( force, handler, timeout );
       }
   };
 
@@ -395,18 +532,9 @@ namespace XrdCl
   //! Factory for creating StatImpl objects (as there is another Stat in
   //! FileSystem there would be a clash of typenames).
   //----------------------------------------------------------------------------
-  StatImpl<false> Stat( File *file, Arg<bool> force )
+  inline StatImpl<false> Stat( Ctx<File> file, Arg<bool> force, uint16_t timeout = 0 )
   {
-    return StatImpl<false>( file, std::move( force ) );
-  }
-
-  //----------------------------------------------------------------------------
-  //! Factory for creating StatImpl objects (as there is another Stat in
-  //! FileSystem there would be a clash of typenames).
-  //----------------------------------------------------------------------------
-  StatImpl<false> Stat( File &file, Arg<bool> force )
-  {
-    return StatImpl<false>( file, std::move( force ) );
+    return StatImpl<false>( std::move( file ), std::move( force ) ).Timeout( timeout );
   }
 
   //----------------------------------------------------------------------------
@@ -414,7 +542,7 @@ namespace XrdCl
   //----------------------------------------------------------------------------
   template<bool HasHndl>
   class WriteImpl: public FileOperation<WriteImpl, HasHndl, Resp<void>, Arg<uint64_t>,
-      Arg<uint32_t>, Arg<void*>>
+      Arg<uint32_t>, Arg<const void*>>
   {
     public:
 
@@ -422,7 +550,7 @@ namespace XrdCl
       //! Inherit constructors from FileOperation (@see FileOperation)
       //------------------------------------------------------------------------
       using FileOperation<WriteImpl, HasHndl, Resp<void>, Arg<uint64_t>, Arg<uint32_t>,
-                          Arg<void*>>::FileOperation;
+                          Arg<const void*>>::FileOperation;
 
       //------------------------------------------------------------------------
       //! Argument indexes in the args tuple
@@ -446,26 +574,26 @@ namespace XrdCl
       //!                  previous operation
       //! @return       :  status of the operation
       //------------------------------------------------------------------------
-      XRootDStatus RunImpl()
+      XRootDStatus RunImpl( PipelineHandler *handler, uint16_t pipelineTimeout )
       {
-        try
-        {
-          uint64_t  offset = std::get<OffsetArg>( this->args ).Get();
-          uint32_t  size   = std::get<SizeArg>( this->args ).Get();
-          void     *buffer = std::get<BufferArg>( this->args ).Get();
-          return this->file->Write( offset, size, buffer, this->handler.get() );
-        }
-        catch( const PipelineException& ex )
-        {
-          return ex.GetError();
-        }
-        catch( const std::exception& ex )
-        {
-          return XRootDStatus( stError, ex.what() );
-        }
+        uint64_t    offset = std::get<OffsetArg>( this->args ).Get();
+        uint32_t    size   = std::get<SizeArg>( this->args ).Get();
+        const void *buffer = std::get<BufferArg>( this->args ).Get();
+        uint16_t    timeout = pipelineTimeout < this->timeout ?
+                            pipelineTimeout : this->timeout;
+        return this->file->Write( offset, size, buffer, handler, timeout );
       }
   };
-  typedef WriteImpl<false> Write;
+
+  //----------------------------------------------------------------------------
+  //! Factory for creating WriteImpl objects
+  //----------------------------------------------------------------------------
+  inline WriteImpl<false> Write( Ctx<File> file, Arg<uint64_t> offset, Arg<uint32_t> size,
+                                 Arg<const void*> buffer, uint16_t timeout = 0 )
+  {
+    return WriteImpl<false>( std::move( file ), std::move( offset ), std::move( size ),
+                             std::move( buffer ) ).Timeout( timeout );
+  }
 
   //----------------------------------------------------------------------------
   //! Sync operation (@see FileOperation)
@@ -497,12 +625,21 @@ namespace XrdCl
       //!                  previous operation
       //! @return       :  status of the operation
       //------------------------------------------------------------------------
-      XRootDStatus RunImpl()
+      XRootDStatus RunImpl( PipelineHandler *handler, uint16_t pipelineTimeout )
       {
-        return this->file->Sync( this->handler.get() );
+        uint16_t timeout = pipelineTimeout < this->timeout ?
+                           pipelineTimeout : this->timeout;
+        return this->file->Sync( handler, timeout );
       }
   };
-  typedef SyncImpl<false> Sync;
+
+  //----------------------------------------------------------------------------
+  //! Factory for creating SyncImpl objects
+  //----------------------------------------------------------------------------
+  inline SyncImpl<false> Sync( Ctx<File> file, uint16_t timeout = 0 )
+  {
+    return SyncImpl<false>( std::move( file ) ).Timeout( timeout );
+  }
 
   //----------------------------------------------------------------------------
   //! Truncate operation (@see FileOperation)
@@ -539,21 +676,12 @@ namespace XrdCl
       //!                  previous operation
       //! @return       :  status of the operation
       //------------------------------------------------------------------------
-      XRootDStatus RunImpl()
+      XRootDStatus RunImpl( PipelineHandler *handler, uint16_t pipelineTimeout )
       {
-        try
-        {
-          uint64_t size = std::get<SizeArg>( this->args ).Get();
-          return this->file->Truncate( size, this->handler.get() );
-        }
-        catch( const PipelineException& ex )
-        {
-          return ex.GetError();
-        }
-        catch( const std::exception& ex )
-        {
-          return XRootDStatus( stError, ex.what() );
-        }
+        uint64_t size    = std::get<SizeArg>( this->args ).Get();
+        uint16_t timeout = pipelineTimeout < this->timeout ?
+                           pipelineTimeout : this->timeout;
+        return this->file->Truncate( size, handler, timeout );
       }
   };
 
@@ -561,18 +689,9 @@ namespace XrdCl
   //! Factory for creating TruncateImpl objects (as there is another Stat in
   //! FileSystem there would be a clash of typenames).
   //----------------------------------------------------------------------------
-  TruncateImpl<false> Truncate( File *file, Arg<uint64_t> size )
+  inline TruncateImpl<false> Truncate( Ctx<File> file, Arg<uint64_t> size, uint16_t timeout )
   {
-    return TruncateImpl<false>( file, std::move( size ) );
-  }
-
-  //----------------------------------------------------------------------------
-  //! Factory for creating TruncateImpl objects (as there is another Stat in
-  //! FileSystem there would be a clash of typenames).
-  //----------------------------------------------------------------------------
-  TruncateImpl<false> Truncate( File &file, Arg<uint64_t> size )
-  {
-    return TruncateImpl<false>( file, std::move( size ) );
+    return TruncateImpl<false>( std::move( file ), std::move( size ) ).Timeout( timeout );
   }
 
   //----------------------------------------------------------------------------
@@ -612,25 +731,30 @@ namespace XrdCl
       //!                  previous operation
       //! @return       :  status of the operation
       //------------------------------------------------------------------------
-      XRootDStatus RunImpl()
+      XRootDStatus RunImpl( PipelineHandler *handler, uint16_t pipelineTimeout )
       {
-        try
-        {
-          ChunkList chunks( std::get<ChunksArg>( this->args ).Get() );
-          void *buffer = std::get<BufferArg>( this->args ).Get();
-          return this->file->VectorRead( chunks, buffer, this->handler.get() );
-        }
-        catch( const PipelineException& ex )
-        {
-          return ex.GetError();
-        }
-        catch( const std::exception& ex )
-        {
-          return XRootDStatus( stError, ex.what() );
-        }
+        ChunkList &chunks  = std::get<ChunksArg>( this->args ).Get();
+        void      *buffer  = std::get<BufferArg>( this->args ).Get();
+        uint16_t   timeout = pipelineTimeout < this->timeout ?
+                             pipelineTimeout : this->timeout;
+        return this->file->VectorRead( chunks, buffer, handler, timeout );
       }
   };
-  typedef VectorReadImpl<false> VectorRead;
+
+  //----------------------------------------------------------------------------
+  //! Factory for creating VectorReadImpl objects
+  //----------------------------------------------------------------------------
+  inline VectorReadImpl<false> VectorRead( Ctx<File> file, Arg<ChunkList> chunks,
+                                           Arg<void*> buffer, uint16_t timeout = 0 )
+  {
+    return VectorReadImpl<false>( std::move( file ), std::move( chunks ), std::move( buffer ) ).Timeout( timeout );
+  }
+
+  inline VectorReadImpl<false> VectorRead( Ctx<File> file, Arg<ChunkList> chunks,
+                                           uint16_t timeout = 0 )
+  {
+    return VectorReadImpl<false>( std::move( file ), std::move( chunks ), nullptr ).Timeout( timeout );
+  }
 
   //----------------------------------------------------------------------------
   //! VectorWrite operation (@see FileOperation)
@@ -668,31 +792,30 @@ namespace XrdCl
       //!                  previous operation
       //! @return       :  status of the operation
       //------------------------------------------------------------------------
-      XRootDStatus RunImpl()
+      XRootDStatus RunImpl( PipelineHandler *handler, uint16_t pipelineTimeout )
       {
-        try
-        {
-          const ChunkList chunks( std::get<ChunksArg>( this->args ).Get() );
-          return this->file->VectorWrite( chunks, this->handler.get() );
-        }
-        catch( const PipelineException& ex )
-        {
-          return ex.GetError();
-        }
-        catch( const std::exception& ex )
-        {
-          return XRootDStatus( stError, ex.what() );
-        }
+        const ChunkList &chunks  = std::get<ChunksArg>( this->args ).Get();
+        uint16_t         timeout = pipelineTimeout < this->timeout ?
+                                   pipelineTimeout : this->timeout;
+        return this->file->VectorWrite( chunks, handler, timeout );
       }
   };
-  typedef VectorWriteImpl<false> VectorWrite;
+
+  //----------------------------------------------------------------------------
+  //! Factory for creating VectorWriteImpl objects
+  //----------------------------------------------------------------------------
+  inline VectorWriteImpl<false> VectorWrite( Ctx<File> file, Arg<ChunkList> chunks,
+                                             uint16_t timeout = 0 )
+  {
+    return VectorWriteImpl<false>( std::move( file ), std::move( chunks ) ).Timeout( timeout );
+  }
 
   //----------------------------------------------------------------------------
   //! WriteV operation (@see FileOperation)
   //----------------------------------------------------------------------------
   template<bool HasHndl>
   class WriteVImpl: public FileOperation<WriteVImpl, HasHndl, Resp<void>, Arg<uint64_t>,
-      Arg<struct iovec*>, Arg<int>>
+                                         Arg<std::vector<iovec>>>
   {
     public:
 
@@ -700,12 +823,12 @@ namespace XrdCl
       //! Inherit constructors from FileOperation (@see FileOperation)
       //------------------------------------------------------------------------
       using FileOperation<WriteVImpl, HasHndl, Resp<void>, Arg<uint64_t>,
-                          Arg<struct iovec*>, Arg<int>>::FileOperation;
+                          Arg<std::vector<iovec>>>::FileOperation;
 
       //------------------------------------------------------------------------
       //! Argument indexes in the args tuple
       //------------------------------------------------------------------------
-      enum { OffsetArg, IovArg, IovcntArg };
+      enum { OffsetArg, IovArg };
 
       //------------------------------------------------------------------------
       //! @return : name of the operation (@see Operation)
@@ -724,26 +847,34 @@ namespace XrdCl
       //!                  previous operation
       //! @return       :  status of the operation
       //------------------------------------------------------------------------
-      XRootDStatus RunImpl()
+      XRootDStatus RunImpl( PipelineHandler *handler, uint16_t pipelineTimeout )
       {
-        try
+        uint64_t            offset  = std::get<OffsetArg>( this->args ).Get();
+        std::vector<iovec> &stdiov  = std::get<IovArg>( this->args ).Get();
+        uint16_t            timeout = pipelineTimeout < this->timeout ?
+                                      pipelineTimeout : this->timeout;
+
+        int iovcnt = stdiov.size();
+        iovec iov[iovcnt];
+        for( size_t i = 0; i < stdiov.size(); ++i )
         {
-          uint64_t            offset = std::get<OffsetArg>( this->args ).Get();
-          const struct iovec *iov    = std::get<IovArg>( this->args ).Get();
-          int                 iovcnt = std::get<IovcntArg>( this->args ).Get();
-          return this->file->WriteV( offset, iov, iovcnt, this->handler.get() );
+          iov[i].iov_base = stdiov[i].iov_base;
+          iov[i].iov_len  = stdiov[i].iov_len;
         }
-        catch( const PipelineException& ex )
-        {
-          return ex.GetError();
-        }
-        catch( const std::exception& ex )
-        {
-          return XRootDStatus( stError, ex.what() );
-        }
+
+        return this->file->WriteV( offset, iov, iovcnt, handler, timeout );
       }
   };
-  typedef WriteVImpl<false> WriteV;
+
+  //----------------------------------------------------------------------------
+  //! Factory for creating WriteVImpl objects
+  //----------------------------------------------------------------------------
+  inline WriteVImpl<false> WriteV( Ctx<File> file, Arg<uint64_t> offset,
+                                   Arg<std::vector<iovec>> iov, uint16_t timeout = 0 )
+  {
+    return WriteVImpl<false>( std::move( file ), std::move( offset ),
+                              std::move( iov ) ).Timeout( timeout );
+  }
 
   //----------------------------------------------------------------------------
   //! Fcntl operation (@see FileOperation)
@@ -780,21 +911,12 @@ namespace XrdCl
       //!                  previous operation
       //! @return       :  status of the operation
       //------------------------------------------------------------------------
-      XRootDStatus RunImpl()
+      XRootDStatus RunImpl( PipelineHandler *handler, uint16_t pipelineTimeout )
       {
-        try
-        {
-          Buffer arg( std::get<BufferArg>( this->args ).Get() );
-          return this->file->Fcntl( arg, this->handler.get() );
-        }
-        catch( const PipelineException& ex )
-        {
-          return ex.GetError();
-        }
-        catch( const std::exception& ex )
-        {
-          return XRootDStatus( stError, ex.what() );
-        }
+        Buffer   &arg     = std::get<BufferArg>( this->args ).Get();
+        uint16_t  timeout = pipelineTimeout < this->timeout ?
+                            pipelineTimeout : this->timeout;
+        return this->file->Fcntl( arg, handler, timeout );
       }
   };
   typedef FcntlImpl<false> Fcntl;
@@ -829,12 +951,417 @@ namespace XrdCl
       //!                  previous operation
       //! @return       :  status of the operation
       //------------------------------------------------------------------------
-      XRootDStatus RunImpl()
+      XRootDStatus RunImpl( PipelineHandler *handler, uint16_t pipelineTimeout )
       {
-        return this->file->Visa( this->handler.get() );
+        uint16_t timeout = pipelineTimeout < this->timeout ?
+                           pipelineTimeout : this->timeout;
+        return this->file->Visa( handler, timeout );
       }
   };
   typedef VisaImpl<false> Visa;
+
+  //----------------------------------------------------------------------------
+  //! SetXAttr operation (@see FileOperation)
+  //----------------------------------------------------------------------------
+  template<bool HasHndl>
+  class SetXAttrImpl: public FileOperation<SetXAttrImpl, HasHndl, Resp<void>,
+      Arg<std::string>, Arg<std::string>>
+  {
+    public:
+
+      //------------------------------------------------------------------------
+      //! Inherit constructors from FileOperation (@see FileOperation)
+      //------------------------------------------------------------------------
+      using FileOperation<SetXAttrImpl, HasHndl, Resp<void>,
+                          Arg<std::string>, Arg<std::string>>::FileOperation;
+
+      //------------------------------------------------------------------------
+      //! Argument indexes in the args tuple
+      //------------------------------------------------------------------------
+      enum { NameArg, ValueArg };
+
+      //------------------------------------------------------------------------
+      //! @return : name of the operation (@see Operation)
+      //------------------------------------------------------------------------
+      std::string ToString()
+      {
+        return "SetXAttrImpl";
+      }
+
+    protected:
+
+      //------------------------------------------------------------------------
+      //! RunImpl operation (@see Operation)
+      //!
+      //! @param params :  container with parameters forwarded from
+      //!                  previous operation
+      //! @return       :  status of the operation
+      //------------------------------------------------------------------------
+      XRootDStatus RunImpl( PipelineHandler *handler, uint16_t pipelineTimeout )
+      {
+        std::string &name  = std::get<NameArg>( this->args ).Get();
+        std::string &value = std::get<ValueArg>( this->args ).Get();
+        // wrap the arguments with a vector
+        std::vector<xattr_t> attrs;
+        attrs.push_back( xattr_t( name, value ) );
+        // wrap the PipelineHandler so the response gets unpacked properly
+        UnpackXAttrStatus *h = new UnpackXAttrStatus( handler );
+        uint16_t     timeout = pipelineTimeout < this->timeout ?
+                                     pipelineTimeout : this->timeout;
+        XRootDStatus st = this->file->SetXAttr( attrs, h, timeout );
+        if( !st.IsOK() ) delete h;
+        return st;
+      }
+  };
+
+  //----------------------------------------------------------------------------
+  //! Factory for creating SetXAttrImpl objects (as there is another SetXAttr in
+  //! FileSystem there would be a clash of typenames).
+  //----------------------------------------------------------------------------
+  inline SetXAttrImpl<false> SetXAttr( Ctx<File> file, Arg<std::string> name, Arg<std::string> value )
+  {
+    return SetXAttrImpl<false>( std::move( file ), std::move( name ), std::move( value ) );
+  }
+
+  //----------------------------------------------------------------------------
+  //! SetXAttr bulk operation (@see FileOperation)
+  //----------------------------------------------------------------------------
+  template<bool HasHndl>
+  class SetXAttrBulkImpl: public FileOperation<SetXAttrBulkImpl, HasHndl,
+      Resp<std::vector<XAttrStatus>>, Arg<std::vector<xattr_t>>>
+  {
+    public:
+
+      //------------------------------------------------------------------------
+      //! Inherit constructors from FileOperation (@see FileOperation)
+      //------------------------------------------------------------------------
+      using FileOperation<SetXAttrBulkImpl, HasHndl, Resp<std::vector<XAttrStatus>>,
+                          Arg<std::vector<xattr_t>>>::FileOperation;
+
+      //------------------------------------------------------------------------
+      //! Argument indexes in the args tuple
+      //------------------------------------------------------------------------
+      enum { AttrsArg };
+
+      //------------------------------------------------------------------------
+      //! @return : name of the operation (@see Operation)
+      //------------------------------------------------------------------------
+      std::string ToString()
+      {
+        return "SetXAttrBulkImpl";
+      }
+
+
+    protected:
+
+      //------------------------------------------------------------------------
+      //! RunImpl operation (@see Operation)
+      //!
+      //! @param params :  container with parameters forwarded from
+      //!                  previous operation
+      //! @return       :  status of the operation
+      //------------------------------------------------------------------------
+      XRootDStatus RunImpl( PipelineHandler *handler, uint16_t pipelineTimeout )
+      {
+        std::vector<xattr_t> &attrs   = std::get<AttrsArg>( this->args ).Get();
+        uint16_t              timeout = pipelineTimeout < this->timeout ?
+                                        pipelineTimeout : this->timeout;
+        return this->file->SetXAttr( attrs, handler, timeout );
+      }
+  };
+
+  //----------------------------------------------------------------------------
+  //! Factory for creating SetXAttrBulkImpl objects (as there is another SetXAttr
+  //! in FileSystem there would be a clash of typenames).
+  //----------------------------------------------------------------------------
+  inline SetXAttrBulkImpl<false> SetXAttr( Ctx<File> file, Arg<std::vector<xattr_t>> attrs )
+  {
+    return SetXAttrBulkImpl<false>( std::move( file ), std::move( attrs ) );
+  }
+
+  //----------------------------------------------------------------------------
+  //! GetXAttr operation (@see FileOperation)
+  //----------------------------------------------------------------------------
+  template<bool HasHndl>
+  class GetXAttrImpl: public FileOperation<GetXAttrImpl, HasHndl, Resp<std::string>,
+      Arg<std::string>>
+  {
+    public:
+
+      //------------------------------------------------------------------------
+      //! Inherit constructors from FileOperation (@see FileOperation)
+      //------------------------------------------------------------------------
+      using FileOperation<GetXAttrImpl, HasHndl, Resp<std::string>,
+                          Arg<std::string>>::FileOperation;
+
+      //------------------------------------------------------------------------
+      //! Argument indexes in the args tuple
+      //------------------------------------------------------------------------
+      enum { NameArg };
+
+      //------------------------------------------------------------------------
+      //! @return : name of the operation (@see Operation)
+      //------------------------------------------------------------------------
+      std::string ToString()
+      {
+        return "GetXAttrImpl";
+      }
+
+    protected:
+
+      //------------------------------------------------------------------------
+      //! RunImpl operation (@see Operation)
+      //!
+      //! @param params :  container with parameters forwarded from
+      //!                  previous operation
+      //! @return       :  status of the operation
+      //------------------------------------------------------------------------
+      XRootDStatus RunImpl( PipelineHandler *handler, uint16_t pipelineTimeout )
+      {
+        std::string &name = std::get<NameArg>( this->args ).Get();
+        // wrap the argument with a vector
+        std::vector<std::string> attrs;
+        attrs.push_back( name );
+        // wrap the PipelineHandler so the response gets unpacked properly
+        UnpackXAttr   *h = new UnpackXAttr( handler );
+        uint16_t timeout = pipelineTimeout < this->timeout ?
+                           pipelineTimeout : this->timeout;
+        XRootDStatus st = this->file->GetXAttr( attrs, h, timeout );
+        if( !st.IsOK() ) delete h;
+        return st;
+      }
+  };
+
+  //----------------------------------------------------------------------------
+  //! Factory for creating GetXAttrImpl objects (as there is another GetXAttr in
+  //! FileSystem there would be a clash of typenames).
+  //----------------------------------------------------------------------------
+  inline GetXAttrImpl<false> GetXAttr( Ctx<File> file, Arg<std::string> name )
+  {
+    return GetXAttrImpl<false>( std::move( file ), std::move( name ) );
+  }
+
+  //----------------------------------------------------------------------------
+  //! GetXAttr bulk operation (@see FileOperation)
+  //----------------------------------------------------------------------------
+  template<bool HasHndl>
+  class GetXAttrBulkImpl: public FileOperation<GetXAttrBulkImpl, HasHndl, Resp<std::vector<XAttr>>,
+      Arg<std::vector<std::string>>>
+  {
+    public:
+
+      //------------------------------------------------------------------------
+      //! Inherit constructors from FileOperation (@see FileOperation)
+      //------------------------------------------------------------------------
+      using FileOperation<GetXAttrBulkImpl, HasHndl, Resp<std::vector<XAttr>>,
+                          Arg<std::vector<std::string>>>::FileOperation;
+
+      //------------------------------------------------------------------------
+      //! Argument indexes in the args tuple
+      //------------------------------------------------------------------------
+      enum { NamesArg };
+
+      //------------------------------------------------------------------------
+      //! @return : name of the operation (@see Operation)
+      //------------------------------------------------------------------------
+      std::string ToString()
+      {
+        return "GetXAttrBulkImpl";
+      }
+
+
+    protected:
+
+      //------------------------------------------------------------------------
+      //! RunImpl operation (@see Operation)
+      //!
+      //! @param params :  container with parameters forwarded from
+      //!                  previous operation
+      //! @return       :  status of the operation
+      //------------------------------------------------------------------------
+      XRootDStatus RunImpl( PipelineHandler *handler, uint16_t pipelineTimeout )
+      {
+        std::vector<std::string> &attrs   = std::get<NamesArg>( this->args ).Get();
+        uint16_t                  timeout = pipelineTimeout < this->timeout ?
+                                            pipelineTimeout : this->timeout;
+        return this->file->GetXAttr( attrs, handler, timeout );
+      }
+  };
+
+  //----------------------------------------------------------------------------
+  //! Factory for creating GetXAttrBulkImpl objects (as there is another GetXAttr in
+  //! FileSystem there would be a clash of typenames).
+  //----------------------------------------------------------------------------
+  inline GetXAttrBulkImpl<false> GetXAttr( Ctx<File> file, Arg<std::vector<std::string>> attrs )
+  {
+    return GetXAttrBulkImpl<false>( std::move( file ), std::move( attrs ) );
+  }
+
+  //----------------------------------------------------------------------------
+  //! DelXAttr operation (@see FileOperation)
+  //----------------------------------------------------------------------------
+  template<bool HasHndl>
+  class DelXAttrImpl: public FileOperation<DelXAttrImpl, HasHndl, Resp<void>,
+      Arg<std::string>>
+  {
+    public:
+
+      //------------------------------------------------------------------------
+      //! Inherit constructors from FileOperation (@see FileOperation)
+      //------------------------------------------------------------------------
+      using FileOperation<DelXAttrImpl, HasHndl, Resp<void>, Arg<std::string>>::FileOperation;
+
+      //------------------------------------------------------------------------
+      //! Argument indexes in the args tuple
+      //------------------------------------------------------------------------
+      enum { NameArg };
+
+      //------------------------------------------------------------------------
+      //! @return : name of the operation (@see Operation)
+      //------------------------------------------------------------------------
+      std::string ToString()
+      {
+        return "DelXAttrImpl";
+      }
+
+    protected:
+
+      //------------------------------------------------------------------------
+      //! RunImpl operation (@see Operation)
+      //!
+      //! @param params :  container with parameters forwarded from
+      //!                  previous operation
+      //! @return       :  status of the operation
+      //------------------------------------------------------------------------
+      XRootDStatus RunImpl( PipelineHandler *handler, uint16_t pipelineTimeout )
+      {
+        std::string &name = std::get<NameArg>( this->args ).Get();
+        // wrap the argument with a vector
+        std::vector<std::string> attrs;
+        attrs.push_back( name );
+        // wrap the PipelineHandler so the response gets unpacked properly
+        UnpackXAttrStatus *h = new UnpackXAttrStatus( handler );
+        uint16_t     timeout = pipelineTimeout < this->timeout ?
+                               pipelineTimeout : this->timeout;
+        XRootDStatus st = this->file->DelXAttr( attrs, h, timeout );
+        if( !st.IsOK() ) delete h;
+        return st;
+      }
+  };
+
+  //----------------------------------------------------------------------------
+  //! Factory for creating DelXAttrImpl objects (as there is another DelXAttr in
+  //! FileSystem there would be a clash of typenames).
+  //----------------------------------------------------------------------------
+  inline DelXAttrImpl<false> DelXAttr( Ctx<File> file, Arg<std::string> name )
+  {
+    return DelXAttrImpl<false>( std::move( file ), std::move( name ) );
+  }
+
+  //----------------------------------------------------------------------------
+  //! DelXAttr bulk operation (@see FileOperation)
+  //----------------------------------------------------------------------------
+  template<bool HasHndl>
+  class DelXAttrBulkImpl: public FileOperation<DelXAttrBulkImpl, HasHndl,
+      Resp<std::vector<XAttrStatus>>, Arg<std::vector<std::string>>>
+  {
+    public:
+
+      //------------------------------------------------------------------------
+      //! Inherit constructors from FileOperation (@see FileOperation)
+      //------------------------------------------------------------------------
+      using FileOperation<DelXAttrBulkImpl, HasHndl, Resp<std::vector<XAttrStatus>>,
+                          Arg<std::vector<std::string>>>::FileOperation;
+
+      //------------------------------------------------------------------------
+      //! Argument indexes in the args tuple
+      //------------------------------------------------------------------------
+      enum { NamesArg };
+
+      //------------------------------------------------------------------------
+      //! @return : name of the operation (@see Operation)
+      //------------------------------------------------------------------------
+      std::string ToString()
+      {
+        return "DelXAttrBulkImpl";
+      }
+
+
+    protected:
+
+      //------------------------------------------------------------------------
+      //! RunImpl operation (@see Operation)
+      //!
+      //! @param params :  container with parameters forwarded from
+      //!                  previous operation
+      //! @return       :  status of the operation
+      //------------------------------------------------------------------------
+      XRootDStatus RunImpl( PipelineHandler *handler, uint16_t pipelineTimeout )
+      {
+        std::vector<std::string> &attrs   = std::get<NamesArg>( this->args ).Get();
+        uint16_t                  timeout = pipelineTimeout < this->timeout ?
+                                            pipelineTimeout : this->timeout;
+        return this->file->DelXAttr( attrs, handler, timeout );
+      }
+  };
+
+  //----------------------------------------------------------------------------
+  //! Factory for creating DelXAttrBulkImpl objects (as there is another DelXAttr
+  //! in FileSystem there would be a clash of typenames).
+  //----------------------------------------------------------------------------
+  inline DelXAttrBulkImpl<false> DelXAttr( Ctx<File> file, Arg<std::vector<std::string>> attrs )
+  {
+    return DelXAttrBulkImpl<false>( std::move( file ), std::move( attrs ) );
+  }
+
+  //----------------------------------------------------------------------------
+  //! ListXAttr bulk operation (@see FileOperation)
+  //----------------------------------------------------------------------------
+  template<bool HasHndl>
+  class ListXAttrImpl: public FileOperation<ListXAttrImpl, HasHndl,
+      Resp<std::vector<XAttr>>>
+  {
+    public:
+
+      //------------------------------------------------------------------------
+      //! Inherit constructors from FileOperation (@see FileOperation)
+      //------------------------------------------------------------------------
+      using FileOperation<ListXAttrImpl, HasHndl, Resp<std::vector<XAttr>>>::FileOperation;
+
+      //------------------------------------------------------------------------
+      //! @return : name of the operation (@see Operation)
+      //------------------------------------------------------------------------
+      std::string ToString()
+      {
+        return "ListXAttrImpl";
+      }
+
+
+    protected:
+
+      //------------------------------------------------------------------------
+      //! RunImpl operation (@see Operation)
+      //!
+      //! @param params :  container with parameters forwarded from
+      //!                  previous operation
+      //! @return       :  status of the operation
+      //------------------------------------------------------------------------
+      XRootDStatus RunImpl( PipelineHandler *handler, uint16_t pipelineTimeout )
+      {
+        uint16_t timeout = pipelineTimeout < this->timeout ?
+                           pipelineTimeout : this->timeout;
+        return this->file->ListXAttr( handler, timeout );
+      }
+  };
+
+  //----------------------------------------------------------------------------
+  //! Factory for creating ListXAttrImpl objects (as there is another ListXAttr
+  //! in FileSystem there would be a clash of typenames).
+  //----------------------------------------------------------------------------
+  inline ListXAttrImpl<false> ListXAttr( Ctx<File> file )
+  {
+    return ListXAttrImpl<false>( std::move( file ) );
+  }
 }
 
 #endif // __XRD_CL_FILE_OPERATIONS_HH__

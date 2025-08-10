@@ -30,7 +30,7 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <stdlib.h>
+#include <cstdlib>
 
 #include "XrdBwm/XrdBwmPolicy.hh"
 #include "XrdOuc/XrdOucErrInfo.hh"
@@ -50,7 +50,7 @@ enum HandleState {Idle = 0, Scheduled, Dispatched};
 
 static XrdBwmHandle *Alloc(const char *theUsr,  const char *thePath,
                            const char *lclNode, const char *rmtNode,
-                           int Incomming);
+                           int Incoming);
 
 static void         *Dispatch();
 

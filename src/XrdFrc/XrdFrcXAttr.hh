@@ -31,10 +31,10 @@
 /******************************************************************************/
 
 #include <sys/types.h>
-#include <inttypes.h>
+#include <cinttypes>
 #include <netinet/in.h>
 #include <sys/types.h>
-#include <string.h>
+#include <cstring>
 
 #include "XrdSys/XrdSysPlatform.hh"
 
@@ -177,7 +177,7 @@ char      Pfn[MAXPATHLEN+8]; // Enough room for the Pfn
 /* postGet() and preSet() are minimal as no chages are needed
 */
 static int             postGet(int Result)         {return Result;}
-       XrdFrcXAttrPfn *preSet(XrdFrcXAttrPfn &tmp) {return this;}
+       XrdFrcXAttrPfn *preSet(XrdFrcXAttrPfn &tmp) {(void)tmp; return this;}
 
 /* Name() returns the extended attribute name for this object.
 */

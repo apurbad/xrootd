@@ -28,9 +28,9 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <strings.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -125,7 +125,7 @@ int XrdFrcReqAgent::List(XrdFrcRequest::Item *Items, int Num)
    for (i = 0; i <= XrdFrcRequest::maxPrty; i++)
        {Offs = 0;
         while(rQueue[i]->List(myLfn, sizeof(myLfn), Offs, Items, Num))
-             {cout <<myLfn <<endl; n++;}
+             {std::cout <<myLfn <<std::endl; n++;}
        }
 // All done
 //
@@ -144,7 +144,7 @@ int XrdFrcReqAgent::List(XrdFrcRequest::Item *Items, int Num, int Prty)
    if (Prty <= XrdFrcRequest::maxPrty)
        {Offs = 0;
         while(rQueue[Prty]->List(myLfn, sizeof(myLfn), Offs, Items, Num))
-             {cout <<myLfn <<endl; n++;}
+             {std::cout <<myLfn <<std::endl; n++;}
        }
 
 // All done

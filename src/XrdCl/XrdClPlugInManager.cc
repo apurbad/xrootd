@@ -31,6 +31,10 @@
 #include "XrdSys/XrdSysPwd.hh"
 #include "XrdVersion.hh"
 
+#ifdef WITH_XRDEC
+#include "XrdCl/XrdClEcHandler.hh"
+#endif
+
 #include <unistd.h>
 #include <sys/types.h>
 #include <vector>
@@ -228,11 +232,12 @@ namespace XrdCl
 
       XrdSysPwd pwdHandler;
       passwd *pwd = pwdHandler.Get( getuid() );
-      if( !pwd ) return;
-      std::string userPlugIns = pwd->pw_dir;
-      userPlugIns += "/.xrootd/client.plugins.d";
-      ProcessConfigDir( userPlugIns );
-
+      if( pwd )
+      {
+        std::string userPlugIns = pwd->pw_dir;
+        userPlugIns += "/.xrootd/client.plugins.d";
+        ProcessConfigDir( userPlugIns );
+      }
       std::string customPlugIns = DefaultPlugInConfDir;
       env->GetString( "PlugInConfDir", customPlugIns );
       if( !customPlugIns.empty() )
@@ -324,7 +329,7 @@ namespace XrdCl
 
       pg = LoadFactory( lib, config );
 
-      if( !pg.first )
+      if( !pg.second )
         return;
     }
     else
@@ -345,6 +350,36 @@ namespace XrdCl
     const std::string &lib, const std::map<std::string, std::string> &config )
   {
     Log *log = DefaultEnv::GetLog();
+
+#ifdef WITH_XRDEC
+    if( lib == "XrdEcDefault" )
+    {
+      auto itr = config.find( "nbdta" );
+      if( itr == config.end() )
+        return std::make_pair<XrdOucPinLoader*, PlugInFactory*>( nullptr, nullptr );
+      uint8_t nbdta = std::stoul( itr->second );
+      itr = config.find( "nbprt" );
+      if( itr == config.end() )
+        return std::make_pair<XrdOucPinLoader*, PlugInFactory*>( nullptr, nullptr );
+      uint8_t nbprt = std::stoul( itr->second );
+      itr = config.find( "chsz" );
+      if( itr == config.end() )
+        return std::make_pair<XrdOucPinLoader*, PlugInFactory*>( nullptr, nullptr );
+      uint64_t chsz = std::stoul( itr->second );
+      std::vector<std::string> plgr;
+      itr = config.find( "plgr" );
+      if( itr != config.end() )
+        Utils::splitString( plgr, itr->second, "," );
+
+      std::string xrdclECenv = std::to_string(nbdta) + "," +
+                                 std::to_string(nbprt) + "," +
+                                 std::to_string(chsz);
+      setenv("XRDCL_EC", xrdclECenv.c_str(), 1);
+
+      EcPlugInFactory *ecHandler = new EcPlugInFactory( nbdta, nbprt, chsz, std::move( plgr ) );
+      return std::make_pair<XrdOucPinLoader*, PlugInFactory*>( nullptr, ecHandler );
+    }
+#endif
 
     char errorBuff[1024];
     XrdOucPinLoader *pgHandler = new XrdOucPinLoader( errorBuff, 1024,
@@ -393,7 +428,7 @@ namespace XrdCl
       if (pDefaultFactory) {
         if (pDefaultFactory->isEnv) {
           log->Debug(PlugInMgrMsg, "There is already an env default plugin "
-                     "loaded, skiping %s", lib.c_str());
+                     "loaded, skipping %s", lib.c_str());
           return false;
         } else {
           log->Debug(PlugInMgrMsg, "There can be only one default plugin "
@@ -424,7 +459,9 @@ namespace XrdCl
     }
 
     std::sort( normalizedURLs.begin(), normalizedURLs.end() );
-    std::unique( normalizedURLs.begin(), normalizedURLs.end() );
+
+    auto last = std::unique( normalizedURLs.begin(), normalizedURLs.end() );
+    normalizedURLs.erase( last, normalizedURLs.end() );
 
     if( normalizedURLs.empty() )
       return false;

@@ -29,11 +29,10 @@
 /******************************************************************************/
   
 #include <unistd.h>
-#include <ctype.h>
-#include <errno.h>
+#include <cctype>
 #include <fcntl.h>
-#include <stdio.h>
-#include <stdlib.h>
+#include <cstdio>
+#include <cstdlib>
 #include <strings.h>
 #include <sys/param.h>
 #include <sys/stat.h>
@@ -44,6 +43,7 @@
 
 #include "XrdOuc/XrdOucStream.hh"
 
+#include "XrdSys/XrdSysE2T.hh"
 #include "XrdSys/XrdSysError.hh"
   
 /******************************************************************************/
@@ -278,8 +278,10 @@ bool XrdDigAuth::Parse(XrdOucStream &aFile, int lNum)
             return Failure(lNum, "Invalid entity type -", var);
          if (*(var+1) != '=' || !*(var+2))
             return Failure(lNum, "Badly formed entity value in", var);
-         n = snprintf(bP, bLeft, "%s", var+2) + 1;
-         if ((bLeft -= n) <= 0) break;
+         n = snprintf(bP, bLeft, "%s", var+2);
+         if (n < 0 || n >= bLeft) break;
+         ++n;
+         bLeft -= n;
          if ((var = index(bP, '\\'))) Squash(var);
          aEnt.eP->eChk[eCode-eVec] = bP; bP += n;
          aOK = true;
@@ -365,7 +367,7 @@ bool XrdDigAuth::SetupAuth(bool isRefresh)
 //
    if ( (authFD = open(authFN, O_RDONLY, 0)) < 0)
       {NoGo = errno != ENOENT;
-       eDest->Say("Config ",strerror(errno)," opening dig auth file ", authFN);
+       eDest->Say("Config ",XrdSysE2T(errno)," opening dig auth file ",authFN);
        return SetupAuth(isRefresh, !NoGo);
       }
    aFile.Attach(authFD, 4096);
@@ -373,7 +375,7 @@ bool XrdDigAuth::SetupAuth(bool isRefresh)
 // Get the time the file was ctreated
 //
    if (fstat(authFD, &Stat))
-      {eDest->Say("Config ",strerror(errno)," stating dig auth file ", authFN);
+      {eDest->Say("Config ",XrdSysE2T(errno)," stating dig auth file ",authFN);
        close(authFD);
        return SetupAuth(isRefresh, false);
       }
@@ -386,10 +388,10 @@ bool XrdDigAuth::SetupAuth(bool isRefresh)
          lNum++;
         }
 
-// Now check if any errors occured during file i/o
+// Now check if any errors occurred during file i/o
 //
    if ((retc = aFile.LastError()))
-      {eDest->Say("Config ",strerror(-retc)," reading config file ", authFN);
+      {eDest->Say("Config ",XrdSysE2T(-retc)," reading config file ",authFN);
        NoGo = true;
       }
    aFile.Close();

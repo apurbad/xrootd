@@ -29,8 +29,7 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <strings.h>
-#include <stdlib.h>
+#include <cstring>
   
 class XrdLinkMatch
 {

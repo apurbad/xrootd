@@ -30,16 +30,16 @@
 #include <sys/types.h>
 #include <unistd.h>
 #include <dirent.h>
-#include <errno.h>
 #include <fcntl.h>
 #include <memory.h>
-#include <string.h>
-#include <stdio.h>
-#include <stdlib.h>
+#include <cstring>
+#include <cstdio>
+#include <cstdlib>
 #include <sys/param.h>
 #include <sys/stat.h>
 
 #include "XrdVersion.hh"
+#include "XrdSys/XrdSysE2T.hh"
 #include "XrdSys/XrdSysError.hh"
 #include "XrdSys/XrdSysHeaders.hh"
 #include "XrdSys/XrdSysLogger.hh"
@@ -197,7 +197,7 @@ const char *XrdSfsNativeDirectory::nextEntry()
 
 // Read the next directory entry
 //
-#ifdef __linux__
+#if defined(__linux__) || defined(__GNU__) || (defined(__FreeBSD_kernel__) && defined(__GLIBC__))
    errno = 0;
    rp = readdir(dh);
    if (!rp)
@@ -387,7 +387,7 @@ int      XrdSfsNativeFile::fctl(const int               cmd,
 
 // We don't support this
 //
-   out_error.setErrInfo(EEXIST, "fctl operation not supported");
+   out_error.setErrInfo(ENOTSUP, "fctl operation not supported");
    return SFS_ERROR;
 }
   
@@ -727,7 +727,7 @@ int XrdSfsNative::exists(const char                *path,        // In
        return SFS_OK;
       }
 
-// An error occured, return the error info
+// An error occurred, return the error info
 //
    return XrdSfsNative::Emsg(epname, error, errno, "locate", path);
 }
@@ -1025,13 +1025,13 @@ int XrdSfsNative::Emsg(const char    *pfx,    // Message prefix value
                        const char    *op,     // Operation being performed
                        const char    *target) // The target (e.g., fname)
 {
-    char *etext, buffer[MAXPATHLEN+80], unkbuff[64];
+    const char *etext;
+    char buffer[MAXPATHLEN+80];
 
 // Get the reason for the error
 //
    if (ecode < 0) ecode = -ecode;
-   if (!(etext = strerror(ecode)))
-      {sprintf(unkbuff, "reason unknown (%d)", ecode); etext = unkbuff;}
+   etext = XrdSysE2T(ecode);
 
 // Format the error message
 //

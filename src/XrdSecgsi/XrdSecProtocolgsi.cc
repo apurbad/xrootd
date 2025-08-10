@@ -27,11 +27,11 @@
 /******************************************************************************/
 
 #include <unistd.h>
-#include <ctype.h>
-#include <errno.h>
-#include <stdlib.h>
+#include <cctype>
+#include <cerrno>
+#include <cstdlib>
 #include <strings.h>
-#include <stdio.h>
+#include <cstdio>
 #include <sys/param.h>
 #include <pwd.h>
 #include <sys/types.h>
@@ -43,6 +43,7 @@
 #include "XrdVersion.hh"
 
 #include "XrdNet/XrdNetAddr.hh"
+#include "XrdSec/XrdSecEntityAttr.hh"
 #include "XrdSys/XrdSysHeaders.hh"
 #include "XrdSys/XrdSysLogger.hh"
 #include "XrdSys/XrdSysError.hh"
@@ -57,12 +58,14 @@
 #include "XrdCrypto/XrdCryptoX509Req.hh"
 
 #include "XrdSecgsi/XrdSecProtocolgsi.hh"
+#include "XrdSecgsi/XrdSecgsiOpts.hh"
 
 /******************************************************************************/
 /*                 T r a c i n g  I n i t  O p t i o n s                      */
 /******************************************************************************/
 #ifndef NODEBUG
-#define POPTS(t,y)    {if (t) {t->Beg(epname); cerr <<y; t->End();}}
+//#define POPTS(t,y)    {if (t) {t->Beg(epname); std::cerr <<y; t->End();}}
+#define POPTS(t,y)      {if (t) {std::cerr <<"Secgsi" <<y <<'\n' << std::flush;}}
 #else
 #define POPTS(t,y)
 #endif
@@ -146,20 +149,21 @@ String XrdSecProtocolgsi::UsrCert  = "/.globus/usercert.pem";
 String XrdSecProtocolgsi::UsrKey   = "/.globus/userkey.pem";
 String XrdSecProtocolgsi::PxyValid = "12:00";
 int    XrdSecProtocolgsi::DepLength= 0;
-int    XrdSecProtocolgsi::DefBits  = 512;
-int    XrdSecProtocolgsi::CACheck  = 1;
-int    XrdSecProtocolgsi::CRLCheck = 1;
+int    XrdSecProtocolgsi::DefBits  = XrdCryptoDefRSABits;
+int    XrdSecProtocolgsi::CACheck  = caVerifyss;
+int    XrdSecProtocolgsi::CRLCheck = crlTry; // 1
 int    XrdSecProtocolgsi::CRLDownload = 0;
 int    XrdSecProtocolgsi::CRLRefresh = 86400;
 int    XrdSecProtocolgsi::GMAPOpt  = 1;
 bool   XrdSecProtocolgsi::GMAPuseDNname = 0;
 String XrdSecProtocolgsi::DefCrypto= "ssl";
 String XrdSecProtocolgsi::DefCipher= "aes-128-cbc:bf-cbc:des-ede3-cbc";
-String XrdSecProtocolgsi::DefMD    = "sha1:md5";
+String XrdSecProtocolgsi::DefMD    = "sha256";
 String XrdSecProtocolgsi::DefError = "invalid credentials ";
 int    XrdSecProtocolgsi::PxyReqOpts = 0;
 int    XrdSecProtocolgsi::AuthzPxyWhat = -1;
 int    XrdSecProtocolgsi::AuthzPxyWhere = -1;
+int    XrdSecProtocolgsi::AuthzAlways = 1;
 XrdSecgsiGMAP_t XrdSecProtocolgsi::GMAPFun = 0;
 XrdSecgsiAuthz_t XrdSecProtocolgsi::AuthzFun = 0;
 XrdSecgsiAuthzKey_t XrdSecProtocolgsi::AuthzKey = 0;
@@ -167,12 +171,13 @@ int    XrdSecProtocolgsi::AuthzCertFmt = -1;
 int    XrdSecProtocolgsi::GMAPCacheTimeOut = -1;
 int    XrdSecProtocolgsi::AuthzCacheTimeOut = 43200;  // 12h, default
 String XrdSecProtocolgsi::SrvAllowedNames;
-int    XrdSecProtocolgsi::VOMSAttrOpt = 1;
+int    XrdSecProtocolgsi::VOMSAttrOpt = vatIgnore; // Was '1' or extract
 XrdSecgsiAuthz_t XrdSecProtocolgsi::VOMSFun = 0;
 int    XrdSecProtocolgsi::VOMSCertFmt = -1;
 int    XrdSecProtocolgsi::MonInfoOpt = 0;
 bool   XrdSecProtocolgsi::HashCompatibility = 1;
-bool   XrdSecProtocolgsi::TrustDNS = true;
+bool   XrdSecProtocolgsi::TrustDNS = false;
+bool   XrdSecProtocolgsi::ShowDN = false;
 //
 // Crypto related info
 int  XrdSecProtocolgsi::ncrypt    = 0;                 // Number of factories
@@ -193,7 +198,7 @@ XrdOucGMap *XrdSecProtocolgsi::servGMap = 0; // Grid map service
 //
 // CA and CRL stacks
 GSIStack<XrdCryptoX509Chain>  XrdSecProtocolgsi::stackCA; // Stack of CA in use
-GSIStack<XrdCryptoX509Crl>  XrdSecProtocolgsi::stackCRL; // Stack of CRL in use
+std::unique_ptr<GSIStack<XrdCryptoX509Crl>>  XrdSecProtocolgsi::stackCRL( new GSIStack<XrdCryptoX509Crl>() ); // Stack of CRL in use
 //
 // GMAP control vars
 time_t XrdSecProtocolgsi::lastGMAPCheck = -1; // Time of last check
@@ -403,7 +408,7 @@ char *XrdSecProtocolgsi::Init(gsiOptions opt, XrdOucErrInfo *erp)
    // Static method to the configure the static part of the protocol
    // Called once by XrdSecProtocolgsiInit
    EPNAME("Init");
-   char *Parms = 0;
+   char *Failure = 0, *Parms = 0;
 
    //
    // Debug an tracing
@@ -413,7 +418,7 @@ char *XrdSecProtocolgsi::Init(gsiOptions opt, XrdOucErrInfo *erp)
    // (initialized in XrdSecProtocolgsiInit)
    if (!gsiTrace) {
       ErrF(erp,kGSErrInit,"tracing object (gsiTrace) not initialized! cannot continue");
-      return Parms;
+      return Failure;
    }
    // Set debug mask ... also for auxilliary libs
    int trace = 0, traceSut = 0, traceCrypto = 0;
@@ -453,9 +458,9 @@ char *XrdSecProtocolgsi::Init(gsiOptions opt, XrdOucErrInfo *erp)
    //    1   verify if self-signed; warn if not
    //    2   verify in all cases; fail if not possible
    //
-   if (opt.ca >= 0 && opt.ca <= 2)
+   if (opt.ca >= caNoVerify && opt.ca <= caVerify)
       CACheck = opt.ca;
-   DEBUG("option CACheck: "<<CACheck);
+   DEBUG("option CACheck: "<<getOptName(caVerOpts,CACheck));
 
    //
    // Check existence of CA directory
@@ -471,10 +476,10 @@ char *XrdSecProtocolgsi::Init(gsiOptions opt, XrdOucErrInfo *erp)
             if (XrdSutExpand(dp) == 0) {
                if (stat(dp.c_str(),&st) == -1) {
                   if (errno == ENOENT) {
-                     ErrF(erp,kGSErrError,"CA directory non existing:",dp.c_str());
+                     ErrF(erp,kGSErrError,"CA directory non existing",dp.c_str());
                      PRINT(erp->getErrText());
                   } else {
-                     ErrF(erp,kGSErrError,"cannot stat CA directory:",dp.c_str());
+                     ErrF(erp,kGSErrError,"cannot stat CA directory",dp.c_str());
                      PRINT(erp->getErrText());
                   }
                } else {
@@ -504,11 +509,11 @@ char *XrdSecProtocolgsi::Init(gsiOptions opt, XrdOucErrInfo *erp)
    //
    const char *cocrl[] = { "do-not-care", "use-if-available", "require", "require-not-expired" };
    const char *codwld[] = { "no", "yes"};
-   if (opt.crl >= 10) {
+   if (opt.crl >= crlUpdate) {
       CRLDownload = 1;
       opt.crl %= 10;
    }
-   if (opt.crl >= 0 && opt.crl <= 3)
+   if (opt.crl >= crlIgnore && opt.crl <= crlRequire)
       CRLCheck = opt.crl;
    DEBUG("option CRLCheck: "<<CRLCheck<<" ('"<<cocrl[CRLCheck]<<"'; download? "<<
                               codwld[CRLDownload]<<")");
@@ -570,6 +575,11 @@ char *XrdSecProtocolgsi::Init(gsiOptions opt, XrdOucErrInfo *erp)
    DEBUG("trust DNS option: "<<TrustDNS);
 
    //
+   // Enable/disable displaying the DN
+   ShowDN = opt.showDN;
+   DEBUG("show DN option: "<<ShowDN);
+
+   //
    // Server specific options
    if (Server) {
       //
@@ -626,7 +636,7 @@ char *XrdSecProtocolgsi::Init(gsiOptions opt, XrdOucErrInfo *erp)
       if (ncrypt <= 0) {
          ErrF(erp,kGSErrInit,"could not find any valid crypto module");
          PRINT(erp->getErrText());
-         return Parms;
+         return Failure;
       }
       //
       // List of supported / wanted ciphers
@@ -710,7 +720,7 @@ char *XrdSecProtocolgsi::Init(gsiOptions opt, XrdOucErrInfo *erp)
       if (cacheCert.Num() <= 0) {
          ErrF(erp,kGSErrError,"no valid server certificate found");
          PRINT(erp->getErrText());
-         return Parms;
+         return Failure;
       }
 
       DEBUG("CA list: "<<certcalist);
@@ -754,9 +764,9 @@ char *XrdSecProtocolgsi::Init(gsiOptions opt, XrdOucErrInfo *erp)
          if (opt.gmapto > 0) { pars += "to="; pars += (int)opt.gmapto; }
          if (!(servGMap = XrdOucgetGMap(&eDest, GMAPFile.c_str(), pars.c_str()))) {
             if (GMAPOpt > 1) {
-               ErrF(erp,kGSErrError,"error loading grid map file:",GMAPFile.c_str());
+               ErrF(erp,kGSErrError,"error loading grid map file",GMAPFile.c_str());
                PRINT(erp->getErrText());
-               return Parms;
+               return Failure;
             } else {
                NOTIFY("Grid map file: "<<GMAPFile<<" cannot be 'access'ed: do not use");
             }
@@ -773,7 +783,7 @@ char *XrdSecProtocolgsi::Init(gsiOptions opt, XrdOucErrInfo *erp)
                                      (const char *) opt.gmapfunparms))) {
             ErrF(erp, kGSErrError, "GMAP plug-in could not be loaded", opt.gmapfun); 
             PRINT(erp->getErrText());
-            return Parms;
+            return Failure;
          } else {
             hasgmapfun = 1;
          }
@@ -785,19 +795,20 @@ char *XrdSecProtocolgsi::Init(gsiOptions opt, XrdOucErrInfo *erp)
             ErrF(erp,kGSErrError,"User mapping required, but neither a grid mapfile"
                                  " nor a mapping function are available");
             PRINT(erp->getErrText());
-            return Parms;
+            return Failure;
          }
          GMAPOpt = 0;
       }
       //
-      // Authorization function
+      // Authentication function
       bool hasauthzfun = 0;
+      AuthzAlways = opt.authzcall;
       if (opt.authzfun) {
          if (!(AuthzFun = LoadAuthzFun((const char *) opt.authzfun,
                                        (const char *) opt.authzfunparms, AuthzCertFmt))) {
             ErrF(erp, kGSErrError, "Authz plug-in could not be loaded", opt.authzfun); 
             PRINT(erp->getErrText());
-            return Parms;
+            return Failure;
          } else {
             hasauthzfun = 1;
             // Notify certificate format
@@ -828,7 +839,7 @@ char *XrdSecProtocolgsi::Init(gsiOptions opt, XrdOucErrInfo *erp)
       //                     1  last proxy only
       //        opt_where  = 1  Entity.creds
       //                     2  Entity.endorsements
-      if (opt.authzpxy > 0) {
+      if (opt.authzpxy) {
          AuthzPxyWhat = opt.authzpxy / 10;
          AuthzPxyWhere = opt.authzpxy % 10;
          // Some notification
@@ -851,7 +862,7 @@ char *XrdSecProtocolgsi::Init(gsiOptions opt, XrdOucErrInfo *erp)
         DEBUG("Will not accept delegated proxies");
       } else {
         // Ask the client to sign a delegated proxy; client may decide to forward its proxy
-        if (opt.dlgpxy == 1)
+        if (opt.dlgpxy == dlgReqSign)
            PxyReqOpts |= kOptsSrvReq;
 
         // Exporting options (default none: delegated proxy kept in memory, in proxyChain) 
@@ -882,30 +893,33 @@ char *XrdSecProtocolgsi::Init(gsiOptions opt, XrdOucErrInfo *erp)
       // vomsat = 0  do not look for
       //          1  extract if any (fill 'vorg', 'role'; the full string in 'endorsements');
       //          2  require (fill 'vorg', 'role'; the full string in 'endorsements');
-      VOMSAttrOpt = (opt.vomsat <= 2 && opt.vomsat >= 0) ? opt.vomsat : VOMSAttrOpt;
+      VOMSAttrOpt = (opt.vomsat <= vatRequire && opt.vomsat >= vatIgnore)
+                  ? opt.vomsat : VOMSAttrOpt;
 
       //
       // Alternative VOMS extraction function
       if (opt.vomsfun) {
          if (!(VOMSFun = LoadVOMSFun((const char *) opt.vomsfun,
                                      (const char *) opt.vomsfunparms, VOMSCertFmt))) {
-            ErrF(erp, kGSErrError, "VOMS plug-in could not be loaded", opt.vomsfun); 
+            ErrF(erp, kGSErrError, "VOMS plug-in loading failed", opt.vomsfun);
             PRINT(erp->getErrText());
-            return Parms;
+            return Failure;
          } else {
-            // We at least check VOMS attributes if we have a function ...
-            if (VOMSAttrOpt < 1) VOMSAttrOpt = 1;
             // Notify certificate format
             if (VOMSCertFmt >= 0 && VOMSCertFmt <= 1) {
                const char *ccfmt[] = { "raw", "PEM base64" };
                DEBUG("vomsfun: proxy certificate format: "<<ccfmt[VOMSCertFmt]);
             } else {
-               NOTIFY("vomsfun: proxy certificate format: unknown (code: "<<VOMSCertFmt<<")");
+               char fbuff[64];
+               snprintf(fbuff, sizeof(fbuff), "%d", VOMSCertFmt);
+               ErrF(erp, kGSErrError, "VOMS plug-in returned invalid cert "
+                                      "format", fbuff);
+               PRINT(erp->getErrText());
+               return Failure;
             }
          }
-      }
-      const char *cvomsat[3] = { "ignore", "extract", "require" };
-      DEBUG("VOMS attributes options: "<<cvomsat[VOMSAttrOpt]);
+      } else opt.authzcall = AuthzAlways = 1;
+      DEBUG("VOMS attributes options: "<<getOptName(vomsatOpts, VOMSAttrOpt));
 
       //
       // Default moninfo option
@@ -914,6 +928,15 @@ char *XrdSecProtocolgsi::Init(gsiOptions opt, XrdOucErrInfo *erp)
       MonInfoOpt = opt.moninfo;
       const char *cmoninfo = (MonInfoOpt == 1) ? "DN" : "none";
       DEBUG("Monitor information options: "<<cmoninfo);
+
+      // Make sure we have a calist as the client can't do anything without it.
+      // If the cryptlist is empty the client will use the default one.
+      //
+      if (certcalist.length() == 0)
+         {ErrF(erp,kGSErrInit,"unable to generate ca cert hash list!");
+          PRINT(erp->getErrText());
+          return Failure;
+         }
 
       //
       // Parms in the form:
@@ -925,6 +948,7 @@ char *XrdSecProtocolgsi::Init(gsiOptions opt, XrdOucErrInfo *erp)
       } else {
          ErrF(erp,kGSErrInit,"no system resources for 'Parms'");
          PRINT(erp->getErrText());
+         return Failure;
       }
 
       // Some notification
@@ -989,13 +1013,18 @@ char *XrdSecProtocolgsi::Init(gsiOptions opt, XrdOucErrInfo *erp)
          DefBits = opt.bits;
       //
       // Delegate proxy options
-      if (opt.dlgpxy > 0) {
+      if (opt.dlgpxy > dlgIgnore) {
          PxyReqOpts |= kOptsSigReq;
-         if (opt.dlgpxy == 2) {
+         if (opt.dlgpxy == dlgSendpxy) {
             PxyReqOpts |= kOptsFwdPxy;
          } else {
             PxyReqOpts |= kOptsDlgPxy;
          }
+      }
+      //
+      // No proxy options
+      if (opt.createpxy) {
+         PxyReqOpts |= kOptsCreatePxy;
       }
       //
       // Define valid CNs for the server certificates; default is null, which means that
@@ -1011,6 +1040,9 @@ char *XrdSecProtocolgsi::Init(gsiOptions opt, XrdOucErrInfo *erp)
       TRACE(Authen, "proxy: depth of signature path: "<<DepLength);
       TRACE(Authen, "proxy: bits in key:             "<<DefBits);
       TRACE(Authen, "server cert: allowed names:     "<<SrvAllowedNames);
+      if (!(PxyReqOpts & kOptsCreatePxy)) {
+         TRACE(Authen, "allowing for pure cert/key authentication (no proxy) ");
+      }
 
       // We are done
       Parms = (char *)"";
@@ -1031,6 +1063,7 @@ void XrdSecProtocolgsi::Delete()
    SafeFree(Entity.vorg);
    SafeFree(Entity.role);
    SafeFree(Entity.grps);
+   SafeFree(Entity.caps);
    SafeFree(Entity.endorsements);
    if (Entity.creds && Entity.credslen > 0) {
       SafeFree(Entity.creds);
@@ -1047,9 +1080,9 @@ void XrdSecProtocolgsi::Delete()
    SafeDelete(sessionMD);     // Message Digest instance
    SafeDelete(sessionKsig);   // RSA key to sign
    SafeDelete(sessionKver);   // RSA key to verify
-   if (proxyChain) proxyChain->Cleanup(1);
+   if (proxyChain) proxyChain->Cleanup();
    SafeDelete(proxyChain);    // Chain with delegated proxies
-   SafeDelete(expectedHost);
+   SafeFree(expectedHost);
 
    delete this;
 }
@@ -1087,8 +1120,8 @@ int XrdSecProtocolgsi::Encrypt(const char *inbuf,  // Data to be encrypted
    int liv = 0;
    char *iv = 0;
    if (useIV) {
-      iv = sessionKey->RefreshIV(liv);
-      sessionKey->SetIV(liv, iv);
+      iv = sessionKey->RefreshIV(liv); // no need to call sessionKeySetIV as
+                                       // RefreshIV will set the internal value
    }
 
    // Get output buffer
@@ -1099,7 +1132,8 @@ int XrdSecProtocolgsi::Encrypt(const char *inbuf,  // Data to be encrypted
    memcpy(buf, iv, liv);
 
    // Encrypt
-   int len = sessionKey->Encrypt(inbuf, inlen, buf + liv);
+   int len = sessionKey->Encrypt(inbuf, inlen, buf + liv) + liv; // the size of initialization vector which is being appended at
+                                                                 // the beginning of the output buffer has to be taken into account
    if (len <= 0) {
       SafeFree(buf);
       return -EINVAL;
@@ -1421,11 +1455,11 @@ XrdSecCredentials *XrdSecProtocolgsi::getCredentials(XrdSecParameters *parm,
 
    // We support passing the user {proxy, cert, key} paths via Url parameter
    char *upp = (ei && ei->getEnv()) ? ei->getEnv()->Get("xrd.gsiusrpxy") : 0;
-   if (upp) UsrProxy = upp;
+   if (upp) urlUsrProxy = upp;
    upp = (ei && ei->getEnv()) ? ei->getEnv()->Get("xrd.gsiusrcrt") : 0;
-   if (upp) UsrCert = upp;
+   if (upp) urlUsrCert = upp;
    upp = (ei && ei->getEnv()) ? ei->getEnv()->Get("xrd.gsiusrkey") : 0;
-   if (upp) UsrKey = upp;
+   if (upp) urlUsrKey = upp;
 
    // Count interations
    (hs->Iter)++;
@@ -1479,7 +1513,6 @@ XrdSecCredentials *XrdSecProtocolgsi::getCredentials(XrdSecParameters *parm,
    // Parse input buffer
    if (ParseClientInput(bpar, &bmai, Emsg) == -1) {
       DEBUG(Emsg<<" CF: "<<sessionCF);
-      std::cerr <<"secgsi: " <<Emsg <<'\n' <<std::flush;
       return ErrC(ei,bpar,bmai,0,kGSErrParseBuffer,Emsg.c_str(),stepstr);
    }
    // Dump, if requested
@@ -1749,6 +1782,7 @@ int XrdSecProtocolgsi::Authenticate(XrdSecCredentials *cred,
    int nextstep = 0;
    char *bpub = 0;
    int lpub = 0;
+   bool vomsFailed = false;
    const char *stepstr = 0;
    String Message;
    String CryptList;
@@ -1926,6 +1960,7 @@ int XrdSecProtocolgsi::Authenticate(XrdSecCredentials *cred,
                DEBUG("user mapping lookup successful: name is '"<<name<<"'");
             }
             Entity.name = strdup(name.c_str());
+            Entity.eaAPI->Add("gridmap.name", "1", true);
          }
       }
       // If not set, use DN
@@ -1941,39 +1976,39 @@ int XrdSecProtocolgsi::Authenticate(XrdSecCredentials *cred,
       }
 
       // Add the DN as default moninfo if requested (the authz plugin may change this)
-      if (MonInfoOpt > 0) {
-         Entity.moninfo = strdup(hs->Chain->EECname());
+      if (MonInfoOpt > 0 || ShowDN) {
+         const char *theDN = hs->Chain->EECname();
+         if (theDN) {
+            if (ShowDN && !GMAPuseDNname) {
+               PRINT(Entity.name<<" Subject DN='"<<theDN<<"'");
+            }
+            if (MonInfoOpt > 0) Entity.moninfo = strdup(theDN);
+         }
       }
 
-      if (VOMSAttrOpt > 0) {
-         if (VOMSFun) {
-            // Fill the information needed by the external function
-            if (VOMSCertFmt == 1) {
-               // PEM base64
-               bpxy = (*X509ExportChain)(hs->Chain, true);
-               bpxy->ToString(spxy);
-               delete bpxy;
-               Entity.creds = strdup(spxy.c_str());
-               Entity.credslen = spxy.length();
-            } else {
-               // Raw (opaque) format, to be used with XrdCrypto
-               Entity.creds = (char *) hs->Chain;
-               Entity.credslen = 0;
-            }
-            if ((*VOMSFun)(Entity) != 0 && VOMSAttrOpt == 2) {
-               // Error
-               kS_rc = kgST_error;
-               PRINT("ERROR: the VOMS extraction plug-in reported a failure for this handshake");
-               break;
-            }
+      if (VOMSAttrOpt > vatIgnore && VOMSFun) {
+         // Fill the information needed by the external function
+         if (VOMSCertFmt == 1) {
+            // PEM base64
+            bpxy = (*X509ExportChain)(hs->Chain, true);
+            bpxy->ToString(spxy);
+            delete bpxy;
+            Entity.creds = strdup(spxy.c_str());
+            Entity.credslen = spxy.length();
          } else {
-            // Lite version (no validations whatsover)
-            if (ExtractVOMS(hs->Chain, Entity) != 0 && VOMSAttrOpt == 2) {
+            // Raw (opaque) format, to be used with XrdCrypto
+            Entity.creds = (char *) hs->Chain;
+            Entity.credslen = 0;
+         }
+         if ((*VOMSFun)(Entity) != 0) {
+            vomsFailed = true;
+            if (VOMSAttrOpt == vatRequire) {
                // Error
                kS_rc = kgST_error;
-               PRINT("ERROR: VOMS attributes required but not found (default lite-extraction technology)");
+               PRINT("ERROR: the VOMS extraction plug-in reported "
+                     "authentication failure");
                break;
-            }
+             }
          }
          NOTIFY("VOMS: Entity.vorg:         "<< (Entity.vorg ? Entity.vorg : "<none>"));
          NOTIFY("VOMS: Entity.grps:         "<< (Entity.grps ? Entity.grps : "<none>"));
@@ -1984,7 +2019,7 @@ int XrdSecProtocolgsi::Authenticate(XrdSecCredentials *cred,
       // Here prepare/extract the information for authorization
       spxy = "";
       bpxy = 0;
-      if (AuthzFun && AuthzKey) {
+      if (AuthzFun && AuthzKey && (AuthzAlways || vomsFailed)) {
          // Fill the information needed by the external function
          if (AuthzCertFmt == 1) {
             // May have been already done
@@ -2041,7 +2076,7 @@ int XrdSecProtocolgsi::Authenticate(XrdSecCredentials *cred,
             if ((authzrc = (*AuthzFun)(Entity)) != 0) {
                // Error
                kS_rc = kgST_error;
-               PRINT("ERROR: the authorization plug-in reported a failure for this handshake");
+               PRINT("ERROR: the authz plug-in reported failure");
                SafeDelete(key);
                ceref.UnLock();
                break;
@@ -2080,8 +2115,8 @@ int XrdSecProtocolgsi::Authenticate(XrdSecCredentials *cred,
       }
 
       // Export proxy for authorization, if required
-      if (AuthzPxyWhat >= 0) {
-         if (bpxy && AuthzPxyWhat == 1) {
+      if (AuthzPxyWhat >= azFull) {
+         if (bpxy && AuthzPxyWhat == azLast) {
             SafeDelete(bpxy); spxy = "";
             SafeFree(Entity.creds);
             Entity.credslen = 0;
@@ -2094,7 +2129,7 @@ int XrdSecProtocolgsi::Authenticate(XrdSecCredentials *cred,
             }
             bpxy->ToString(spxy);
          }
-         if (AuthzPxyWhere == 1) {
+         if (AuthzPxyWhere == azCred) {
             Entity.creds = strdup(spxy.c_str());
             Entity.credslen = spxy.length();
          } else {
@@ -2235,91 +2270,6 @@ void XrdSecProtocolgsi::FreeEntity(XrdSecEntity *in)
 }
 
 /******************************************************************************/
-/*                         E x t r a c t V O M S                              */
-/******************************************************************************/
-
-int XrdSecProtocolgsi::ExtractVOMS(X509Chain *c, XrdSecEntity &ent)
-{
-   // Get the VOMS attributes from proxy file(s) in chain 'c' (either the proxy
-   // or the limited proxy) and fill the relevant fields in 'ent'
-   EPNAME("ExtractVOMS");
-
-   if (!c) return -1;
-
-   XrdCryptoX509 *xp = c->End();
-   if (!xp) return -1;
-   
-   // Extractor
-   XrdCryptoX509GetVOMSAttr_t X509GetVOMSAttr = sessionCF->X509GetVOMSAttr();
-   if (!X509GetVOMSAttr) return -1;
-
-   // Extract the information
-   XrdOucString vatts;
-   int rc = 0;
-   if ((rc = (*X509GetVOMSAttr)(xp, vatts)) != 0) {
-      if (strstr(xp->Subject(), "CN=limited proxy")) {
-         xp = c->SearchBySubject(xp->Issuer());
-         rc = (*X509GetVOMSAttr)(xp, vatts);
-      }
-      if (rc != 0) {
-         if (rc > 0) {
-            NOTIFY("No VOMS attributes in proxy chain");
-         } else {
-            PRINT("ERROR: problem extracting VOMS attributes");
-         }
-         return -1;
-      }      
-   }
-
-   int from = 0;
-   XrdOucString vat;
-   while ((from = vatts.tokenize(vat, from, ',')) != -1) {
-      XrdOucString vo, role, grp;
-      if (vat.length() > 0) {
-         // The attribute is in the form
-         //        /VO[/group[/subgroup(s)]][/Role=role][/Capability=cap]
-         int isl = vat.find('/', 1);
-         if (isl != STR_NPOS) vo.assign(vat, 1, isl - 1);
-         int igr = vat.find("/Role=", 1);
-         if (igr != STR_NPOS) grp.assign(vat, 0, igr - 1);
-         int irl = vat.find("Role=");
-         if (irl != STR_NPOS) {
-            role.assign(vat, irl + 5);
-            isl = role.find('/');
-            role.erase(isl);
-         }
-         if (ent.vorg) {
-            if (vo != (const char *) ent.vorg) {
-               DEBUG("WARNING: found a second VO ('"<<vo<<"'): keeping the first one ('"<<ent.vorg<<"')");
-               // We do not mix-up role settings ...
-               continue;
-            }
-         } else {
-            if (vo.length() > 0) ent.vorg = strdup(vo.c_str());
-         }
-         if (grp.length() > 0
-         &&  (!ent.grps || grp.length() > int(strlen(ent.grps)))) {
-            SafeFree(ent.grps);
-            ent.grps = strdup(grp.c_str());
-         }
-         if (role.length() > 0 && role != "NULL" && !ent.role) {
-            ent.role = strdup(role.c_str());
-         }
-      }
-   }
-
-   // Save the whole string in endorsements
-   SafeFree(ent.endorsements);
-   if (vatts.length() > 0) ent.endorsements = strdup(vatts.c_str());
-   
-   // Notify if did not find the main info (the VO ...)
-   if (!ent.vorg) PRINT("WARNING: no VO found! (VOMS attributes: '"<<vatts<<"')");
-
-   // Done
-   return (!ent.vorg ? -1 : 0);
-}
-
-/******************************************************************************/
 /*                        E n a b l e T r a c i n g                           */
 /******************************************************************************/
 
@@ -2339,20 +2289,20 @@ XrdOucTrace *XrdSecProtocolgsi::EnableTracing()
 void gsiOptions::Print(XrdOucTrace *t)
 {
    // Dump summary of GSI init options
-   EPNAME("InitOpts");
+// EPNAME("InitOpts");
 
    // For clients print only if really required (for servers we notified it
    // always once for all)
    if ((mode == 'c') && debug <= 0) return;
    
-   POPTS(t, "*** ------------------------------------------------------------ ***");
+   POPTS(t, " -------------------------------------------------------------------");
    POPTS(t, " Mode: "<< ((mode == 'c') ? "client" : "server"));
    POPTS(t, " Debug: "<< debug);
    POPTS(t, " CA dir: " << (certdir ? certdir : XrdSecProtocolgsi::CAdir));
-   POPTS(t, " CA verification level: "<< ca);
+   POPTS(t, " CA verification level: "<< getOptName(caVerOpts, ca));
    POPTS(t, " CRL dir: " << (crldir ? crldir : XrdSecProtocolgsi::CRLdir ));
    POPTS(t, " CRL extension: " << (crlext ? crlext :  XrdSecProtocolgsi::DefCRLext));
-   POPTS(t, " CRL check level: "<< crl);
+   POPTS(t, " CRL check level: "<< getOptName(crlOpts,crl));
    if (crl > 0) POPTS(t, " CRL refresh time: "<< crlrefresh);
    if (mode == 'c') {
       POPTS(t, " Certificate: " << (cert ? cert : XrdSecProtocolgsi::UsrCert));
@@ -2363,15 +2313,16 @@ void gsiOptions::Print(XrdOucTrace *t)
       POPTS(t, " Proxy bits: " << bits);
       POPTS(t, " Proxy sign option: "<< sigpxy);
       POPTS(t, " Proxy delegation option: "<< dlgpxy);
+      if (createpxy) POPTS(t, " Pure Cert/Key authentication allowed");
       POPTS(t, " Allowed server names: "<< (srvnames ? srvnames : "[*/]<target host name>[/*]"));
    } else {
       POPTS(t, " Certificate: " << (cert ? cert : XrdSecProtocolgsi::SrvCert));
       POPTS(t, " Key: " << (key ? key : XrdSecProtocolgsi::SrvKey));
-      POPTS(t, " Proxy delegation option: "<< dlgpxy);
-      if (dlgpxy > 1)
+      POPTS(t, " Proxy delegation option: "<< getOptName(sDlgOpts,dlgpxy));
+      if (exppxy)
          POPTS(t, " Template for exported proxy: "<< (exppxy ? exppxy : gUsrPxyDef));
       POPTS(t, " GRIDmap file: " << (gridmap ? gridmap : XrdSecProtocolgsi::GMAPFile));
-      POPTS(t, " GRIDmap option: "<< ogmap);
+      POPTS(t, " GRIDmap option: "<< getOptName(gmoOpts,ogmap));
       POPTS(t, " GRIDmap cache entries expiration (secs): "<< gmapto);
       if (gmapfun) {
          POPTS(t, " DN mapping function: " << gmapfun);
@@ -2380,14 +2331,16 @@ void gsiOptions::Print(XrdOucTrace *t)
          if (gmapfunparms) POPTS(t, " DN mapping function parms: ignored (no mapping function defined)");
       }
       if (authzfun) {
-         POPTS(t, " Authorization function: " << authzfun);
-         if (authzfunparms) POPTS(t, " Authorization function parms: " << authzfunparms);
-         POPTS(t, " Authorization cache entries expiration (secs): " << authzto);
+         POPTS(t, " Authz function: " << authzfun);
+         if (authzfunparms) POPTS(t, " Authz function parms: " << authzfunparms);
+         POPTS(t, " Authz call: " <<getOptName(azCallOpts,authzcall));
+         POPTS(t, " Authz cache entries expiration (secs): " << authzto);
       } else {
-         if (authzfunparms) POPTS(t, " Authorization function parms: ignored (no authz function defined)");
+         if (authzfunparms) POPTS(t, " Authz function parms: ignored (no authz function defined)");
       }
-      POPTS(t, " Client proxy availability in XrdSecEntity.endorsement: "<< authzpxy);
-      POPTS(t, " VOMS option: "<< vomsat);
+      if (authzpxy)
+         POPTS(t, " Client proxy availability in XrdSecEntity.endorsement: "<< getOptName(azPxyOpts,authzpxy));
+      POPTS(t, " VOMS option: "<< getOptName(vomsatOpts,vomsat));
       if (vomsfun) {
          POPTS(t, " VOMS extraction function: " << vomsfun);
          if (vomsfunparms) POPTS(t, " VOMS extraction function parms: " << vomsfunparms);
@@ -2397,6 +2350,7 @@ void gsiOptions::Print(XrdOucTrace *t)
       POPTS(t, " MonInfo option: "<< moninfo);
       if (!hashcomp)
          POPTS(t, " Name hashing algorithm compatibility OFF");
+      POPTS(t, " Show DN option: "<<showDN);
    }
    // Crypto options
    POPTS(t, " Crypto modules: "<< (clist ? clist : XrdSecProtocolgsi::DefCrypto));
@@ -2407,7 +2361,7 @@ void gsiOptions::Print(XrdOucTrace *t)
    } else {
       POPTS(t, " Untrusting DNS for hostname checking");
    }
-   POPTS(t, "*** ------------------------------------------------------------ ***");
+   POPTS(t, " -------------------------------------------------------------------");
 }
 
 /******************************************************************************/
@@ -2460,7 +2414,7 @@ char *XrdSecProtocolgsiInit(const char mode,
       //                                     ["12:00", i.e. 12 hours]
       //             "XrdSecGSIPROXYDEPLEN"  depth of signature path for proxies;
       //                                     use -1 for unlimited [0]
-      //             "XrdSecGSIPROXYKEYBITS" bits in PKI for proxies [512]
+      //             "XrdSecGSIPROXYKEYBITS" bits in PKI for proxies [default: XrdCryptoDefRSABits]
       //             "XrdSecGSICACHECK"      CA check level [1]:
       //                                      0 do not verify;
       //                                      1 verify if self-signed, warn if not;
@@ -2474,6 +2428,9 @@ char *XrdSecProtocolgsiInit(const char mode,
       //                                     0 deny; 1 sign request created
       //                                     by server; 2 forward local proxy
       //                                     (include private key) [1]
+      //             "XrdSecGSICREATEPROXY"  Controls use of proxy [1]:
+      //                                       1 auto-generate proxy from the cert/key pair if no one is not found
+      //                                       0 a proxy is used if present; else, the cert/key pair is used if present.
       //             "XrdSecGSISRVNAMES"     Server names allowed: if the server CN
       //                                     does not match any of these, or it is
       //                                     explicitely denied by these, or it is
@@ -2563,6 +2520,11 @@ char *XrdSecProtocolgsiInit(const char mode,
       if (cenv)
          opts.dlgpxy = atoi(cenv);
 
+      // No proxy
+      cenv = getenv("XrdSecGSICREATEPROXY");
+      if (cenv)
+         opts.createpxy = atoi(cenv);
+
       // Allowed server name formats
       cenv = getenv("XrdSecGSISRVNAMES");
       if (cenv)
@@ -2631,6 +2593,7 @@ char *XrdSecProtocolgsiInit(const char mode,
       //              [-gridmap:<grid_map_file>]
       //              [-gmapfun:<grid_map_function>]
       //              [-gmapfunparms:<grid_map_function_init_parameters>]
+      //              [-authzcall:<authz_callopt>]
       //              [-authzfun:<authz_function>]
       //              [-authzfunparms:<authz_function_init_parameters>]
       //              [-authzto:<authz_cache_entry_validity_in_secs>]
@@ -2668,12 +2631,14 @@ char *XrdSecProtocolgsiInit(const char mode,
       int ogmap = 1;
       int gmapto = 600;
       int authzto = -1;
-      int dlgpxy = 0;
+      int authzcall = 1;
+      int dlgpxy = dlgIgnore;
       int authzpxy = 0;
-      int vomsat = 1;
+      int vomsat = vatIgnore; // Was 1 or extract
       int moninfo = 0;
       int hashcomp = 1;
-      int trustdns = 1;
+      int trustdns = false;
+      int showDN = false;
       char *op = 0;
       while (inParms.GetLine()) { 
          while ((op = inParms.GetToken())) {
@@ -2696,19 +2661,22 @@ char *XrdSecProtocolgsiInit(const char mode,
             } else if (!strncmp(op, "-md:",4)) {
                md = (const char *)(op+4);
             } else if (!strncmp(op, "-ca:",4)) {
+               ca = getOptVal(caVerOpts, op+4);
                ca = atoi(op+4);
             } else if (!strncmp(op, "-crl:",5)) {
-               crl = atoi(op+5);
+               crl = getOptVal(crlOpts, op+5);
             } else if (!strncmp(op, "-crlrefresh:",12)) {
                crlrefresh = atoi(op+12);
             } else if (!strncmp(op, "-gmapopt:",9)) {
-               ogmap = atoi(op+9);
+               ogmap = getOptVal(gmoOpts, op+9);
             } else if (!strncmp(op, "-gridmap:",9)) {
                gridmap = (const char *)(op+9);
             } else if (!strncmp(op, "-gmapfun:",9)) {
                gmapfun = (const char *)(op+9);
             } else if (!strncmp(op, "-gmapfunparms:",14)) {
                gmapfunparms = (const char *)(op+14);
+            } else if (!strncmp(op, "-authzcall:",11)) {
+               authzcall = getOptVal(azCallOpts, op+11);
             } else if (!strncmp(op, "-authzfun:",10)) {
                authzfun = (const char *)(op+10);
             } else if (!strncmp(op, "-authzfunparms:",15)) {
@@ -2718,15 +2686,17 @@ char *XrdSecProtocolgsiInit(const char mode,
             } else if (!strncmp(op, "-gmapto:",8)) {
                gmapto = atoi(op+8);
             } else if (!strncmp(op, "-dlgpxy:",8)) {
-               dlgpxy = atoi(op+8);
+               opts.dlgpxy = getOptVal(sDlgOpts, op+8);
             } else if (!strncmp(op, "-exppxy:",8)) {
                exppxy = (const char *)(op+8);
             } else if (!strncmp(op, "-authzpxy:",10)) {
-               authzpxy = atoi(op+10);
+               opts.authzpxy = getOptVal(azPxyOpts, op+10);
             } else if (!strncmp(op, "-authzpxy",9)) {
                authzpxy = 11;
             } else if (!strncmp(op, "-vomsat:",8)) {
-               vomsat = atoi(op+8);
+               vomsat = getOptVal(vomsatOpts, op+8);
+               if (vomsat != vatIgnore && vomsfun.length() == 0)
+                  vomsfun = "default";
             } else if (!strncmp(op, "-vomsfun:",9)) {
                vomsfun = (const char *)(op+9);
             } else if (!strncmp(op, "-vomsfunparms:",14)) {
@@ -2738,12 +2708,24 @@ char *XrdSecProtocolgsiInit(const char mode,
             } else if (!strcmp(op, "-defaulthash")) {
                hashcomp = 0;
             } else if (!strncmp(op, "-trustdns:",10)) {
-               trustdns = atoi(op+10);
+               trustdns = getOptVal(tdnsOpts, op+10);
+            } else if (!strncmp(op, "-showdn:",8)) {
+               showDN = getOptVal(tdnsOpts, op+8);
             } else {
                PRINT("ignoring unknown switch: "<<op);
             }
          }
       }
+
+      // If vomsfun is 'default' substitute the default plugin. The go on to
+      // resolve conflicts between vomsfun and vomsat options. So, if vomsfun
+      // was specified but vomsat is set to 'ignore' then we set vomsat to be
+      // 'required'.
+      //
+      if (vomsfun.length() > 0)
+         {if (vomsat == vatIgnore) vomsat = vatExtract;
+          if (vomsfun == "default") vomsfun =  LIB_XRDVOMS;
+         } else authzcall = azAlways;
 
       //
       // Build the option object
@@ -2754,13 +2736,15 @@ char *XrdSecProtocolgsiInit(const char mode,
       opts.crlrefresh = crlrefresh;
       opts.ogmap = ogmap;
       opts.gmapto = gmapto;
+      opts.authzcall = authzcall;
       opts.authzto = authzto;
-      opts.dlgpxy = (dlgpxy >= 0 && dlgpxy <= 1) ? dlgpxy : 0;
+      opts.dlgpxy = (dlgpxy >= dlgIgnore && dlgpxy <= dlgReqSign) ? dlgpxy : 0;
       opts.authzpxy = authzpxy;
       opts.vomsat = vomsat;
       opts.moninfo = moninfo;
       opts.hashcomp = hashcomp;
       opts.trustdns = (trustdns <= 0) ? false : true;
+      opts.showDN = (showDN > 0) ? true : false;
       if (clist.length() > 0)
          opts.clist = (char *)clist.c_str();
       if (certdir.length() > 0)
@@ -2837,13 +2821,13 @@ XrdSecProtocol *XrdSecProtocolgsiObject(const char              mode,
       if (erp) 
          erp->setErrInfo(ENOMEM, msg);
       else 
-         cerr <<msg <<endl;
+         std::cerr <<msg <<std::endl;
       return (XrdSecProtocol *)0;
    }
    //
    // We are done
    if (!erp)
-      cerr << "protocol object instantiated" << endl;
+      std::cerr << "protocol object instantiated" << std::endl;
    return prot;
 }}
 
@@ -3076,36 +3060,61 @@ int XrdSecProtocolgsi::ClientDoInit(XrdSutBuffer *br, XrdSutBuffer **bm,
       hs->Chain = 0;
       return -1;
    }
+
+   //
+   // Extract no proxy option, if any
+   bool createpxy = (PxyReqOpts & kOptsCreatePxy) ? 1 : 0;
+   if (hs->RemVers < XrdSecgsiVersCertKey && !createpxy) {
+      // Server does not accept pure cert files
+      createpxy = 1;
+      DEBUG("Server does not accept pure cert/key authentication: version < "<< (int)XrdSecgsiVersCertKey);
+   }
+
+   String clientcert = UsrCert, clientkey = UsrKey, clientproxy = UsrProxy;
+   if (urlUsrCert.length()>0) clientcert = urlUsrCert;
+   if (urlUsrKey.length()>0) clientkey = urlUsrKey;
+   if (urlUsrProxy.length()>0) clientproxy = urlUsrProxy;
+
    //
    // Resolve place-holders in cert, key and proxy file paths, if any
-   if (XrdSutResolve(UsrCert, Entity.host, Entity.vorg, Entity.grps, Entity.name) != 0) {
-      PRINT("Problems resolving templates in "<<UsrCert);
+   if (XrdSutResolve(clientcert, Entity.host, Entity.vorg, Entity.grps, Entity.name) != 0) {
+      PRINT("Problems resolving templates in "<<clientcert);
       return -1;
    }
-   if (XrdSutResolve(UsrKey, Entity.host, Entity.vorg, Entity.grps, Entity.name) != 0) {
-      PRINT("Problems resolving templates in "<<UsrKey);
+   if (XrdSutResolve(clientkey, Entity.host, Entity.vorg, Entity.grps, Entity.name) != 0) {
+      PRINT("Problems resolving templates in "<<clientkey);
       return -1;
    }
-   if (XrdSutResolve(UsrProxy, Entity.host, Entity.vorg, Entity.grps, Entity.name) != 0) {
-      PRINT("Problems resolving templates in "<<UsrProxy);
+   //
+   // In the standard case we need to resolve also the proxy file path
+   // Get the proxy path
+   if (XrdSutResolve(clientproxy, Entity.host, Entity.vorg, Entity.grps, Entity.name) != 0) {
+      PRINT("Problems resolving templates in "<<clientproxy);
       return -1;
    }
    //
    // Load / Attach-to user proxies
-   ProxyIn_t pi = {UsrCert.c_str(), UsrKey.c_str(), CAdir.c_str(),
-                   UsrProxy.c_str(), PxyValid.c_str(),
-                   DepLength, DefBits};
+   ProxyIn_t pi = {clientcert.c_str(), clientkey.c_str(), CAdir.c_str(),
+                   clientproxy.c_str(), PxyValid.c_str(),
+                   DepLength, DefBits, createpxy};
    ProxyOut_t po = {hs->PxyChain, sessionKsig, hs->Cbck };
-   if (QueryProxy(1, &cachePxy, UsrProxy.c_str(),
+   if (QueryProxy(1, &cachePxy, clientproxy.c_str(),
                   sessionCF, hs->TimeStamp, &pi, &po) != 0) {
       emsg = "error getting user proxies";
       hs->Chain = 0;
       return -1;
    }
+
+   if (!po.cbck) {
+     emsg = "failed to initialize user proxies";
+     hs->Chain = 0;
+     return -1;
+   }
+
    // Save the result
    hs->PxyChain = po.chain;
    hs->Cbck = new XrdSutBucket(*((XrdSutBucket *)(po.cbck)));
-   if (!(sessionKsig = sessionCF->RSA(*(po.ksig)))) {
+   if (!po.ksig || !(sessionKsig = sessionCF->RSA(*(po.ksig)))) {
       emsg = "could not get a copy of the signing key:";
       hs->Chain = 0;
       return -1;
@@ -3247,18 +3256,24 @@ int XrdSecProtocolgsi::ClientDoCert(XrdSutBuffer *br, XrdSutBuffer **bm,
            DEBUG("TrustDNS: checking if cert is for host " <<name);
            usedDNS = true;
            bool hostOK = ServerCertNameOK(hs->Chain->End()->Subject(),name,emsg)
-                      || (hasSAN && !hs->Chain->End()->MatchesSAN(name,hasSAN));
+                      || (hasSAN && hs->Chain->End()->MatchesSAN(name,hasSAN));
            if (!hostOK) return -1;
           }
       }
 
    // If we used the DNS then we must prohibit proxy delegation of any kind
    //
-   if (usedDNS)
+   // In the case of delegation, give client a chance to use XrdSecGSISRVNAMES
+   // to limit where it is being redirected to. If the new destination does not 
+   // match XrdSecGSISRVNAMES, refuse to delegate.
+   //
+   if (usedDNS || 
+       (SrvAllowedNames.length() > 0 && 
+        !ServerCertNameOK(hs->Chain->End()->Subject(), NULL, emsg)))
       {if (hs->Options & (kOptsFwdPxy | kOptsSigReq))
           {hs->Options &= ~(kOptsFwdPxy | kOptsSigReq);
-           std::cerr <<"secgsi: proxy delegation forbidden when trusting DNS!\n"
-                     <<std::flush;
+           std::cerr <<"secgsi: proxy delegation forbidden when trusting DNS "
+                       "to resolve '" <<wantHost <<"'!\n" <<std::flush;
           }
       }
 
@@ -3830,11 +3845,14 @@ int XrdSecProtocolgsi::ServerDoCert(XrdSutBuffer *br,  XrdSutBuffer **bm,
       return -1;
    }
    // Parse bucket
+   int ncimin = (hs->Options & kOptsCreatePxy) ? 2 : 1;
    int nci = (*ParseBucket)(bck, hs->Chain);
-   if (nci < 2) {
-      cmsg = "wrong number of certificates in received bucket (";
+   if (nci < ncimin) {
+      cmsg = "wrong number of certificates in received bucket (received: ";
       cmsg += nci;
-      cmsg += " > 1 expected)";
+      cmsg += ", expected: >= ";
+      cmsg += ncimin;
+      cmsg += ")";
       return -1;
    }
    //
@@ -3891,6 +3909,9 @@ int XrdSecProtocolgsi::ServerDoCert(XrdSutBuffer *br,  XrdSutBuffer **bm,
    if (needReq || (hs->Options & kOptsFwdPxy)) {
       // Create a new proxy chain
       hs->PxyChain = new X509Chain();
+      // The new chain must be deleted if still in the handshake info
+      // when the info is destroyed
+      hs->Options |= kOptsDelPxy;
       // Add the current proxy
       if ((*ParseBucket)(bck, hs->PxyChain) > 1) {
          // Reorder it
@@ -3901,21 +3922,34 @@ int XrdSecProtocolgsi::ServerDoCert(XrdSutBuffer *br,  XrdSutBuffer **bm,
             XrdCryptoRSA *krPXp = 0;
             if ((*X509CreateProxyReq)(hs->PxyChain->End(), &rPXp, &krPXp) == 0) {
                // Save key in the cache
-               hs->Cref->buf4.buf = (char *)krPXp;
+               hs->Cref->buf4.len = krPXp->GetPrilen() + 1;
+               hs->Cref->buf4.buf = new char[hs->Cref->buf4.len];
+               if (krPXp->ExportPrivate(hs->Cref->buf4.buf, hs->Cref->buf4.len) != 0) {
+                  delete krPXp;
+                  delete rPXp;
+                  if (hs->PxyChain) hs->PxyChain->Cleanup();
+                  SafeDelete(hs->PxyChain);
+                  cmsg = "cannot export private key of the proxy request!";
+                  return -1;
+               }
                // Prepare export bucket for request
                XrdSutBucket *bckr = rPXp->Export();
                // Add it to the main list
                if ((*bm)->AddBucket(bckr) != 0) {
+                  if (hs->PxyChain) hs->PxyChain->Cleanup();
                   SafeDelete(hs->PxyChain);
                   NOTIFY("WARNING: proxy req: problem adding bucket to main buffer");
                }
+               delete krPXp;
                delete rPXp;
             } else {
+               if (hs->PxyChain) hs->PxyChain->Cleanup();
                SafeDelete(hs->PxyChain);
                NOTIFY("WARNING: proxy req: problem creating request");
             }
          }
       } else {
+         if (hs->PxyChain) hs->PxyChain->Cleanup();
          SafeDelete(hs->PxyChain);
          NOTIFY("WARNING: proxy req: wrong number of certificates");
       }
@@ -3985,7 +4019,7 @@ int XrdSecProtocolgsi::ServerDoSigpxy(XrdSutBuffer *br,  XrdSutBuffer **bm,
    if (!(bck = (*bm)->GetBucket(kXRS_x509))) {
       cmsg = "buffer with requested info missing";
       // Is there a message from the client?
-      if (!(bck = (*bm)->GetBucket(kXRS_message))) {
+      if ((bck = (*bm)->GetBucket(kXRS_message))) {
          // Yes: decode it and print it
          String m;
          bck->ToString(m);
@@ -4026,8 +4060,12 @@ int XrdSecProtocolgsi::ServerDoSigpxy(XrdSutBuffer *br,  XrdSutBuffer **bm,
          return 0;
       }
       // Set full PKI
-      XrdCryptoRSA *knpx = (XrdCryptoRSA *)(hs->Cref->buf4.buf);
-      npx->SetPKI((XrdCryptoX509data)(knpx->Opaque()));
+      XrdCryptoRSA *const knpx = npx->PKI();
+      if (!knpx || knpx->ImportPrivate(hs->Cref->buf4.buf, hs->Cref->buf4.len) != 0) {
+        delete npx;
+        cmsg = "could not import private key into signed request";
+        return 0;
+      }
       // Add the new proxy ecert to the chain
       pxyc->PushBack(npx);
    }
@@ -4510,7 +4548,7 @@ bool XrdSecProtocolgsi::VerifyCA(int opt, X509Chain *cca, XrdCryptoFactory *CF)
                inam = GetCApath(xd->IssuerHash(ha));
                if (inam.length() <= 0) continue;
                ch = new X509Chain();
-               ncis = (*ParseFile)(inam.c_str(), ch);
+               ncis = (*ParseFile)(inam.c_str(), ch, 0);
                if (ncis >= 1) break;
                SafeDelete(ch);
             }
@@ -4559,9 +4597,10 @@ bool XrdSecProtocolgsi::VerifyCA(int opt, X509Chain *cca, XrdCryptoFactory *CF)
          }
       }
    } else {
-      if (CACheck > 0) {
-         // Check self-signature
-         if (!(verified = cca->CheckCA()))
+      if (CACheck > caNoVerify) {
+         // Check self-signature and fail if needed
+         bool checkselfsigned = (CACheck > caVerifyss) ? true : false;
+         if (!(verified = cca->CheckCA(checkselfsigned)))
             PRINT("CA certificate self-signed: integrity check failed ("<<xc->SubjectHash()<<")");
       } else {
          // Set OK in any case
@@ -4663,7 +4702,7 @@ int XrdSecProtocolgsi::GetCA(const char *cahash,
    if (cent->status == kCE_inactive) {
       // Cleanup and remove existing invalid entries
       if (chain) stackCA.Del(chain);
-      if (crl) stackCRL.Del(crl);
+      if (crl) stackCRL->Del(crl);
       PRINT("unable to get a valid entry from cache for " << tag);
       return -1;
    }
@@ -4677,14 +4716,14 @@ int XrdSecProtocolgsi::GetCA(const char *cahash,
       if (crl) {
          if (hs) hs->Crl = crl;
          // Add to the stack for proper cleaning of invalidated CRLs
-         stackCRL.Add(crl);
+         stackCRL->Add(crl);
       }
       return 0;
    }
 
    // Cleanup and remove existing invalid entries
    if (chain) stackCA.Del(chain);
-   if (crl) stackCRL.Del(crl);
+   if (crl) stackCRL->Del(crl);
 
    chain = 0;
    crl = 0;
@@ -4706,7 +4745,7 @@ int XrdSecProtocolgsi::GetCA(const char *cahash,
    // Get the parse function
    XrdCryptoX509ParseFile_t ParseFile = cf->X509ParseFile();
    if (rc == 0 && ParseFile) {
-      int nci = (createchain) ? (*ParseFile)(fnam.c_str(), chain) : 1;
+      int nci = (createchain) ? (*ParseFile)(fnam.c_str(), chain, 0) : 1;
       bool ok = 0, verified = 0;
       if (nci == 1) {
          // Verify the CA
@@ -4742,7 +4781,7 @@ int XrdSecProtocolgsi::GetCA(const char *cahash,
             if (crl) {
                cent->buf2.buf = (char *)(crl);
                cent->buf2.len = 0;      // Just a flag
-               stackCRL.Add(crl);
+               stackCRL->Add(crl);
             }
             cent->mtime = timestamp;
             cent->status = kCE_ok;
@@ -4858,7 +4897,7 @@ int XrdSecProtocolgsi::InitProxy(ProxyIn_t *pi, XrdCryptoFactory *cf, X509Chain 
    }
 
    // Add number of bits in key
-   if (pi->bits > 512) {
+   if (pi->bits != XrdCryptoDefRSABits) {
       cmd += " -bits ";
       cmd += pi->bits;
    }
@@ -5074,8 +5113,8 @@ int XrdSecProtocolgsi::QueryProxy(bool checkcache, XrdSutCache *cache,
    XrdCryptoX509ParseBucket_t ParseBucket = 0;
    while (!hasproxy && ntry > 0) {
 
-      // Try init as last option
-      if (ntry == 1) {
+      // Try init as last option if not in pure cert/key mode
+      if (ntry == 1 && pi->createpxy) {
 
          // Cleanup the chain
          po->chain->Cleanup();
@@ -5130,15 +5169,27 @@ int XrdSecProtocolgsi::QueryProxy(bool checkcache, XrdSutCache *cache,
                   continue;
                }
             }
+
             // Parse the proxy file
-            int nci = (*ParseFile)(pi->out, po->chain);
+            int nci = (*ParseFile)(pi->out, po->chain, 0);
             if (nci < 2) {
-               DEBUG("proxy files must have at least two certificates"
+               DEBUG("proxy files must have at least 2 certificates"
                      " (found: "<<nci<<")");
-               continue;
+               if (!pi->createpxy) {
+                  // Parse the cert file if requested
+                  int nci = (*ParseFile)(pi->cert, po->chain, pi->key);
+                  if (nci < 1) {
+                     DEBUG("cert files must have at least 1 certificates"
+                           " (found: "<<nci<<")");
+                     continue;
+                  }
+               } else {
+                  continue;
+               }
             }
+
             // Check if any CA was in the file
-            bool checkselfsigned = (CACheck > 1) ? 1 : 0;
+            bool checkselfsigned = (CACheck > caVerifyss) ? true : false;
             po->chain->CheckCA(checkselfsigned);
             exportbucket = 1;
          }
@@ -5675,7 +5726,7 @@ XrdSutCacheEntry *XrdSecProtocolgsi::GetSrvCertEnt(XrdSutCERef &ceref,
    if (cent->status == kCE_special) {
       // Try init proxies
       ProxyIn_t pi = {SrvCert.c_str(), SrvKey.c_str(), CAdir.c_str(),
-                        UsrProxy.c_str(), PxyValid.c_str(), 0, 512};
+                      UsrProxy.c_str(), PxyValid.c_str(), 0, 512, false};
       X509Chain *ch = 0;
       XrdCryptoRSA *k = 0;
       XrdSutBucket *b = 0;
@@ -5692,11 +5743,17 @@ XrdSutCacheEntry *XrdSecProtocolgsi::GetSrvCertEnt(XrdSutCERef &ceref,
    }
 
    // Reset the entry
-   delete (XrdCryptoX509 *) cent->buf1.buf; // Destroys also xsrv->PKI() pointed in cent->buf2.buf
-   delete (XrdSutBucket *) cent->buf3.buf;
-   cent->buf1.buf = 0;
-   cent->buf2.buf = 0;
-   cent->buf3.buf = 0;
+   XrdCryptoX509 *buf1 = (XrdCryptoX509*) cent->buf1.buf;
+   XrdSutBucket *buf3 = (XrdSutBucket*) cent->buf3.buf;
+
+   if (buf1)
+     delete buf1; // Destroys also xsrv->PKI() pointed in cent->buf2.buf
+   if (buf3)
+     delete buf3;
+
+   cent->buf1.buf = nullptr;
+   cent->buf2.buf = nullptr;
+   cent->buf3.buf = nullptr;
 
    //
    // Get the IDs of the file: we need them to acquire the right privileges when opening
@@ -5772,18 +5829,23 @@ XrdSutCacheEntry *XrdSecProtocolgsi::GetSrvCertEnt(XrdSutCERef &ceref,
       cent->status = kCE_ok;
       cent->cnt = 0;
       cent->mtime = xsrv->NotAfter(); // expiration time
+
       // Save pointer to certificate (destroys also xsrv->PKI())
-      if (cent->buf1.buf) delete (XrdCryptoX509 *) cent->buf1.buf;
+      if (cent->buf1.buf)
+        delete (XrdCryptoX509 *) cent->buf1.buf;
       cent->buf1.buf = (char *)xsrv;
       cent->buf1.len = 0;  // just a flag
+
       // Save pointer to key
-      cent->buf2.buf = 0;
       cent->buf2.buf = (char *)(xsrv->PKI());
       cent->buf2.len = 0;  // just a flag
+
       // Save pointer to bucket
-      if (cent->buf3.buf) delete (XrdSutBucket *) cent->buf3.buf;
+      if (cent->buf3.buf)
+        delete (XrdSutBucket *) cent->buf3.buf;
       cent->buf3.buf = (char *)(xbck);
       cent->buf3.len = 0;  // just a flag
+
       // Save CA hash in list to communicate to clients
       if (certcalist.find(xsrv->IssuerHash()) == STR_NPOS) {
          if (certcalist.length() > 0) certcalist += "|";

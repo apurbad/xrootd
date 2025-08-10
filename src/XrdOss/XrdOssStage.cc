@@ -39,11 +39,11 @@
 */
 
 #include <unistd.h>
-#include <errno.h>
+#include <cerrno>
 #include <strings.h>
 #include <signal.h>
-#include <stdio.h>
-#include <time.h>
+#include <cstdio>
+#include <ctime>
 #include <sys/param.h>
 #include <sys/stat.h>
 #include <sys/stat.h>
@@ -131,7 +131,7 @@ int XrdOssSys::Stage_QT(const char *Tid, const char *fn, XrdOucEnv &env,
    int pdlen[XrdOucMsubs::maxElem + 2];
    time_t cTime, mTime, tNow = time(0);
 
-// If there is a fail file and the error occured within the hold time,
+// If there is a fail file and the error occurred within the hold time,
 // fail the request. Otherwise, try it again. This avoids tight loops.
 //
    if ((cTime = HasFile(fn, XRDOSS_FAIL_FILE, &mTime))
@@ -393,8 +393,9 @@ int XrdOssSys::CalcTime()
 
 int XrdOssSys::CalcTime(XrdOssStage_Req *req) // StageMutex lock held!
 {
+    unsigned long long numq = 1;
     unsigned long long tbytes = req->size + stgbytes/2;
-    int xfrtime, numq = 1;
+    int xfrtime;
     time_t now;
     XrdOssStage_Req *rqp = req;
 
@@ -409,8 +410,8 @@ int XrdOssSys::CalcTime(XrdOssStage_Req *req) // StageMutex lock held!
           else return (xfrovhd < 4 ? 2 : xfrovhd / 2);
       }
 
-// Calculate the number of pending bytes being transfered plus 1/2 of the
-// current number of bytes being transfered
+// Calculate the number of pending bytes being transferred plus 1/2 of the
+// current number of bytes being transferred
 //
     while ((rqp=(rqp->pendList.Next()->Item()))) {tbytes += rqp->size; numq++;}
 

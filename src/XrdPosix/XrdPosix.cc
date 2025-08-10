@@ -28,9 +28,9 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <stdarg.h>
-#include <stdio.h>
-#include <stdlib.h>
+#include <cstdarg>
+#include <cstdio>
+#include <cstdlib>
 #include <sys/param.h>
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -52,6 +52,58 @@
        XrdPosixXrootPath XrootPath;
   
 extern XrdPosixLinkage   Xunix;
+
+/******************************************************************************/
+/*                      U t i l i t y  F u n c t i o n s                      */
+/******************************************************************************/
+
+#ifdef MUSL
+#include <stdio_ext.h>
+#endif
+
+static inline void fseterr(FILE *fp)
+{
+  /* Most systems provide FILE as a struct and the necessary bitmask in
+     <stdio.h>, because they need it for implementing getc() and putc() as
+     fast macros. This function is based on gnulib's fseterr.c */
+#if defined _IO_ERR_SEEN || defined _IO_ftrylockfile || __GNU_LIBRARY__ == 1
+  /* GNU libc, BeOS, Haiku, Linux libc5 */
+  fp->_flags |= _IO_ERR_SEEN;
+#elif defined __sferror || defined __APPLE__ || defined __DragonFly__ || defined __FreeBSD__ || defined __ANDROID__
+  /* FreeBSD, NetBSD, OpenBSD, DragonFly, Mac OS X, Cygwin, Minix 3, Android */
+  fp->_flags |= __SERR;
+#elif defined _IOERR
+  /* AIX, HP-UX, IRIX, OSF/1, Solaris, OpenServer, UnixWare, mingw, MSVC, NonStop Kernel, OpenVMS */
+  fp->_flag |= _IOERR;
+#elif defined __UCLIBC__            /* uClibc */
+  fp->__modeflags |= __FLAG_ERROR;
+#elif defined MUSL /* musl libc */
+  __fseterr(fp);
+#else
+ #error "Unsupported platform! Please report it as a bug."
+#endif
+}
+
+static inline void fseteof(FILE *fp)
+{
+  /* Most systems provide FILE as a struct and the necessary bitmask in
+     <stdio.h>, because they need it for implementing getc() and putc() as
+     fast macros.  */
+#if defined _IO_EOF_SEEN || defined _IO_ftrylockfile || __GNU_LIBRARY__ == 1
+  /* GNU libc, BeOS, Haiku, Linux libc5 */
+  fp->_flags |= _IO_EOF_SEEN;
+#elif defined __sferror || defined __APPLE__ || defined __DragonFly__ || defined __ANDROID__
+  /* FreeBSD, NetBSD, OpenBSD, DragonFly, Mac OS X, Cygwin, Minix 3, Android */
+  fp->_flags |= __SEOF;
+#elif defined _IOEOF
+  /* AIX, HP-UX, IRIX, OSF/1, Solaris, OpenServer, UnixWare, mingw, MSVC, NonStop Kernel, OpenVMS */
+  fp->_flag |= _IOEOF;
+#elif defined __UCLIBC__            /* uClibc */
+  fp->__modeflags |= __FLAG_EOF;
+#else
+  (void) fseek(fp, 0L, SEEK_END);
+#endif
+}
 
 /******************************************************************************/
 /*                       X r d P o s i x _ A c c e s s                        */
@@ -213,11 +265,10 @@ int XrdPosix_Fdatasync(int fildes)
 /*                    X r d P o s i x _ F g e t x a t t r                     */
 /******************************************************************************/
   
-#ifdef __linux__
+#if defined(__linux__) || defined(__GNU__) || (defined(__FreeBSD_kernel__) && defined(__GLIBC__))
 extern "C"
 {
-long long XrdPosix_Fgetxattr (int fd, const char *name, void *value, 
-                              unsigned long long size)
+ssize_t XrdPosix_Fgetxattr (int fd, const char *name, void *value, size_t size)
 {
    if (Xroot.myFD(fd)) {errno = ENOTSUP; return -1;}
    return Xunix.Fgetxattr(fd, name, value, size);
@@ -267,11 +318,13 @@ FILE *XrdPosix_Fopen(const char *path, const char *mode)
         if (ISMODE("r")  || ISMODE("rb"))                   omode = O_RDONLY;
    else if (ISMODE("w")  || ISMODE("wb"))                   omode = O_WRONLY
                                                         | O_CREAT | O_TRUNC;
-   else if (ISMODE("a")  || ISMODE("ab"))                   omode = O_APPEND;
+   else if (ISMODE("a")  || ISMODE("ab"))                   omode = O_WRONLY
+                                                        | O_CREAT | O_APPEND;
    else if (ISMODE("r+") || ISMODE("rb+") || ISMODE("r+b")) omode = O_RDWR;
    else if (ISMODE("w+") || ISMODE("wb+") || ISMODE("w+b")) omode = O_RDWR
                                                         | O_CREAT | O_TRUNC;
-   else if (ISMODE("a+") || ISMODE("ab+") || ISMODE("a+b")) omode = O_APPEND;
+   else if (ISMODE("a+") || ISMODE("ab+") || ISMODE("a+b")) omode = O_RDWR
+                                                        | O_CREAT | O_APPEND;
    else {errno = EINVAL; return 0;}
 
 // Now open the file
@@ -308,19 +361,9 @@ size_t XrdPosix_Fread(void *ptr, size_t size, size_t nitems, FILE *stream)
 
 // Get the right return code. Note that we cannot emulate the flags in sunx86
 //
-        if (bytes > 0 && size) rc = bytes/size;
-#ifndef SUNX86
-#if defined(__linux__)
-   else if (bytes < 0) stream->_flags |= _IO_ERR_SEEN;
-   else                stream->_flags |= _IO_EOF_SEEN;
-#elif defined(__APPLE__) || defined(__FreeBSD__)
-   else if (bytes < 0) stream->_flags |= __SEOF;
-   else                stream->_flags |= __SERR;
-#else
-   else if (bytes < 0) stream->_flag  |= _IOERR;
-   else                stream->_flag  |= _IOEOF;
-#endif
-#endif
+   if (bytes > 0 && size) rc = bytes/size;
+   else if (bytes < 0) fseterr(stream);
+   else                fseteof(stream);
 
    return rc;
 }
@@ -375,7 +418,7 @@ int XrdPosix_Fstat(int fildes, struct stat *buf)
 //
    return (Xroot.myFD(fildes)
           ? Xroot.Fstat(fildes, buf)
-#ifdef __linux__
+#if defined(__linux__) and defined(_STAT_VER)
           : Xunix.Fstat64(_STAT_VER, fildes, (struct stat64 *)buf));
 #else
           : Xunix.Fstat64(           fildes, (struct stat64 *)buf));
@@ -387,7 +430,11 @@ int XrdPosix_FstatV(int ver, int fildes, struct stat *buf)
 {
    return (Xroot.myFD(fildes)
           ? Xroot.Fstat(fildes, buf)
+#ifdef _STAT_VER
           : Xunix.Fstat64(ver, fildes, (struct stat64 *)buf));
+#else
+          : Xunix.Fstat64(     fildes, (struct stat64 *)buf));
+#endif
 }
 #endif
 }
@@ -473,18 +520,10 @@ size_t XrdPosix_Fwrite(const void *ptr, size_t size, size_t nitems, FILE *stream
 
    bytes = Xroot.Write(fd, ptr, size*nitems);
 
-// Get the right return code. Note that we cannot emulate the flags in sunx86
+// Get the right return code.
 //
    if (bytes > 0 && size) rc = bytes/size;
-#ifndef SUNX86
-#if defined(__linux__)
-      else stream->_flags |= _IO_ERR_SEEN;
-#elif defined(__APPLE__) || defined(__FreeBSD__)
-      else stream->_flags |= __SERR;
-#else
-      else stream->_flag  |= _IOERR;
-#endif
-#endif
+   else fseterr(stream);
 
    return rc;
 }
@@ -494,11 +533,10 @@ size_t XrdPosix_Fwrite(const void *ptr, size_t size, size_t nitems, FILE *stream
 /*                     X r d P o s i x _ G e t x a t t r                      */
 /******************************************************************************/
   
-#ifdef __linux__
+#if defined(__linux__) || defined(__GNU__) || (defined(__FreeBSD_kernel__) && defined(__GLIBC__))
 extern "C"
 {
-long long XrdPosix_Getxattr (const char *path, const char *name, void *value, 
-                             unsigned long long size)
+ssize_t XrdPosix_Getxattr (const char *path, const char *name, void *value, size_t size)
 {
    char *myPath, buff[2048];
 
@@ -514,11 +552,10 @@ long long XrdPosix_Getxattr (const char *path, const char *name, void *value,
 /*                    X r d P o s i x _ L g e t x a t t r                     */
 /******************************************************************************/
   
-#ifdef __linux__
+#if defined(__linux__) || defined(__GNU__) || (defined(__FreeBSD_kernel__) && defined(__GLIBC__))
 extern "C"
 {
-long long XrdPosix_Lgetxattr (const char *path, const char *name, void *value, 
-                              unsigned long long size)
+ssize_t XrdPosix_Lgetxattr (const char *path, const char *name, void *value, size_t size)
 {
    if (XrootPath.URL(path, 0, 0)) {errno = ENOTSUP; return -1;}
    return Xunix.Lgetxattr(path, name, value, size);
@@ -532,7 +569,7 @@ long long XrdPosix_Lgetxattr (const char *path, const char *name, void *value,
   
 extern "C"
 {
-long long XrdPosix_Lseek(int fildes, long long offset, int whence)
+off_t XrdPosix_Lseek(int fildes, off_t offset, int whence)
 {
 
 // Return the operation of the seek
@@ -559,7 +596,7 @@ int XrdPosix_Lstat(const char *path, struct stat *buf)
 // Return the results of an open of a Unix file
 //
    return (!(myPath = XrootPath.URL(path, buff, sizeof(buff)))
-#ifdef __linux__
+#if defined(__linux__) and defined(_STAT_VER)
           ? Xunix.Lstat64(_STAT_VER, path, (struct stat64 *)buf)
 #else
           ? Xunix.Lstat64(           path, (struct stat64 *)buf)
@@ -675,8 +712,7 @@ long XrdPosix_Pathconf(const char *path, int name)
   
 extern "C"
 {
-long long XrdPosix_Pread(int fildes, void *buf, unsigned long long nbyte,
-                         long long offset)
+ssize_t XrdPosix_Pread(int fildes, void *buf, size_t nbyte, off_t offset)
 {
 
 // Return the results of the read
@@ -692,8 +728,7 @@ long long XrdPosix_Pread(int fildes, void *buf, unsigned long long nbyte,
   
 extern "C"
 {
-long long XrdPosix_Pwrite(int fildes, const void *buf, unsigned long long nbyte,
-                          long long offset)
+ssize_t XrdPosix_Pwrite(int fildes, const void *buf, size_t nbyte, off_t offset)
 {
 
 // Return the results of the write
@@ -709,7 +744,7 @@ long long XrdPosix_Pwrite(int fildes, const void *buf, unsigned long long nbyte,
   
 extern "C"
 {
-long long XrdPosix_Read(int fildes, void *buf, unsigned long long nbyte)
+ssize_t XrdPosix_Read(int fildes, void *buf, size_t nbyte)
 {
 
 // Return the results of the read
@@ -725,7 +760,7 @@ long long XrdPosix_Read(int fildes, void *buf, unsigned long long nbyte)
   
 extern "C"
 {
-long long XrdPosix_Readv(int fildes, const struct iovec *iov, int iovcnt)
+ssize_t XrdPosix_Readv(int fildes, const struct iovec *iov, int iovcnt)
 {
 
 // Return results of the readv
@@ -887,7 +922,7 @@ int XrdPosix_Stat(const char *path, struct stat *buf)
 // Return the results of an open of a Unix file
 //
    return (!(myPath = XrootPath.URL(path, buff, sizeof(buff)))
-#ifdef __linux__
+#if defined(__linux__) and defined(_STAT_VER)
           ? Xunix.Stat64(_STAT_VER, path, (struct stat64 *)buf)
 #else
           ? Xunix.Stat64(           path, (struct stat64 *)buf)
@@ -962,7 +997,7 @@ long XrdPosix_Telldir(DIR *dirp)
   
 extern "C"
 {
-int XrdPosix_Truncate(const char *path, long long offset)
+int XrdPosix_Truncate(const char *path, off_t offset)
 {
    char *myPath, buff[2048];
 
@@ -1012,7 +1047,7 @@ int XrdPosix_Unlink(const char *path)
   
 extern "C"
 {
-long long XrdPosix_Write(int fildes, const void *buf, unsigned long long nbyte)
+ssize_t XrdPosix_Write(int fildes, const void *buf, size_t nbyte)
 {
 
 // Return the results of the write
@@ -1028,7 +1063,7 @@ long long XrdPosix_Write(int fildes, const void *buf, unsigned long long nbyte)
   
 extern "C"
 {
-long long XrdPosix_Writev(int fildes, const struct iovec *iov, int iovcnt)
+ssize_t XrdPosix_Writev(int fildes, const struct iovec *iov, int iovcnt)
 {
 
 // Return results of the writev

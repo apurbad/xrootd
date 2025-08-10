@@ -28,7 +28,10 @@
 #include "XrdCl/XrdClPropertyList.hh"
 #include "XrdCl/XrdClDefaultEnv.hh"
 #include "XrdCl/XrdClConstants.hh"
+#include "XrdCl/XrdClPostMaster.hh"
+#include "XrdCl/XrdClXRootDTransport.hh"
 #include "XrdNet/XrdNetUtils.hh"
+#include "XrdOuc/XrdOucTUtils.hh"
 
 #include <sys/time.h>
 
@@ -38,6 +41,8 @@
 
 namespace XrdCl
 {
+  class Message;
+
   //----------------------------------------------------------------------------
   //! Random utilities
   //----------------------------------------------------------------------------
@@ -52,25 +57,13 @@ namespace XrdCl
                                const std::string &input,
                                const std::string &delimiter )
       {
-        size_t start  = 0;
-        size_t end    = 0;
-        size_t length = 0;
-
-        do
-        {
-          end = input.find( delimiter, start );
-
-          if( end != std::string::npos )
-            length = end - start;
-          else
-            length = input.length() - start;
-
-          if( length )
-            result.push_back( input.substr( start, length ) );
-
-          start = end + delimiter.size();
-        }
-        while( end != std::string::npos );
+          /*
+           * This was done in order to not duplicate code as this method
+           * is also used in XrdHttp
+           * TODO: Maybe this method could be collapsed
+           * to avoid this middle-man call here
+           */
+          XrdOucTUtils::splitString(result,input,delimiter);
       }
 
       //------------------------------------------------------------------------
@@ -134,8 +127,7 @@ namespace XrdCl
       //------------------------------------------------------------------------
       static XRootDStatus GetRemoteCheckSum( std::string       &checkSum,
                                              const std::string &checkSumType,
-                                             const std::string &server,
-                                             const std::string &path );
+                                             const URL         &url );
 
       //------------------------------------------------------------------------
       //! Get a checksum from local file
@@ -182,6 +174,12 @@ namespace XrdCl
                                    const std::string                  &file );
 
       //------------------------------------------------------------------------
+      //! Process a config directory and return key-value pairs
+      //------------------------------------------------------------------------
+      static Status ProcessConfigDir( std::map<std::string, std::string> &config,
+                                      const std::string                  &dir );
+
+      //------------------------------------------------------------------------
       //! Trim a string
       //------------------------------------------------------------------------
       static void Trim( std::string &str );
@@ -204,6 +202,90 @@ namespace XrdCl
       //------------------------------------------------------------------------
       static std::string NormalizeChecksum( const std::string &name,
                                             const std::string &checksum );
+
+      //------------------------------------------------------------------------
+      //! Get supported checksum types for given URL
+      //------------------------------------------------------------------------
+      static std::vector<std::string> GetSupportedCheckSums( const XrdCl::URL &url );
+
+      //------------------------------------------------------------------------
+      //! Automatically infer the right checksum type
+      //!
+      //! @param source      : source URL
+      //! @param destination : destination URL
+      //! @param zip         : true if the source file is being extracted from
+      //!                      a ZIP archive, false otherwise
+      //! @return            : checksum type
+      //------------------------------------------------------------------------
+      static std::string InferChecksumType( const XrdCl::URL &source,
+                                            const XrdCl::URL &destination,
+                                            bool              zip = false );
+
+      //------------------------------------------------------------------------
+      //! Check if this client can support given EC redirect
+      //------------------------------------------------------------------------
+      static bool CheckEC( const Message *req, const URL &url );
+
+      //------------------------------------------------------------------------
+      //! Get protocol version of the given server
+      //! @param url     : URL pointing to the server
+      //! @param protver : protocol version (output parameter)
+      //! @return        : operation status
+      //------------------------------------------------------------------------
+      inline static XrdCl::XRootDStatus GetProtocolVersion( const XrdCl::URL url, int &protver )
+      {
+        XrdCl::AnyObject  qryResult;
+        XrdCl::XRootDStatus st = XrdCl::DefaultEnv::GetPostMaster()->
+            QueryTransport( url, XrdCl::XRootDQuery::ProtocolVersion, qryResult );
+        if( !st.IsOK() ) return st;
+        int *tmp = 0;
+        qryResult.Get( tmp );
+        if( !tmp )
+          return st;
+        protver = *tmp;
+        delete tmp;
+        return XrdCl::XRootDStatus();
+      }
+
+      //------------------------------------------------------------------------
+      //! Check if given server supports extended file attributes
+      //! @param url : URL pointing to the server
+      //! @return    : true if yes, false otherwise
+      //------------------------------------------------------------------------
+      inline static bool HasXAttr( const XrdCl::URL &url )
+      {
+        if( url.IsLocalFile() ) return true;
+        int protver = 0;
+        auto st = GetProtocolVersion( url, protver );
+        if( !st.IsOK() ) return false;
+        return protver >= kXR_PROTXATTVERSION;
+      }
+
+      //------------------------------------------------------------------------
+      //! Check if given server supports pgread/pgwrite
+      //! @param url : URL pointing to the server
+      //! @return    : true if yes, false otherwise
+      //------------------------------------------------------------------------
+      inline static bool HasPgRW( const XrdCl::URL &url )
+      {
+        if( url.IsLocalFile() ) return false;
+        int protver = 0;
+        auto st = GetProtocolVersion( url, protver );
+        if( !st.IsOK() ) return false;
+        return protver >= kXR_PROTPGRWVERSION;
+      }
+
+      //------------------------------------------------------------------------
+      //! Split chunks in a ChunkList into one or more ChunkLists
+      //! @param listsvec        : output vector of ChunkLists
+      //! @param chunks          : input ChunkLisits
+      //! @param maxcs           : maximum size of a ChunkInfo in output
+      //! @param maxc            : maximum number of ChunkInfo in each ChunkList
+      //------------------------------------------------------------------------
+      static void SplitChunks( std::vector<ChunkList> &listsvec,
+                               const ChunkList        &chunks,
+                               const uint32_t          maxcs,
+                               const size_t            maxc );
   };
 
   //----------------------------------------------------------------------------

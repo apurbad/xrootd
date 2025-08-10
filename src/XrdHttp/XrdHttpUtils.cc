@@ -38,7 +38,7 @@
 
 
 
-#include <string.h>
+#include <cstring>
 #include <openssl/hmac.h>
 #include <openssl/bio.h>
 #include <openssl/buffer.h>
@@ -93,14 +93,14 @@ int parseURL(char *url, char *host, int &port, char **path) {
   *path = p2;
 
   char buf[256];
-  int l = min((int)(p2 - p), (int)sizeof (buf));
+  int l = std::min((int)(p2 - p), (int)sizeof (buf));
   strncpy(buf, p, l);
   buf[l] = '\0';
 
   // Now look for :
   p = strchr(buf, ':');
   if (p) {
-    int l = min((int)(p - buf), (int)sizeof (buf));
+    int l = std::min((int)(p - buf), (int)sizeof (buf));
     strncpy(host, buf, l);
     host[l] = '\0';
 
@@ -230,8 +230,14 @@ void calcHashes(
         const char *key) {
 
 
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+  EVP_MAC *mac;
+  EVP_MAC_CTX *ctx;
+  size_t len;
+#else
   HMAC_CTX *ctx;
   unsigned int len;
+#endif
   unsigned char mdbuf[EVP_MAX_MD_SIZE];
   char buf[64];
   struct tm tms;
@@ -249,6 +255,54 @@ void calcHashes(
   if (!fn || !secent) {
     return;
   }
+
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+
+  mac = EVP_MAC_fetch(0, "sha256", 0);
+  ctx = EVP_MAC_CTX_new(mac);
+
+  if (!ctx) {
+     return;
+  }
+
+
+  EVP_MAC_init(ctx, (const unsigned char *) key, strlen(key), 0);
+
+
+  if (fn)
+    EVP_MAC_update(ctx, (const unsigned char *) fn,
+          strlen(fn) + 1);
+
+  EVP_MAC_update(ctx, (const unsigned char *) &request,
+          sizeof (request));
+
+  if (secent->name)
+    EVP_MAC_update(ctx, (const unsigned char *) secent->name,
+          strlen(secent->name) + 1);
+
+  if (secent->vorg)
+    EVP_MAC_update(ctx, (const unsigned char *) secent->vorg,
+          strlen(secent->vorg) + 1);
+
+  if (secent->host)
+    EVP_MAC_update(ctx, (const unsigned char *) secent->host,
+          strlen(secent->host) + 1);
+
+  if (secent->moninfo)
+    EVP_MAC_update(ctx, (const unsigned char *) secent->moninfo,
+          strlen(secent->moninfo) + 1);
+
+  localtime_r(&tim, &tms);
+  strftime(buf, sizeof (buf), "%s", &tms);
+  EVP_MAC_update(ctx, (const unsigned char *) buf,
+          strlen(buf) + 1);
+
+  EVP_MAC_final(ctx, mdbuf, &len, EVP_MAX_MD_SIZE);
+
+  EVP_MAC_CTX_free(ctx);
+  EVP_MAC_free(mac);
+
+#else
 
   ctx = HMAC_CTX_new();
 
@@ -279,7 +333,7 @@ void calcHashes(
   if (secent->host)
     HMAC_Update(ctx, (const unsigned char *) secent->host,
           strlen(secent->host) + 1);
-    
+
   if (secent->moninfo)
     HMAC_Update(ctx, (const unsigned char *) secent->moninfo,
           strlen(secent->moninfo) + 1);
@@ -291,9 +345,11 @@ void calcHashes(
 
   HMAC_Final(ctx, mdbuf, &len);
 
-  Tobase64(mdbuf, len / 2, hash);
-
   HMAC_CTX_free(ctx);
+
+#endif
+
+  Tobase64(mdbuf, len / 2, hash);
 }
 
 int compareHash(
@@ -308,11 +364,6 @@ int compareHash(
   return strcmp(h1, h2);
 
 }
-
-
-
-
-
 
 // unquote a string and return a new one
 
@@ -371,8 +422,24 @@ char *quote(const char *str) {
         strcpy(r + j, "%3A");
         j += 3;
         break;
-      case '/':
-        strcpy(r + j, "%2F");
+      // case '/':
+      //   strcpy(r + j, "%2F");
+      //   j += 3;
+      //   break;
+      case '#':
+         strcpy(r + j, "%23");
+         j += 3;
+         break;
+      case '\n':
+        strcpy(r + j, "%0A");
+        j += 3;
+        break;
+      case '\r':
+        strcpy(r + j, "%0D");
+        j += 3;
+        break;
+      case '=':
+        strcpy(r + j, "%3D");
         j += 3;
         break;
       default:
@@ -386,7 +453,48 @@ char *quote(const char *str) {
 }
 
 
+// Escape a string and return a new one
 
+char *escapeXML(const char *str) {
+  int l = strlen(str);
+  char *r = (char *) malloc(l*6 + 1);
+  r[0] = '\0';
+  int i, j = 0;
+  
+  for (i = 0; i < l; i++) {
+    char c = str[i];
+    
+    switch (c) {
+      case '"':
+        strcpy(r + j, "&quot;");
+        j += 6;
+        break;
+      case '&':
+        strcpy(r + j, "&amp;");
+        j += 5;
+        break;
+      case '<':
+        strcpy(r + j, "&lt;");
+        j += 4;
+        break;
+      case '>':
+        strcpy(r + j, "&gt;");
+        j += 4;
+        break;
+      case '\'':
+        strcpy(r + j, "&apos;");
+        j += 6;
+        break;
+      
+      default:
+        r[j++] = c;
+    }
+  }
+  
+  r[j] = '\0';
+  
+  return r;
+}
 
 
 

@@ -253,7 +253,7 @@ namespace XrdCl
     std::string glfnRedirector;
     env->GetString( "GlfnRedirector", glfnRedirector );
     // parse the metalink
-    XrdXmlMetaLink parser( "root:xroot:file:", "xroot:",
+    XrdXmlMetaLink parser( "root:xroot:roots:xroots:file:", "xroot:",
         glfnRedirector.empty() ? 0 : glfnRedirector.c_str() );
     int size = 0;
     XrdOucFileInfo **fileInfos = parser.ConvertAll( metalink.c_str(), size,
@@ -301,7 +301,7 @@ namespace XrdCl
     while( !pPendingRedirects.empty() )
     {
       const Message *msg = pPendingRedirects.front().first;
-      IncomingMsgHandler *handler = pPendingRedirects.front().second;
+      MsgHandler *handler = pPendingRedirects.front().second;
       pPendingRedirects.pop_front();
       if( !handler || !msg )
         continue;
@@ -312,7 +312,7 @@ namespace XrdCl
   //----------------------------------------------------------------------------
   // Generates redirect response for the given request
   //----------------------------------------------------------------------------
-  Message* MetalinkRedirector::GetResponse( const Message *msg ) const
+  std::shared_ptr<Message> MetalinkRedirector::GetResponse( const Message *msg ) const
   {
     if( !pStatus.IsOK() )
       return GetErrorMsg( msg, "Could not load the Metalink file.",
@@ -321,9 +321,9 @@ namespace XrdCl
         reinterpret_cast<const ClientRequestHdr*>( msg->GetBuffer() );
     // get the redirect location
     std::string replica;
-    if( !GetReplica( msg, replica ).IsOK() )
-      return GetErrorMsg( msg, "No more replicas to try.", kXR_NotFound );
-    Message *resp = new Message( sizeof(ServerResponse) );
+    if( !GetReplica( *msg, replica ).IsOK() )
+      return GetErrorMsg( msg, "Metalink: no more replicas to try.", kXR_noReplicas );
+    auto resp = std::make_shared<Message>( sizeof(ServerResponse) );
     ServerResponse* response =
         reinterpret_cast<ServerResponse*>( resp->GetBuffer() );
     response->hdr.status = kXR_redirect;
@@ -338,13 +338,13 @@ namespace XrdCl
   //----------------------------------------------------------------------------
   // Generates error response for the given request
   //----------------------------------------------------------------------------
-  Message* MetalinkRedirector::GetErrorMsg( const Message *msg,
+  std::shared_ptr<Message> MetalinkRedirector::GetErrorMsg( const Message *msg,
       const std::string &errMsg, XErrorCode code ) const
   {
     const ClientRequestHdr *req =
         reinterpret_cast<const ClientRequestHdr*>( msg->GetBuffer() );
 
-    Message* resp = new Message( sizeof(ServerResponse) );
+    auto resp = std::make_shared<Message>( sizeof(ServerResponse) );
     ServerResponse* response =
         reinterpret_cast<ServerResponse*>( resp->GetBuffer() );
 
@@ -364,12 +364,12 @@ namespace XrdCl
   // The virtual response is being handled by the given handler.
   //----------------------------------------------------------------------------
   XRootDStatus MetalinkRedirector::HandleRequestImpl( const Message *msg,
-      IncomingMsgHandler *handler )
+      MsgHandler *handler )
   {
-    Message *resp = GetResponse( msg );
+    auto resp = GetResponse( msg );
     JobManager *jobMan = DefaultEnv::GetPostMaster()->GetJobManager();
-    RedirectJob *job = new RedirectJob( handler );
-    jobMan->QueueJob( job, resp );
+    RedirectJob *job = new RedirectJob( handler, std::move( resp ) );
+    jobMan->QueueJob( job );
     return XRootDStatus();
   }
 
@@ -379,7 +379,7 @@ namespace XrdCl
   // is done.
   //----------------------------------------------------------------------------
   XRootDStatus MetalinkRedirector::HandleRequest( const Message *msg,
-      IncomingMsgHandler *handler )
+      MsgHandler *handler )
   {
     XrdSysMutexHelper scopedLck( pMutex );
     // if the metalink data haven't been loaded yet, make it pending
@@ -396,7 +396,7 @@ namespace XrdCl
   //----------------------------------------------------------------------------
   //! Count how many replicas do we have left to try for given request
   //----------------------------------------------------------------------------
-  int MetalinkRedirector::Count( Message *req ) const
+  int MetalinkRedirector::Count( Message &req ) const
   {
     ReplicaList::const_iterator itr = GetReplica( req );
     return pReplicas.end() - itr;
@@ -433,14 +433,21 @@ namespace XrdCl
   //----------------------------------------------------------------------------
   //! Get the next replica for the given message
   //----------------------------------------------------------------------------
-  XRootDStatus MetalinkRedirector::GetReplica( const Message *msg,
+  XRootDStatus MetalinkRedirector::GetReplica( const Message &msg,
       std::string &replica ) const
   {
     ReplicaList::const_iterator itr = GetReplica( msg );
     if( itr == pReplicas.end() )
       return XRootDStatus( stError, errNotFound );
 
-    replica = *itr;
+    XrdCl::Env *env = XrdCl::DefaultEnv::GetEnv();
+    int tlsmtl = DefaultTlsMetalink;
+    env->GetInt( "TlsMetalink", tlsmtl );
+    URL url( *itr );
+    if( tlsmtl && ( url.GetProtocol() == "root" || url.GetProtocol() == "xroot" ) )
+      url.SetProtocol( "roots" );
+    replica = url.GetURL();
+
     return XRootDStatus();
   }
 
@@ -448,7 +455,7 @@ namespace XrdCl
   //! Get the next replica for the given message
   //----------------------------------------------------------------------------
   MetalinkRedirector::ReplicaList::const_iterator
-  MetalinkRedirector::GetReplica( const Message *msg ) const
+  MetalinkRedirector::GetReplica( const Message &msg ) const
   {
     if( pReplicas.empty() )
       return pReplicas.cend();
@@ -474,13 +481,13 @@ namespace XrdCl
   //----------------------------------------------------------------------------
   //! Extracts an element from url cgi
   //----------------------------------------------------------------------------
-  XRootDStatus MetalinkRedirector::GetCgiInfo( const Message *msg,
+  XRootDStatus MetalinkRedirector::GetCgiInfo( const Message &msg,
       const std::string &key, std::string &value ) const
   {
     const ClientRequestHdr *req =
-        reinterpret_cast<const ClientRequestHdr*>( msg->GetBuffer() );
-    kXR_int32 dlen = msg->IsMarshalled() ? ntohl( req->dlen ) : req->dlen;
-    std::string url( msg->GetBuffer( 24 ), dlen );
+        reinterpret_cast<const ClientRequestHdr*>( msg.GetBuffer() );
+    kXR_int32 dlen = msg.IsMarshalled() ? ntohl( req->dlen ) : req->dlen;
+    std::string url( msg.GetBuffer( 24 ), dlen );
     size_t pos = url.find( '?' );
     if( pos == std::string::npos )
       return XRootDStatus( stError );

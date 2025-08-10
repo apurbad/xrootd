@@ -28,9 +28,9 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <string.h>
+#include <cstring>
 #include <strings.h>
-#include <stdio.h>
+#include <cstdio>
 #include <fcntl.h>
 #include <unistd.h>
 #include <utime.h>
@@ -401,12 +401,16 @@ void XrdFrmTransfer::ffMake(int nofile){
   
 void *InitXfer(void *parg)
 {   XrdFrmTransfer *xP = new XrdFrmTransfer;
-    xP->Start();
+    if (parg) xP->Start(*(int *)parg);
     return (void *)0;
 }
   
 int XrdFrmTransfer::Init()
 {
+   static int anyQ = XrdFrmXfrQueue::useAnyQ;
+   static int inpQ = XrdFrmXfrQueue::useInpQ;
+   static int outQ = XrdFrmXfrQueue::useOutQ;
+   void *qWant;
    pthread_t tid;
    int retc, n;
 
@@ -418,11 +422,18 @@ int XrdFrmTransfer::Init()
 //
    if (!XrdFrmXfrQueue::Init()) return 0;
 
-// Start the required number of transfer threads
+// Start the required number of transfer threads. Note we can split these
+// as dedicated in threads and dedicated out threads.
 //
    n = Config.xfrMax;
    while(n--)
-        {if ((retc = XrdSysThread::Run(&tid, InitXfer, (void *)0,
+        {     if (Config.xfrMaxIn)
+                 { qWant = (void *)&inpQ; Config.xfrMaxIn--;}
+         else if (Config.xfrMaxOt)
+                 { qWant = (void *)&outQ; Config.xfrMaxOt--;}
+         else      qWant = (void *)&anyQ;
+
+         if ((retc = XrdSysThread::Run(&tid, InitXfer, qWant,
                                        XRDSYSTHREAD_BIND, "transfer")))
             {Say.Emsg("main", retc, "create xfr thread"); return 0;}
         }
@@ -483,7 +494,7 @@ int XrdFrmTransfer::SetupCmd(XrdFrmTranArg *argP)
 /* Public:                         S t a r t                                  */
 /******************************************************************************/
   
-void XrdFrmTransfer::Start()
+void XrdFrmTransfer::Start(int ioqType)
 {
    EPNAME("Transfer");  // Wrong but looks better
    const char *Msg;
@@ -493,7 +504,7 @@ void XrdFrmTransfer::Start()
 // Endless loop looking for transfer jobs
 //
    while(1)
-        {xfrP = XrdFrmXfrQueue::Get();
+        {xfrP = XrdFrmXfrQueue::Get(ioqType);
 
          DEBUG(xfrP->Type <<" starting " <<xfrP->reqData.LFN
                <<" for " <<xfrP->reqData.User);
@@ -526,6 +537,7 @@ void XrdFrmTransfer::Start()
   
 int XrdFrmTransfer::TrackDC(char *Lfn, char *Mdp, char *Rfn)
 {
+   (void)Lfn;
    char *FName, *Slash, *Slush = 0, *begRfn = Rfn;
    int n = -1;
 
@@ -595,8 +607,9 @@ const char *XrdFrmTransfer::Throw()
    XrdFrmTranChk Chk(&begStat);
    time_t xfrET;
    const char *eTxt, *retMsg = 0;
-   char Rfn[MAXPATHLEN+256], *lfnpath = xfrP->reqData.LFN, *theDest;
-   char pdBuff[1024];
+   char Rfn[MAXPATHLEN+256] = "";
+   char *lfnpath = xfrP->reqData.LFN, *theDest = nullptr;
+   char pdBuff[1024] = "";
    int isMigr = xfrP->reqData.Options & XrdFrcRequest::Migrate;
    int iXfr, isURL, pdSZ, rc, mDP = -1;
 
@@ -674,7 +687,7 @@ const char *XrdFrmTransfer::Throw()
 //
    if (!rc)
       {if ((rc = Config.Stat(lfnpath+xfrP->reqData.LFO, xfrP->PFN, &endStat)))
-          {Say.Emsg("Throw", lfnpath, "transfered but not found!");
+          {Say.Emsg("Throw", lfnpath, "transferred but not found!");
            retMsg = "unable to verify copy";
           } else {
            if (begStat.st_mtime != endStat.st_mtime
@@ -809,7 +822,7 @@ const char *XrdFrmTransfer::ThrowOK(XrdFrmTranChk *cP)
       } else statRC = 1;
    if (statRC && !Config.runNew) return "missing lock file";
 
-// If running in new mode then we must get the extened attribute for this file
+// If running in new mode then we must get the extended attribute for this file
 // unless we got the lock file time which takes precendence.
 //
    if (Config.runNew)

@@ -28,7 +28,7 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <errno.h>
+#include <cerrno>
 #include <fcntl.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
@@ -38,6 +38,15 @@
 #include "XrdSys/XrdSysHeaders.hh"
 #include "XrdSys/XrdSysTimer.hh"
 
+/******************************************************************************/
+/*                               G l o b a l s                                */
+/******************************************************************************/
+
+namespace XrdPosixGlobals
+{
+extern thread_local XrdOucECMsg ecMsg;
+}
+  
 /******************************************************************************/
 /*                        S t a t i c   M e m b e r s                         */
 /******************************************************************************/
@@ -310,7 +319,7 @@ void XrdPosixObject::Shutdown()
    XrdPosixObject *oP;
    int i;
 
-// Destory all files and static data
+// Destroy all files and static data
 //
    fdMutex.Lock();
    if (myFiles)

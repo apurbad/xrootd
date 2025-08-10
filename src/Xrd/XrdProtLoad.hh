@@ -39,14 +39,13 @@ public:
 
 void          DoIt() {}
 
-static void   Init(XrdSysError *eP, XrdOucTrace *tP)
-                  {XrdLog = eP; XrdTrace = tP;}
-
 static int    Load(const char *lname, const char *pname, char *parms,
-                   XrdProtocol_Config *pi);
+                   XrdProtocol_Config *pi, bool istls);
 
 static int    Port(const char *lname, const char *pname, char *parms,
                    XrdProtocol_Config *pi);
+
+static void   Port(int protIdx, int port, bool isTLS);
 
 XrdProtocol  *Match(XrdLink *) {return 0;}
 
@@ -62,6 +61,7 @@ static int    Statistics(char *buff, int blen, int do_sync=0);
              ~XrdProtLoad();
 
 static const int ProtoMax = 8;
+static const int PortoMax = 8;
 
 private:
 
@@ -70,16 +70,11 @@ static XrdProtocol *getProtocol    (const char *lname, const char *pname,
 static int          getProtocolPort(const char *lname, const char *pname,
                                     char *parms, XrdProtocol_Config *pi);
 
-static XrdSysError   *XrdLog;
-static XrdOucTrace   *XrdTrace;
-
 static char          *ProtName[ProtoMax];   // ->Supported protocol names
 static XrdProtocol   *Protocol[ProtoMax];   // ->Supported protocol objects
-static int            ProtPort[ProtoMax];   // ->Supported protocol ports
-static XrdProtocol   *ProtoWAN[ProtoMax];   // ->Supported protocol objects WAN
 static int            ProtoCnt;             // Number in table (at least 1)
-static int            ProtWCnt;             // Number in table (WAN may be 0)
 
        int            myPort;
+       signed char    myProt[ProtoMax+2];   // My protocols
 };
 #endif

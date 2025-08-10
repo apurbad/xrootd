@@ -29,9 +29,13 @@
 #include "XrdCl/XrdClUtils.hh"
 
 #include "XrdSys/XrdSysPthread.hh"
+#include "XrdSys/XrdSysRAtomic.hh"
 #include "XrdNet/XrdNetAddr.hh"
+#include "XrdOuc/XrdOucCompiler.hh"
 #include <list>
 #include <vector>
+#include <functional>
+#include <memory>
 
 namespace XrdCl
 {
@@ -61,7 +65,7 @@ namespace XrdCl
       //------------------------------------------------------------------------
       //! Constructor
       //------------------------------------------------------------------------
-      Stream( const URL *url, uint16_t streamNum );
+      Stream( const URL *url, const URL &prefer = URL() );
 
       //------------------------------------------------------------------------
       //! Destructor
@@ -71,15 +75,15 @@ namespace XrdCl
       //------------------------------------------------------------------------
       //! Initializer
       //------------------------------------------------------------------------
-      Status Initialize();
+      XRootDStatus Initialize();
 
       //------------------------------------------------------------------------
       //! Queue the message for sending
       //------------------------------------------------------------------------
-      Status Send( Message              *msg,
-                   OutgoingMsgHandler   *handler,
-                   bool                  stateful,
-                   time_t                expires );
+      XRootDStatus Send( Message     *msg,
+                         MsgHandler  *handler,
+                         bool         stateful,
+                         time_t       expires );
 
       //------------------------------------------------------------------------
       //! Set the transport
@@ -103,8 +107,6 @@ namespace XrdCl
       void SetIncomingQueue( InQueue *incomingQueue )
       {
         pIncomingQueue = incomingQueue;
-        delete pQueueIncMsgJob;
-        pQueueIncMsgJob = new QueueIncMsgJob( incomingQueue );
       }
 
       //------------------------------------------------------------------------
@@ -136,7 +138,7 @@ namespace XrdCl
       //! handler gets write readiness events, it will update the path with
       //! what it has actually enabled
       //------------------------------------------------------------------------
-      Status EnableLink( PathID &path );
+      XRootDStatus EnableLink( PathID &path );
 
       //------------------------------------------------------------------------
       //! Disconnect the stream
@@ -155,14 +157,6 @@ namespace XrdCl
       const URL *GetURL() const
       {
         return pUrl;
-      }
-
-      //------------------------------------------------------------------------
-      //! Get the stream number
-      //------------------------------------------------------------------------
-      uint16_t GetStreamNumber() const
-      {
-        return pStreamNum;
       }
 
       //------------------------------------------------------------------------
@@ -187,13 +181,13 @@ namespace XrdCl
       //! Call back when a message has been reconstructed
       //------------------------------------------------------------------------
       void OnIncoming( uint16_t  subStream,
-                       Message  *msg,
+                       std::shared_ptr<Message> msg,
                        uint32_t  bytesReceived );
 
       //------------------------------------------------------------------------
       // Call when one of the sockets is ready to accept a new message
       //------------------------------------------------------------------------
-      std::pair<Message *, OutgoingMsgHandler *>
+      std::pair<Message *, MsgHandler *>
         OnReadyToWrite( uint16_t subStream );
 
       //------------------------------------------------------------------------
@@ -211,27 +205,27 @@ namespace XrdCl
       //------------------------------------------------------------------------
       //! On connect error
       //------------------------------------------------------------------------
-      void OnConnectError( uint16_t subStream, Status status );
+      void OnConnectError( uint16_t subStream, XRootDStatus status );
 
       //------------------------------------------------------------------------
       //! On error
       //------------------------------------------------------------------------
-      void OnError( uint16_t subStream, Status status );
+      void OnError( uint16_t subStream, XRootDStatus status );
 
       //------------------------------------------------------------------------
       //! Force error
       //------------------------------------------------------------------------
-      void ForceError( Status status );
+      void ForceError( XRootDStatus status, bool hush=false );
 
       //------------------------------------------------------------------------
       //! On read timeout
       //------------------------------------------------------------------------
-      void OnReadTimeout( uint16_t subStream, bool &isBroken );
+      bool OnReadTimeout( uint16_t subStream ) XRD_WARN_UNUSED_RESULT;
 
       //------------------------------------------------------------------------
       //! On write timeout
       //------------------------------------------------------------------------
-      void OnWriteTimeout( uint16_t subStream );
+      bool OnWriteTimeout( uint16_t subStream ) XRD_WARN_UNUSED_RESULT;
 
       //------------------------------------------------------------------------
       //! Register channel event handler
@@ -253,27 +247,57 @@ namespace XrdCl
       //! @param stream stream concerned
       //! @return       a pair containing the handler and ownership flag
       //------------------------------------------------------------------------
-      std::pair<IncomingMsgHandler *, bool>
-        InstallIncHandler( Message *msg, uint16_t stream );
+      MsgHandler*
+        InstallIncHandler( std::shared_ptr<Message> &msg, uint16_t stream );
+
+      //------------------------------------------------------------------------
+      //! In case the message is a kXR_status response it needs further attention
+      //!
+      //! @return : a MsgHandler in case we need to read out raw data
+      //------------------------------------------------------------------------
+      uint16_t InspectStatusRsp( uint16_t stream, MsgHandler *&incHandler );
+
+      //------------------------------------------------------------------------
+      //! Set the on-connect handler for data streams
+      //------------------------------------------------------------------------
+      void SetOnDataConnectHandler( std::shared_ptr<Job> &onConnJob )
+      {
+        XrdSysMutexHelper scopedLock( pMutex );
+        pOnDataConnJob = onConnJob;
+      }
+
+      //------------------------------------------------------------------------
+      //! @return : true is this channel can be collapsed using this URL, false
+      //!           otherwise
+      //------------------------------------------------------------------------
+      bool CanCollapse( const URL &url );
+
+      //------------------------------------------------------------------------
+      //! Query the stream
+      //------------------------------------------------------------------------
+      Status Query( uint16_t   query, AnyObject &result );
 
     private:
 
       //------------------------------------------------------------------------
-      // Job queuing the incoming messages
+      //! Check if message is a partial response
       //------------------------------------------------------------------------
-      class QueueIncMsgJob: public Job
+      static bool IsPartial( Message &msg );
+
+      //------------------------------------------------------------------------
+      //! Check if addresses contains given address
+      //------------------------------------------------------------------------
+      inline static bool HasNetAddr( const XrdNetAddr              &addr,
+                                           std::vector<XrdNetAddr> &addresses )
       {
-        public:
-          QueueIncMsgJob( InQueue *queue ): pQueue( queue ) {};
-          virtual ~QueueIncMsgJob() {};
-          virtual void Run( void *arg )
-          {
-            Message *msg = (Message *)arg;
-            pQueue->AddMessage( msg );
-          }
-        private:
-          InQueue *pQueue;
-      };
+        auto itr = addresses.begin();
+        for( ; itr != addresses.end() ; ++itr )
+        {
+          if( itr->Same( &addr ) ) return true;
+        }
+
+        return false;
+      }
 
       //------------------------------------------------------------------------
       // Job handling the incoming messages
@@ -281,34 +305,33 @@ namespace XrdCl
       class HandleIncMsgJob: public Job
       {
         public:
-          HandleIncMsgJob( IncomingMsgHandler *handler ): pHandler( handler ) {};
+          HandleIncMsgJob( MsgHandler *handler ): pHandler( handler ) {};
           virtual ~HandleIncMsgJob() {};
-          virtual void Run( void *arg )
+          virtual void Run( void* )
           {
-            Message *msg = (Message *)arg;
-            pHandler->Process( msg );
+            pHandler->Process();
             delete this;
           }
         private:
-          IncomingMsgHandler *pHandler;
+          MsgHandler *pHandler;
       };
 
       //------------------------------------------------------------------------
       //! On fatal error - unlocks the stream
       //------------------------------------------------------------------------
       void OnFatalError( uint16_t           subStream,
-                         Status             status,
+                         XRootDStatus       status,
                          XrdSysMutexHelper &lock );
 
       //------------------------------------------------------------------------
       //! Inform the monitoring about disconnection
       //------------------------------------------------------------------------
-      void MonitorDisconnection( Status status );
+      void MonitorDisconnection( XRootDStatus status );
 
       //------------------------------------------------------------------------
       //! Send close after an open request timed out
       //------------------------------------------------------------------------
-      Status RequestClose( Message  *resp );
+      XRootDStatus RequestClose( Message  &resp );
 
       typedef std::vector<SubStreamData*> SubStreamList;
 
@@ -316,7 +339,7 @@ namespace XrdCl
       // Data members
       //------------------------------------------------------------------------
       const URL                     *pUrl;
-      uint16_t                       pStreamNum;
+      const URL                      pPrefer;
       std::string                    pStreamName;
       TransportHandler              *pTransport;
       Poller                        *pPoller;
@@ -326,7 +349,7 @@ namespace XrdCl
       InQueue                       *pIncomingQueue;
       AnyObject                     *pChannelData;
       uint32_t                       pLastStreamError;
-      Status                         pLastFatalError;
+      XRootDStatus                   pLastFatalError;
       uint16_t                       pStreamErrorWindow;
       uint16_t                       pConnectionCount;
       uint16_t                       pConnectionRetry;
@@ -339,17 +362,22 @@ namespace XrdCl
       uint64_t                       pSessionId;
 
       //------------------------------------------------------------------------
-      // Jobs
-      //------------------------------------------------------------------------
-      QueueIncMsgJob                *pQueueIncMsgJob;
-
-      //------------------------------------------------------------------------
       // Monitoring info
       //------------------------------------------------------------------------
       timeval                        pConnectionStarted;
       timeval                        pConnectionDone;
-      uint64_t                       pBytesSent;
-      uint64_t                       pBytesReceived;
+      std::atomic<uint64_t>          pBytesSent;
+      std::atomic<uint64_t>          pBytesReceived;
+
+      //------------------------------------------------------------------------
+      // Data stream on-connect handler
+      //------------------------------------------------------------------------
+      std::shared_ptr<Job>           pOnDataConnJob;
+
+      //------------------------------------------------------------------------
+      // Track last assigned Id across all Streams, to ensure unique sessionId
+      //------------------------------------------------------------------------
+      static RAtomic_uint64_t        sSessCntGen;
   };
 }
 

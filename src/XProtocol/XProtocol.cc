@@ -50,9 +50,14 @@
 /*    OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.    */
 /******************************************************************************/
 
-#include <inttypes.h>
+#include <cinttypes>
 #include <netinet/in.h>
 #include <sys/types.h>
+#include <cstring>
+#include <cstdlib>
+#include <cstdio>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include "XProtocol/XProtocol.hh"
 
@@ -64,7 +69,7 @@ namespace
 {
 const char *errNames[kXR_ERRFENCE-kXR_ArgInvalid] =
                    {"Invalid argument",           // kXR_ArgInvalid = 3000,
-                    "Missing agument",            // kXR_ArgMissing
+                    "Missing argument",           // kXR_ArgMissing
                     "Argument is too long",       // kXR_ArgTooLong
                     "File or object is locked",   // kXR_FileLocked
                     "File or object not open",    // kXR_FileNotOpen
@@ -77,27 +82,39 @@ const char *errNames[kXR_ERRFENCE-kXR_ArgInvalid] =
                     "File or object not found",   // kXR_NotFound
                     "Internal server error",      // kXR_ServerError
                     "Unsupported request",        // kXR_Unsupported
-                    "No serves available",        // kXR_noserver
+                    "No servers available",       // kXR_noserver
                     "Target is not a file",       // kXR_NotFile
                     "Target is a directory",      // kXR_isDirectory
                     "Request cancelled",          // kXR_Cancelled
-                    "Checksum length error",      // kXR_ChkLenErr
+                    "Target exists",              // kXR_ItExists
                     "Checksum is invalid",        // kXR_ChkSumErr
                     "Request in progress",        // kXR_inProgress
                     "Quota exceeded",             // kXR_overQuota
                     "Invalid signature",          // kXR_SigVerErr
-                    "Decryption failed"           // kXR_DecryptErr
+                    "Decryption failed",          // kXR_DecryptErr
+                    "Server is overloaded",       // kXR_Overloaded
+                    "Filesystem is read only",    // kXR_fsReadOnly
+                    "Invalid payload format",     // kXR_BadPayload
+                    "File attribute not found",   // kXR_AttrNotFound
+                    "Operation requires TLS",     // kXR_TLSRequired
+                    "No new servers for replica", // kXR_noReplicas
+                    "Authentication failed",      // kXR_AuthFailed
+                    "Request is not possible",    // kXR_Impossible
+                    "Conflicting request",        // kXR_Conflict
+                    "Too many errors",            // kXR_TooManyErrs
+                    "Request timed out",          // kXR_ReqTimedOut
+                    "Timer expired"               // kXR_TimerExipred
                    };
 
 const char *reqNames[kXR_REQFENCE-kXR_auth] =
              {"auth",        "query",       "chmod",       "close",
-              "dirlist",     "getfile",     "protocol",    "login",
+              "dirlist",     "gpfile",      "protocol",    "login",
               "mkdir",       "mv",          "open",        "ping",
-              "putfile",     "read",        "rm",          "rmdir",
+              "chkpoint",    "read",        "rm",          "rmdir",
               "sync",        "stat",        "set",         "write",
-              "admin",       "prepare",     "statx",       "endsess",
-              "bind",        "readv",       "verifyw",     "locate",
-              "truncate",    "sigver",      "decrypt",     "writev"
+              "fattr",       "prepare",     "statx",       "endsess",
+              "bind",        "readv",       "pgwrite",     "locate",
+              "truncate",    "sigver",      "pgread",      "writev"
              };
 
 // Following value is used to determine if the error or request code is
@@ -130,7 +147,7 @@ const char *XProtocol::errName(kXR_int32 errCode)
 /******************************************************************************/
 /*                               r e q N a m e                                */
 /******************************************************************************/
-  
+
 const char *XProtocol::reqName(kXR_unt16 reqCode)
 {
 // Mangle request code if the byte orderdoesn't match our host order
@@ -144,4 +161,81 @@ const char *XProtocol::reqName(kXR_unt16 reqCode)
 // Return the proper table
 //
    return reqNames[reqCode - kXR_auth];
+}
+
+/******************************************************************************/
+/*                  n v e c & v v e c  o p e r a t i n s                      */
+/******************************************************************************/
+
+// Add an attribute name to nvec (the buffer has to be sufficiently big)
+//
+char* ClientFattrRequest::NVecInsert( const char *name,  char *buffer )
+{
+  // set rc to 0
+  memset( buffer, 0, sizeof( kXR_unt16 ) );
+  buffer += sizeof( kXR_unt16 );
+  // copy attribute name including trailing null
+  size_t len = strlen( name );
+  memcpy( buffer, name, len + 1 );
+  buffer += len + 1;
+
+  // return memory that comes right after newly inserted nvec record
+  return buffer;
+}
+
+// Add an attribute name to vvec (the buffer has to be sufficiently big)
+//
+char* ClientFattrRequest::VVecInsert( const char *value, char *buffer )
+{
+  // copy value size
+  kXR_int32 len    = strlen( value );
+  kXR_int32 lendat = htonl( len );
+  memcpy( buffer, &lendat, sizeof( kXR_int32 ) );
+  buffer += sizeof( kXR_int32 );
+  // copy value itself
+  memcpy( buffer, value, len );
+  buffer += len;
+
+  // return memory that comes right after newly inserted vvec entry
+  return buffer;
+}
+
+// Read error code from nvec
+//
+char* ClientFattrRequest::NVecRead( char* buffer, kXR_unt16 &rc )
+ {
+   memcpy(&rc, buffer, sizeof(kXR_unt16));
+   rc = htons( rc );
+   buffer += sizeof( kXR_unt16 );
+   return buffer;
+ }
+
+// Read attribute name from nvec
+//
+char* ClientFattrRequest::NVecRead( char* buffer, char *&name )
+{
+  name = strdup( buffer );
+  buffer += strlen( name ) + 1;
+  return buffer;
+}
+
+// Read value length from vvec
+//
+char* ClientFattrRequest::VVecRead( char* buffer, kXR_int32 &len )
+{
+  memcpy(&len, buffer, sizeof(kXR_int32));
+  len = htonl( len );
+  buffer += sizeof( kXR_int32 );
+  return buffer;
+}
+
+// Read attribute value from vvec
+//
+char* ClientFattrRequest::VVecRead( char* buffer, kXR_int32 len, char *&value )
+{
+  value = reinterpret_cast<char*>( malloc( len + 1 ) );
+  strncpy( value, buffer, len );
+  value[len] = 0;
+  buffer += len;
+  return buffer;
 }

@@ -30,7 +30,7 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <stdlib.h>
+#include <cstdlib>
 
 #include "Xrd/XrdJob.hh"
 #include "XrdCms/XrdCmsPList.hh"
@@ -39,11 +39,13 @@
 #include "XrdOuc/XrdOucTList.hh"
   
 class XrdInet;
+class XrdProtocol_Config;
 class XrdScheduler;
 class XrdNetSecurity;
 class XrdNetSocket;
 class XrdOss;
 class XrdSysError;
+class XrdOucEnv;
 class XrdOucName2Name;
 class XrdOucProg;
 class XrdOucStream;
@@ -55,6 +57,7 @@ class XrdCmsConfig : public XrdJob
 {
 public:
 
+int   Configure0(XrdProtocol_Config *pi);
 int   Configure1(int argc, char **argv, char *cfn);
 int   Configure2();
 int   ConfigXeq(char *var, XrdOucStream &CFile, XrdSysError *eDest);
@@ -117,13 +120,19 @@ short       DiskHWMP;     // Minimum MB needed of space to requalify   as %
 int         DiskLinger;   // Manager Only
 int         DiskAsk;      // Seconds between disk space reclaculations
 int         DiskWT;       // Seconds to defer client while waiting for space
-int         DiskSS;       // This is a staging server
-int         DiskOK;       // This configuration has data
+bool        DiskSS;       // This is a staging server
+bool        DiskOK;       // This configuration has data
+
+bool        forceRO;      // Manager will force incoming paths to be r/o
+
+char        rsvd[3];
 
 char        sched_RR;     // 1 -> Simply do round robin scheduling
-char        sched_Pack;   // 1 -> Pick oldest node (>1 same but wait for resps)
+char        sched_Pack;   // 1 -> Pick with affinity (>1 same but wait for resps)
+char        sched_AffPC;  // Affinity path component count (-255 <= n <= 255)
 char        sched_Level;  // 1 -> Use load-based level for "pack" selection
 char        sched_Force;  // 1 -> Client cannot select mode
+char        sched_LoadR;  // 1 -> Use randomized load-based weighting for selection
 int         doWait;       // 1 -> Wait for a data end-point
 
 int         adsPort;      // Alternate server port
@@ -142,8 +151,11 @@ XrdVersionInfo  *myVInfo; // xrootd version used in compilation
 XrdOucName2Name *xeq_N2N; // Server or Manager (non-null if library loaded)
 XrdOucName2Name *lcl_N2N; // Server Only
 
+char        *ConfigFN;
 char        *ossLib;      // -> oss library
 char        *ossParms;    // -> oss library parameters
+char        *prfLib;      // ->perf library
+char        *prfParms;    // ->perf library parameters
 char        *VNID_Lib;    // Server Only
 char        *VNID_Parms;  // Server Only
 char        *N2N_Lib;     // Server Only
@@ -204,8 +216,8 @@ int  ConfigN2N(void);
 int  ConfigOSS(void);
 int  ConfigProc(int getrole=0);
 int  isExec(XrdSysError *eDest, const char *ptype, char *prog);
+int  Manifest();
 int  MergeP(void);
-int  PidFile(void);
 int  setupManager(void);
 int  setupServer(void);
 char *setupSid();
@@ -224,11 +236,9 @@ int  xfsxq(XrdSysError *edest, XrdOucStream &CFile);
 int  xfxhld(XrdSysError *edest, XrdOucStream &CFile);
 int  xlclrt(XrdSysError *edest, XrdOucStream &CFile);
 int  xmang(XrdSysError *edest, XrdOucStream &CFile);
+int  xmode(XrdSysError *edest, XrdOucStream &CFile);
 int  xnbsq(XrdSysError *edest, XrdOucStream &CFile);
-int  xnml(XrdSysError *edest, XrdOucStream &CFile);
-int  xolib(XrdSysError *edest, XrdOucStream &CFile);
 int  xperf(XrdSysError *edest, XrdOucStream &CFile);
-int  xpidf(XrdSysError *edest, XrdOucStream &CFile);
 int  xping(XrdSysError *edest, XrdOucStream &CFile);
 int  xprep(XrdSysError *edest, XrdOucStream &CFile);
 int  xprepm(XrdSysError *edest, XrdOucStream &CFile);
@@ -237,6 +247,7 @@ int  xrmtrt(XrdSysError *edest, XrdOucStream &CFile);
 int  xrole(XrdSysError *edest, XrdOucStream &CFile);
 int  xsched(XrdSysError *edest, XrdOucStream &CFile);
 int  xschedm(char *val, XrdSysError *eDest, XrdOucStream &CFile);
+int  xschedp(char *val, XrdSysError *eDest, XrdOucStream &CFile);
 int  xschedx(char *val, XrdSysError *eDest, XrdOucStream &CFile);
 bool xschedy(char *val, XrdSysError *eDest, char *&host, int &hlen, int &port);
 int  xsecl(XrdSysError *edest, XrdOucStream &CFile);
@@ -247,10 +258,9 @@ int  xtrace(XrdSysError *edest, XrdOucStream &CFile);
 int  xvnid(XrdSysError *edest, XrdOucStream &CFile);
 
 XrdInet          *NetTCPr;     // Network for supervisors
+XrdOucEnv        *xrdEnv;
 char             *AdminPath;
 int               AdminMode;
-char             *pidPath;
-char             *ConfigFN;
 char            **inArgv;
 int               inArgc;
 char             *SecLib;

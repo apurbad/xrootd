@@ -30,12 +30,13 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <inttypes.h>
-#include <stdlib.h>
-#include <time.h>
+#include <cinttypes>
+#include <cstdlib>
+#include <ctime>
 #include <netinet/in.h>
 #include <sys/types.h>
 
+#include "XrdSec/XrdSecMonitor.hh"
 #include "XrdSys/XrdSysPthread.hh"
 #include "XrdXrootd/XrdXrootdMonData.hh"
 #include "XProtocol/XPtypes.hh"
@@ -44,16 +45,23 @@
 /*                            X r d M o n i t o r                             */
 /******************************************************************************/
 
-#define XROOTD_MON_ALL      1
-#define XROOTD_MON_FILE     2
-#define XROOTD_MON_IO       4
-#define XROOTD_MON_INFO     8
-#define XROOTD_MON_USER    16
-#define XROOTD_MON_AUTH    32
+#define XROOTD_MON_ALL   0x00000001
+#define XROOTD_MON_FILE  0x00000002
+#define XROOTD_MON_IO    0x00000004
+#define XROOTD_MON_INFO  0x00000008
+#define XROOTD_MON_USER  0x00000010
+#define XROOTD_MON_AUTH  0x00000020
 #define XROOTD_MON_PATH    (XROOTD_MON_IO   | XROOTD_MON_FILE)
-#define XROOTD_MON_REDR    64
-#define XROOTD_MON_IOV    128
-#define XROOTD_MON_FSTA   256
+#define XROOTD_MON_REDR  0x00000040
+#define XROOTD_MON_IOV   0x00000080
+#define XROOTD_MON_FSTA  0x00000100
+#define XROOTD_MON_CCM   0x00000200
+#define XROOTD_MON_PFC   0x00000400
+#define XROOTD_MON_TCPMO 0x00000800
+#define XROOTD_MON_TPC   0x00001000
+#define XROOTD_MON_THROT 0x00002000
+#define XROOTD_MON_OSS   0x00004000
+#define XROOTD_MON_GSTRM (XROOTD_MON_CCM | XROOTD_MON_PFC | XROOTD_MON_TCPMO | XROOTD_MON_THROT | XROOTD_MON_OSS)
 
 #define XROOTD_MON_FSLFN    1
 #define XROOTD_MON_FSOPS    2
@@ -111,13 +119,22 @@ inline void              Add_wr(kXR_unt32 dictid,
 static void              Defaults(char *dest1, int m1, char *dest2, int m2);
 static void              Defaults(int msz,     int rsz,     int wsz,
                                   int flush,   int flash,   int iDent, int rnm,
-                                  int fsint=0, int fsopt=0, int fsion=0);
+                                  int fbsz, int fsint=0, int fsopt=0, int fsion=0);
+
+static int               Flushing() {return autoFlush;}
+
+static kXR_unt32         GetDictID(bool hbo=false);
 
 static void              Ident() {Send(-1, idRec, idLen);}
 
-static int               Init(XrdScheduler *sp,    XrdSysError *errp,
+static void              Init(XrdScheduler *sp,    XrdSysError *errp,
                               const char   *iHost, const char  *iProg,
                               const char   *iName, int Port);
+
+static int               Init();
+
+static bool              ModeEnabled(int mode)
+                                    {return ((monMode1|monMode2) & mode) != 0;}
 
        void              Open(kXR_unt32 dictid, off_t fsize);
 
@@ -126,9 +143,34 @@ static int               Redirect() {return monREDR;}
 static int               Redirect(kXR_unt32  mID, const char *hName, int Port,
                                   const char opC, const char *Path);
 
+static int               Send(int mmode, void *buff, int size, bool setseq=true);
+
 static time_t            Tick();
 
-class  User
+/******************************************************************************/
+
+class   Hello
+{
+public:
+
+static  bool       Hail();
+
+virtual void       Ident() {};
+
+                   Hello(const char *dest, char mode);
+
+virtual           ~Hello() {if (theDest) free(theDest);}
+
+private:
+static  Hello     *First;
+        Hello     *Next;
+        char      *theDest;
+        char       theMode;
+};
+
+/******************************************************************************/
+
+class  User : public XrdSecMonitor
 {
 public:
 
@@ -171,16 +213,22 @@ inline kXR_unt32   MapPath(const char *Path)
                           }
 
        void        Register(const char *Uname, const char *Hname,
-                            const char *Pname);
+                            const char *Pname, unsigned int xSID=0);
 
        void        Report(const char *Info)
                          {Did=XrdXrootdMonitor::Map(XROOTD_MON_MAPUSER,*this,Info);}
+
+       void        Report(int eCode, int aCode);
+
+       bool        Report(WhatInfo infoT, const char *info) override;
 
 inline int         Ready()  {return XrdXrootdMonitor::monACTIVE;}
 
        User() : Agent(0), Did(0), Iops(0), Fops(0), Len(0), Name(0) {}
       ~User() {Clear();}
 };
+
+/******************************************************************************/
 
 static XrdXrootdMonitor *altMon;
 
@@ -218,16 +266,12 @@ static void              fillHeader(XrdXrootdMonHeader *hdr,
 static MonRdrBuff       *Fetch();
        void              Flush();
 static void              Flush(MonRdrBuff *mP);
-static kXR_unt32         GetDictID();
 static kXR_unt32         Map(char  code, XrdXrootdMonitor::User &uInfo,
                              const char *path);
        void              Mark();
-static int               Send(int mmode, void *buff, int size);
 static void              startClock();
 static void              unAlloc(XrdXrootdMonitor *monp);
 
-static XrdScheduler      *Sched;
-static XrdSysError       *eDest;
 static XrdSysMutex        windowMutex;
 static char              *idRec;
 static int                idLen;
@@ -245,7 +289,6 @@ static int                lastRnt;
 static int                autoFlash;
 static int                autoFlush;
 static int                FlushTime;
-static kXR_int32          startTime;
        kXR_int32          lastWindow;
 static kXR_int32          currWindow;
 static int                rdrTOD;
@@ -256,8 +299,6 @@ static int                isEnabled;
 static int                numMonitor;
 static int                monIdent;
 static int                monRlen;
-static char               sidName[16];
-static short              sidSize;
 static char               monIO;
 static char               monINFO;
 static char               monFILE;

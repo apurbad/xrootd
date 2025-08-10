@@ -37,10 +37,10 @@
    struct XrdVersionPlugin
          {const char *pName;    //!< -> plugin object creator function name
           char        vPfxLen;  //!< Generic rule prefix length
-          char        vSfxLen;  //!< Generic rule suffix length for preceeding
+          char        vSfxLen;  //!< Generic rule suffix length for preceding
           int         vProcess; //!< version: <0 skip, =0 optional, >0 required
           short       vMajLow;  //!< Lowest compatible major version number
-          short       vMinLow;  //!< Lowest compatible minor (>99 don't check).
+          short       vMinLow;  //!< Lowest compatible minor (< 0 don't check).
          };
 
 /* The rules are defined here because they apply to every class that uses a
@@ -74,9 +74,8 @@
              >=  0: is the lowest valid major version number allowed.
 
    minorVer: The required minor version number, It is check as follows:
-             <   0: minor version numbers must be identical.
+             <   0: Do not check the minor version number, it's immaterial.
              >=  0: the lowest valid minor version for the major number allowed.
-             >  99: Do not check the minor version number, it's immaterial.
 
    piSymbol: The plugin's object creator's unquoted function name. When this
              symbol is looked-up, the defined version rule is applied.
@@ -86,50 +85,60 @@
          Unreleased versions can use any version. However, a message is issued.
 */
 #define XrdVERSIONPLUGINRULES \
-        XrdVERSIONPLUGIN_Rule(Required,  4,  0, XrdAccAuthorizeObject         )\
-        XrdVERSIONPLUGIN_Rule(Optional,  4,  0, XrdBwmPolicyObject            )\
-        XrdVERSIONPLUGIN_Rule(Required,  4,  0, XrdCksCalcInit                )\
-        XrdVERSIONPLUGIN_Rule(Required,  4,  0, XrdCksInit                    )\
-        XrdVERSIONPLUGIN_Rule(Required,  4,  0, XrdCmsGetClient               )\
-        XrdVERSIONPLUGIN_Rule(Required,  4,  0, XrdCmsgetVnId                 )\
-        XrdVERSIONPLUGIN_Rule(Required,  4,  0, XrdCryptosslFactoryObject     )\
-        XrdVERSIONPLUGIN_Rule(Optional,  4,  0, XrdFileCacheGetDecision       )\
-        XrdVERSIONPLUGIN_Rule(DoNotChk,  4,  0, XrdgetProtocol                )\
-        XrdVERSIONPLUGIN_Rule(Required,  4,  0, XrdgetProtocolPort            )\
+        XrdVERSIONPLUGIN_Rule(Required,  5,  0, SecEntityPin                  )\
+        XrdVERSIONPLUGIN_Rule(Required,  4,  8, TcpMonPin                     )\
+        XrdVERSIONPLUGIN_Rule(Required,  5,  0, XrdAccAuthorizeObject         )\
+        XrdVERSIONPLUGIN_Rule(Required,  5,  0, XrdAccAuthorizeObjAdd         )\
+        XrdVERSIONPLUGIN_Rule(Optional,  5,  0, XrdBwmPolicyObject            )\
+        XrdVERSIONPLUGIN_Rule(Required,  5,  0, XrdCksAdd2                    )\
+        XrdVERSIONPLUGIN_Rule(Required,  5,  0, XrdCksCalcInit                )\
+        XrdVERSIONPLUGIN_Rule(Required,  5,  0, XrdCksInit                    )\
+        XrdVERSIONPLUGIN_Rule(Required,  5,  0, XrdCmsGetClient               )\
+        XrdVERSIONPLUGIN_Rule(Required,  5,  0, XrdCmsgetVnId                 )\
+        XrdVERSIONPLUGIN_Rule(Required,  5,  0, XrdCmsPerfMonitor             )\
+        XrdVERSIONPLUGIN_Rule(Required,  5,  0, XrdCryptosslFactoryObject     )\
+        XrdVERSIONPLUGIN_Rule(Optional,  5,  0, XrdPfcGetDecision       )\
+        XrdVERSIONPLUGIN_Rule(DoNotChk,  5,  0, XrdgetProtocol                )\
+        XrdVERSIONPLUGIN_Rule(Required,  5,  0, XrdgetProtocolPort            )\
         XrdVERSIONPLUGIN_Rule(Required,  4,  0, XrdHttpGetSecXtractor         )\
         XrdVERSIONPLUGIN_Rule(Required,  4,  8, XrdHttpGetExtHandler          )\
-        XrdVERSIONPLUGIN_Rule(Required,  4,  0, XrdSysLogPInit                )\
-        XrdVERSIONPLUGIN_Rule(Required,  4,  0, XrdOssGetStorageSystem        )\
-        XrdVERSIONPLUGIN_Rule(Required,  4,  0, XrdOssStatInfoInit            )\
-        XrdVERSIONPLUGIN_Rule(Required,  4,  0, XrdOssStatInfoInit2           )\
-        XrdVERSIONPLUGIN_Rule(Required,  4,  0, XrdOucGetCache                )\
-        XrdVERSIONPLUGIN_Rule(Required,  4,  0, XrdOucGetCache2               )\
-        XrdVERSIONPLUGIN_Rule(Required,  4,  0, XrdOucCacheCMInit             )\
-        XrdVERSIONPLUGIN_Rule(Optional,  4,  0, XrdOucgetName2Name            )\
-        XrdVERSIONPLUGIN_Rule(Required,  4,  0, XrdSecGetProtocol             )\
-        XrdVERSIONPLUGIN_Rule(Required,  4,  0, XrdSecgetService              )\
-        XrdVERSIONPLUGIN_Rule(Optional,  4,  0, XrdSecgsiAuthzFun             )\
-        XrdVERSIONPLUGIN_Rule(DoNotChk,  4,  0, XrdSecgsiAuthzInit            )\
-        XrdVERSIONPLUGIN_Rule(DoNotChk,  4,  0, XrdSecgsiAuthzKey             )\
-        XrdVERSIONPLUGIN_Rule(Optional,  4,  0, XrdSecgsiGMAPFun              )\
-        XrdVERSIONPLUGIN_Rule(Optional,  4,  0, XrdSecgsiVOMSFun              )\
-        XrdVERSIONPLUGIN_Rule(DoNotChk,  4,  0, XrdSecgsiVOMSInit             )\
-        XrdVERSIONPLUGIN_Rule(DoNotChk,  4,  0, XrdSecProtocolgsiInit         )\
-        XrdVERSIONPLUGIN_Rule(Required,  4,  0, XrdSecProtocolgsiObject       )\
-        XrdVERSIONPLUGIN_Rule(DoNotChk,  4,  0, XrdSecProtocolkrb5Init        )\
-        XrdVERSIONPLUGIN_Rule(Required,  4,  0, XrdSecProtocolkrb5Object      )\
-        XrdVERSIONPLUGIN_Rule(DoNotChk,  4,  0, XrdSecProtocolpwdInit         )\
-        XrdVERSIONPLUGIN_Rule(Required,  4,  0, XrdSecProtocolpwdObject       )\
-        XrdVERSIONPLUGIN_Rule(DoNotChk,  4,  0, XrdSecProtocolsssInit         )\
-        XrdVERSIONPLUGIN_Rule(Required,  4,  0, XrdSecProtocolsssObject       )\
-        XrdVERSIONPLUGIN_Rule(DoNotChk,  4,  0, XrdSecProtocolunixInit        )\
-        XrdVERSIONPLUGIN_Rule(Required,  4,  0, XrdSecProtocolunixObject      )\
-        XrdVERSIONPLUGIN_Rule(Required,  4,  0, XrdSfsGetFileSystem           )\
-        XrdVERSIONPLUGIN_Rule(Required,  4,  0, XrdSfsGetFileSystem2          )\
-        XrdVERSIONPLUGIN_Rule(Required,  4,  0, XrdSysGetXAttrObject          )\
-        XrdVERSIONPLUGIN_Rule(Required,  4,  0, XrdSysLogPInit                )\
-        XrdVERSIONPLUGIN_Rule(Required,  4,  0, XrdClGetMonitor               )\
-        XrdVERSIONPLUGIN_Rule(Required,  4,  0, XrdClGetPlugIn                )\
+        XrdVERSIONPLUGIN_Rule(Required,  5,  0, XrdSysLogPInit                )\
+        XrdVERSIONPLUGIN_Rule(Required,  5,  0, XrdOfsAddPrepare              )\
+        XrdVERSIONPLUGIN_Rule(Required,  5,  0, XrdOfsFSctl                   )\
+        XrdVERSIONPLUGIN_Rule(Required,  5,  0, XrdOfsgetPrepare              )\
+        XrdVERSIONPLUGIN_Rule(Required,  5,  0, XrdOssGetStorageSystem        )\
+        XrdVERSIONPLUGIN_Rule(Required,  5,  0, XrdOssAddStorageSystem2       )\
+        XrdVERSIONPLUGIN_Rule(Required,  5,  0, XrdOssGetStorageSystem2       )\
+        XrdVERSIONPLUGIN_Rule(Required,  5,  0, XrdOssStatInfoInit            )\
+        XrdVERSIONPLUGIN_Rule(Required,  5,  0, XrdOssStatInfoInit2           )\
+        XrdVERSIONPLUGIN_Rule(Required,  5,  0, XrdOucGetCache                )\
+        XrdVERSIONPLUGIN_Rule(Required,  5,  0, XrdOucGetCache2               )\
+        XrdVERSIONPLUGIN_Rule(Required,  5,  0, XrdOucCacheCMInit             )\
+        XrdVERSIONPLUGIN_Rule(Optional,  5,  0, XrdOucgetName2Name            )\
+        XrdVERSIONPLUGIN_Rule(Required,  5,  0, XrdSecGetProtocol             )\
+        XrdVERSIONPLUGIN_Rule(Required,  5,  0, XrdSecgetService              )\
+        XrdVERSIONPLUGIN_Rule(Optional,  5,  0, XrdSecgsiAuthzFun             )\
+        XrdVERSIONPLUGIN_Rule(DoNotChk,  5,  0, XrdSecgsiAuthzInit            )\
+        XrdVERSIONPLUGIN_Rule(DoNotChk,  5,  0, XrdSecgsiAuthzKey             )\
+        XrdVERSIONPLUGIN_Rule(Optional,  5,  0, XrdSecgsiGMAPFun              )\
+        XrdVERSIONPLUGIN_Rule(Optional,  5,  0, XrdSecgsiVOMSFun              )\
+        XrdVERSIONPLUGIN_Rule(DoNotChk,  5,  0, XrdSecgsiVOMSInit             )\
+        XrdVERSIONPLUGIN_Rule(DoNotChk,  5,  0, XrdSecProtocolgsiInit         )\
+        XrdVERSIONPLUGIN_Rule(Required,  5,  0, XrdSecProtocolgsiObject       )\
+        XrdVERSIONPLUGIN_Rule(DoNotChk,  5,  0, XrdSecProtocolkrb5Init        )\
+        XrdVERSIONPLUGIN_Rule(Required,  5,  0, XrdSecProtocolkrb5Object      )\
+        XrdVERSIONPLUGIN_Rule(DoNotChk,  5,  0, XrdSecProtocolpwdInit         )\
+        XrdVERSIONPLUGIN_Rule(Required,  5,  0, XrdSecProtocolpwdObject       )\
+        XrdVERSIONPLUGIN_Rule(DoNotChk,  5,  0, XrdSecProtocolsssInit         )\
+        XrdVERSIONPLUGIN_Rule(Required,  5,  0, XrdSecProtocolsssObject       )\
+        XrdVERSIONPLUGIN_Rule(DoNotChk,  5,  0, XrdSecProtocolunixInit        )\
+        XrdVERSIONPLUGIN_Rule(Required,  5,  0, XrdSecProtocolunixObject      )\
+        XrdVERSIONPLUGIN_Rule(Required,  5,  0, XrdSfsGetFileSystem           )\
+        XrdVERSIONPLUGIN_Rule(Required,  5,  0, XrdSfsGetFileSystem2          )\
+        XrdVERSIONPLUGIN_Rule(Required,  5,  0, XrdSysAddXAttrObject          )\
+        XrdVERSIONPLUGIN_Rule(Required,  5,  0, XrdSysGetXAttrObject          )\
+        XrdVERSIONPLUGIN_Rule(Required,  5,  0, XrdClGetMonitor               )\
+        XrdVERSIONPLUGIN_Rule(Required,  5,  0, XrdClGetPlugIn                )\
                              { 0, 0, 0,  0,  0, 0}
 
 #define XrdVERSIONPLUGIN_Maxim(procMode, majorVer, minorVer, piPfx, piSfx)\
@@ -165,21 +174,81 @@
    to an unversioned name is not allowed). This is enforced by XrdOucVerName.
 */
 #define XrdVERSIONPLUGINSTRICT       \
-        {"libXrdBwm.so",             \
+        {"libXrdAccSciTokens.so",    \
+         "libXrdBlacklistDecision.so", \
+         "libXrdBwm.so",             \
          "libXrdCksCalczcrc32.so",   \
+         "libXrdClProxyPlugin.so",   \
+         "libXrdCmsRedirectLocal.so", \
          "libXrdCryptossl.so",       \
-         "libXrdFileCache.so",       \
          "libXrdHttp.so",            \
+         "libXrdHttpTPC.so",         \
+         "libXrdMacaroons.so",       \
+         "libXrdN2No2p.so",          \
          "libXrdOssSIgpfsT.so",      \
+         "libXrdPfc.so",             \
          "libXrdPss.so",             \
          "libXrdSec.so",             \
          "libXrdSecgsi.so",          \
          "libXrdSecgsiAUTHZVO.so",   \
-         "libXrdSecgsiGMAPDLAP.so",  \
+         "libXrdSecgsiGMAPDN.so",    \
+         "libXrdSecgsiVOMS.so",      \
          "libXrdSeckrb5.so",         \
+         "libXrdSecProt.so",         \
          "libXrdSecpwd.so",          \
          "libXrdSecsss.so",          \
          "libXrdSecunix.so",         \
+         "libXrdSsi.so",             \
+         "libXrdSsiLog.so",          \
+         "libXrdThrottle.so",        \
+         "libXrdVoms.so",            \
          "libXrdXrootd.so",          \
          0}
+
+// The XrdVersionMapD2P maps a directive to the associated plugin creator.
+// When two or more such creators exist, the newest one should be used.
+//
+   struct XrdVersionMapD2P
+         {const char *dName;    //!< -> plugin directive name
+          const char *pName;    //!< -> plugin object creator function name
+         };
+
+#define XrdVERSIONPLUGIN_Mapd(drctv, piSymbol)\
+           {#drctv, #piSymbol},
+
+#define XrdVERSIONPLUGINMAPD2P\
+        XrdVERSIONPLUGIN_Mapd(ofs.authlib,      XrdAccAuthorizeObject         )\
+        XrdVERSIONPLUGIN_Mapd(bwm.policy,       XrdBwmPolicyObject            )\
+        XrdVERSIONPLUGIN_Mapd(ofs.ckslib,       XrdCksInit                    )\
+        XrdVERSIONPLUGIN_Mapd(ofs.cmslib,       XrdCmsGetClient               )\
+        XrdVERSIONPLUGIN_Mapd(cms.vnid,         XrdCmsgetVnId                 )\
+        XrdVERSIONPLUGIN_Mapd(cms.perf,         XrdCmsPerfMonitor             )\
+        XrdVERSIONPLUGIN_Mapd(pfc.decisionlib,  XrdPfcGetDecision             )\
+        XrdVERSIONPLUGIN_Mapd(pfc.purgelib,     XrdPfcGetPurgePin             )\
+        XrdVERSIONPLUGIN_Mapd(xrd.protocol,     XrdgetProtocol                )\
+        XrdVERSIONPLUGIN_Mapd(http.secxtractor, XrdHttpGetSecXtractor         )\
+        XrdVERSIONPLUGIN_Mapd(http.exthandler,  XrdHttpGetExtHandler          )\
+        XrdVERSIONPLUGIN_Mapd(@logging,         XrdSysLogPInit                )\
+        XrdVERSIONPLUGIN_Mapd(ofs.ctllib,       XrdOfsFSctl                   )\
+        XrdVERSIONPLUGIN_Mapd(ofs.preplib,      XrdOfsgetPrepare              )\
+        XrdVERSIONPLUGIN_Mapd(ofs.osslib,       XrdOssGetStorageSystem2       )\
+        XrdVERSIONPLUGIN_Mapd(oss.statlib,      XrdOssStatInfoInit2           )\
+        XrdVERSIONPLUGIN_Mapd(pss.cachelib,     XrdOucGetCache2               )\
+        XrdVERSIONPLUGIN_Mapd(pss.ccmlib,       XrdOucCacheCMInit             )\
+        XrdVERSIONPLUGIN_Mapd(oss.namelib,      XrdOucgetName2Name            )\
+        XrdVERSIONPLUGIN_Mapd(sec.protocol,     XrdSecGetProtocol             )\
+        XrdVERSIONPLUGIN_Mapd(xrootd.seclib,    XrdSecgetService              )\
+        XrdVERSIONPLUGIN_Mapd(gsi-authzfun,     XrdSecgsiAuthzFun             )\
+        XrdVERSIONPLUGIN_Mapd(gsi-gmapfun,      XrdSecgsiGMAPFun              )\
+        XrdVERSIONPLUGIN_Mapd(gsi-vomsfun,      XrdSecgsiVOMSFun              )\
+        XrdVERSIONPLUGIN_Mapd(sec.protocol-gsi, XrdSecProtocolgsiObject       )\
+        XrdVERSIONPLUGIN_Mapd(sec.protocol-krb5,XrdSecProtocolkrb5Object      )\
+        XrdVERSIONPLUGIN_Mapd(sec.protocol-pwd, XrdSecProtocolpwdObject       )\
+        XrdVERSIONPLUGIN_Mapd(sec.protocol-sss, XrdSecProtocolsssObject       )\
+        XrdVERSIONPLUGIN_Mapd(sec.protocol-unix,XrdSecProtocolunixObject      )\
+        XrdVERSIONPLUGIN_Mapd(xrootd.fslib,     XrdSfsGetFileSystem2          )\
+        XrdVERSIONPLUGIN_Mapd(ofs.xattrlib,     XrdSysGetXAttrObject          )\
+        XrdVERSIONPLUGIN_Mapd(xrdcl.monitor,    XrdClGetMonitor               )\
+        XrdVERSIONPLUGIN_Mapd(xrdcl.plugin,     XrdClGetPlugIn                )\
+                             { 0, 0}
 #endif

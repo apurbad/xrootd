@@ -28,9 +28,9 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <errno.h>
-#include <stdlib.h>
-#include <time.h>
+#include <cerrno>
+#include <cstdlib>
+#include <ctime>
 #include <unistd.h>
 #include <sys/types.h>
 
@@ -72,6 +72,7 @@ char               XrdFrmMonitor::monSTAGE   = 0;
 
 void *XrdFrmMonitorID(void *parg)
 {
+   (void)parg;
    XrdFrmMonitor::Ident();
    return (void *)0;
 }
@@ -149,6 +150,12 @@ int XrdFrmMonitor::Init(const char *iHost, const char *iProg, const char *iName)
 //
    if (!isEnabled) return 1;
 
+// Ignore array bounds warning from gcc 12 triggered because the allocated
+// memory for the XrdXrootdMonMap is smaller than sizeof(XrdXrootdMonMap)
+#if defined(__GNUC__) && __GNUC__ >= 12
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Warray-bounds"
+#endif
 // Create identification record
 //
    idLen = strlen(iBuff) + sizeof(XrdXrootdMonHeader) + sizeof(kXR_int32);
@@ -158,6 +165,9 @@ int XrdFrmMonitor::Init(const char *iHost, const char *iProg, const char *iName)
    mP->hdr.pseq = 0;
    mP->dictid   = 0;
    strcpy(mP->info, iBuff);
+#if defined(__GNUC__) && __GNUC__ >= 12
+#pragma GCC diagnostic pop
+#endif
 
 // Setup the primary destination
 //
@@ -237,7 +247,7 @@ kXR_unt32 XrdFrmMonitor::Map(char code, const char *uname, const char *path)
 //
    size = sizeof(XrdXrootdMonHeader)+sizeof(kXR_int32)+size;
    fillHeader(&map.hdr, code, size);
-// cerr <<"Mon send "<<code <<": " <<map.info <<endl;
+// std::cerr <<"Mon send "<<code <<": " <<map.info <<std::endl;
    Send(montype, (void *)&map, size);
 
 // Return the dictionary id

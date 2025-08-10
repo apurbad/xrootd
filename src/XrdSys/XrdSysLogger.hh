@@ -29,13 +29,13 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <stdlib.h>
+#include <cstdlib>
 #ifndef WIN32
 #include <unistd.h>
-#include <string.h>
+#include <cstring>
 #include <strings.h>
 #else
-#include <string.h>
+#include <cstring>
 #include <io.h>
 #include "XrdSys/XrdWin32.hh"
 #endif
@@ -139,7 +139,7 @@ int Bind(const char *path, int lfh=0);
 //! Capture allows you to capture all messages (they are not routed). This is
 //! a global setting so use with caution!
 //!
-//! @param  tBase     Pointer to the XrdOucTListFIFO where messages are saved.
+//! @param  tFIFO     Pointer to the XrdOucTListFIFO where messages are saved.
 //!                   If the pointer is nil, capturing is turned off.
 //-----------------------------------------------------------------------------
 

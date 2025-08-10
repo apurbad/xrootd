@@ -50,6 +50,8 @@ SMask_t        smask;   // Out: Nodes selected
 struct iovec  *iovP;    //  In: Prepare notification I/O vector
 int            iovN;    //  In: Prepare notification I/O vector count
 int            Opts;    //  In: One or more of the following enums
+unsigned int   AltHash; //  In: Alternate hash for affinity when UseAH set
+int            Reserved;
 
 enum {Write   = 0x00010, // File will be open in write mode     (select & cache)
       NewFile = 0x00020, // File will be created may not exist  (select)
@@ -70,8 +72,10 @@ enum {Write   = 0x00010, // File will be open in write mode     (select & cache)
       Pending = 0x80000, // File being staged                   (have   & cache)
       ifWant  = 0x0000f, // XrdNetIF::ifType encoding location
 
-      Pack    = 0x00010000, // Packed selection
-      UseRef  = 0x00020000  // Selection by reference count only
+   Pack    = 0x00100000, // Packed selection
+   UseRef  = 0x00200000, // Selection by reference count only
+   isDir   = 0x00400000, // This selection is for a directory
+   UseAH   = 0x08000000  // Use alternate hash for affinity
      };
 
 struct {SMask_t wf;     // Out: Writable locations
@@ -142,7 +146,7 @@ const  char *reason;
        short nPick;
        char  needNet;
        char  needSpace;
-       bool  selPack;
+       char  selPack;
        bool  xFull;
        bool  xNoNet;
        bool  xOff;

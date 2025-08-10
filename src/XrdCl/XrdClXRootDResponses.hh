@@ -24,10 +24,16 @@
 #include "XrdCl/XrdClURL.hh"
 #include "XrdCl/XrdClAnyObject.hh"
 #include "XProtocol/XProtocol.hh"
+
 #include <string>
 #include <vector>
 #include <list>
 #include <ctime>
+#include <tuple>
+#include <memory>
+#include <functional>
+
+#include <sys/uio.h>
 
 namespace XrdCl
 {
@@ -269,6 +275,62 @@ namespace XrdCl
   };
 
   //----------------------------------------------------------------------------
+  //! Tuple indexes of name and value fields in xattr_t
+  //----------------------------------------------------------------------------
+  enum
+  {
+    xattr_name  = 0,
+    xattr_value = 1
+  };
+
+  //----------------------------------------------------------------------------
+  //! Extended attribute key - value pair
+  //----------------------------------------------------------------------------
+  typedef std::tuple<std::string, std::string> xattr_t;
+
+  //----------------------------------------------------------------------------
+  //! Extended attribute operation status
+  //----------------------------------------------------------------------------
+  struct XAttrStatus
+  {
+      friend class FileStateHandler;
+      friend class FileSystem;
+
+      XAttrStatus( const std::string &name, const XRootDStatus &status ) :
+        name( name ), status( status )
+      {
+
+      }
+
+      std::string name;
+      XRootDStatus status;
+  };
+
+  //----------------------------------------------------------------------------
+  //! Extended attributes with status
+  //----------------------------------------------------------------------------
+  struct XAttr : public XAttrStatus
+  {
+      friend class FileStateHandler;
+      friend class FileSystem;
+
+      XAttr( const std::string  &name, const XRootDStatus &status ) :
+        XAttrStatus( name, status )
+      {
+
+      }
+
+      XAttr( const std::string  &name, const std::string &value = "",
+             const XRootDStatus &status = XRootDStatus() ) :
+        XAttrStatus( name, status ), value( value )
+      {
+
+      }
+
+      std::string value;
+  };
+
+  //----------------------------------------------------------------------------
   //! Binary buffer
   //----------------------------------------------------------------------------
   typedef Buffer BinaryDataInfo;
@@ -286,6 +348,7 @@ namespace XrdCl
       {
         IsManager = kXR_isManager,   //!< Manager
         IsServer  = kXR_isServer,    //!< Data server
+        AttrCache = kXR_attrCache,   //!< Cache attribute
         AttrMeta  = kXR_attrMeta,    //!< Meta attribute
         AttrProxy = kXR_attrProxy,   //!< Proxy attribute
         AttrSuper = kXR_attrSuper    //!< Supervisor attribute
@@ -327,6 +390,11 @@ namespace XrdCl
   };
 
   //----------------------------------------------------------------------------
+  //! Object stat info implementation forward declaration
+  //----------------------------------------------------------------------------
+  struct StatInfoImpl;
+
+  //----------------------------------------------------------------------------
   //! Object stat info
   //----------------------------------------------------------------------------
   class StatInfo
@@ -357,74 +425,146 @@ namespace XrdCl
       //! Constructor
       //------------------------------------------------------------------------
       StatInfo( const std::string &id, uint64_t size, uint32_t flags,
-                uint64_t modTime);
+                uint64_t modTime );
+
+      //------------------------------------------------------------------------
+      //! Copy constructor
+      //------------------------------------------------------------------------
+      StatInfo( const StatInfo &info );
+
+      //------------------------------------------------------------------------
+      //! Destructor
+      //------------------------------------------------------------------------
+      ~StatInfo();
 
       //------------------------------------------------------------------------
       //! Get id
       //------------------------------------------------------------------------
-      const std::string GetId() const
-      {
-        return pId;
-      }
+      const std::string& GetId() const;
 
       //------------------------------------------------------------------------
       //! Get size (in bytes)
       //------------------------------------------------------------------------
-      uint64_t GetSize() const
-      {
-        return pSize;
-      }
+      uint64_t GetSize() const;
+
+      //------------------------------------------------------------------------
+      //! Set size
+      //------------------------------------------------------------------------
+      void SetSize( uint64_t size );
 
       //------------------------------------------------------------------------
       //! Get flags
       //------------------------------------------------------------------------
-      uint32_t GetFlags() const
-      {
-        return pFlags;
-      }
+      uint32_t GetFlags() const;
+
+      //------------------------------------------------------------------------
+      //! Set flags
+      //------------------------------------------------------------------------
+      void SetFlags( uint32_t flags );
 
       //------------------------------------------------------------------------
       //! Test flags
       //------------------------------------------------------------------------
-      bool TestFlags( uint32_t flags ) const
-      {
-        return pFlags & flags;
-      }
+      bool TestFlags( uint32_t flags ) const;
 
       //------------------------------------------------------------------------
       //! Get modification time (in seconds since epoch)
       //------------------------------------------------------------------------
-      uint64_t GetModTime() const
-      {
-        return pModTime;
-      }
+      uint64_t GetModTime() const;
 
       //------------------------------------------------------------------------
       //! Get modification time
       //------------------------------------------------------------------------
-      std::string GetModTimeAsString() const
-      {
-        char ts[256];
-        time_t modTime = pModTime;
-        tm *t = gmtime( &modTime );
-        strftime( ts, 255, "%F %T", t );
-        return ts;
-      }
+      std::string GetModTimeAsString() const;
+
+      //------------------------------------------------------------------------
+      //! Get change time (in seconds since epoch)
+      //------------------------------------------------------------------------
+      uint64_t GetChangeTime() const;
+
+      //------------------------------------------------------------------------
+      //! Get change time
+      //------------------------------------------------------------------------
+      std::string GetChangeTimeAsString() const;
+
+      //------------------------------------------------------------------------
+      //! Get change time (in seconds since epoch)
+      //------------------------------------------------------------------------
+      uint64_t GetAccessTime() const;
+
+      //------------------------------------------------------------------------
+      //! Get change time
+      //------------------------------------------------------------------------
+      std::string GetAccessTimeAsString() const;
+
+      //------------------------------------------------------------------------
+      //! Get mode
+      //------------------------------------------------------------------------
+      const std::string& GetModeAsString() const;
+
+      //------------------------------------------------------------------------
+      //! Get mode
+      //------------------------------------------------------------------------
+      const std::string GetModeAsOctString() const;
+
+      //------------------------------------------------------------------------
+      //! Get owner
+      //------------------------------------------------------------------------
+      const std::string& GetOwner() const;
+
+      //------------------------------------------------------------------------
+      //! Get group
+      //------------------------------------------------------------------------
+      const std::string& GetGroup() const;
+
+      //------------------------------------------------------------------------
+      //! Get checksum
+      //------------------------------------------------------------------------
+      const std::string& GetChecksum() const;
 
       //------------------------------------------------------------------------
       //! Parse server response and fill up the object
       //------------------------------------------------------------------------
       bool ParseServerResponse( const char *data );
 
-    private:
+      //------------------------------------------------------------------------
+      //! Has extended stat information
+      //------------------------------------------------------------------------
+      bool ExtendedFormat() const;
 
       //------------------------------------------------------------------------
-      // Normal stat
+      //! Has checksum
       //------------------------------------------------------------------------
-      std::string pId;
-      uint64_t    pSize;
-      uint32_t    pFlags;
-      uint64_t    pModTime;
+      bool HasChecksum() const;
+
+    private:
+
+      static inline std::string TimeToString( uint64_t time )
+      {
+        char ts[256];
+        time_t modTime = time;
+        tm *t = gmtime( &modTime );
+        strftime( ts, 255, "%F %T", t );
+        return ts;
+      }
+
+      static inline void OctToString( uint8_t oct, std::string &str )
+      {
+        static const uint8_t r_mask = 0x4;
+        static const uint8_t w_mask = 0x2;
+        static const uint8_t x_mask = 0x1;
+
+        if( r_mask & oct ) str.push_back( 'r' );
+        else str.push_back( '-' );
+
+        if( w_mask & oct ) str.push_back( 'w' );
+        else str.push_back( '-' );
+
+        if( x_mask & oct ) str.push_back( 'x' );
+        else str.push_back( '-' );
+      }
+
+      std::unique_ptr<StatInfoImpl> pImpl;
   };
 
   //----------------------------------------------------------------------------
@@ -524,7 +664,7 @@ namespace XrdCl
                      const std::string &name,
                      StatInfo          *statInfo = 0):
             pHostAddress( hostAddress ),
-            pName( name ),
+            pName( SanitizeName( name ) ),
             pStatInfo( statInfo )
           {}
 
@@ -577,6 +717,15 @@ namespace XrdCl
           }
 
         private:
+
+          inline static std::string SanitizeName( const std::string &name )
+          {
+            const char *cstr = name.c_str();
+            while( *cstr == '/' ) // the C string is guaranteed to end with '\0'
+              ++cstr;
+            return cstr;
+          }
+
           std::string  pHostAddress;
           std::string  pName;
           StatInfo    *pStatInfo;
@@ -773,9 +922,132 @@ namespace XrdCl
     ChunkInfo( uint64_t off = 0, uint32_t len = 0, void *buff = 0 ):
       offset( off ), length( len ), buffer(buff) {}
 
+    //----------------------------------------------------------------------------
+    //! Get the offset
+    //----------------------------------------------------------------------------
+    inline uint64_t GetOffset() const
+    {
+      return offset;
+    }
+
+    //----------------------------------------------------------------------------
+    //! Get the data length
+    //----------------------------------------------------------------------------
+    inline uint32_t GetLength() const
+    {
+      return length;
+    }
+
+    //----------------------------------------------------------------------------
+    //! Get the buffer
+    //----------------------------------------------------------------------------
+    inline void* GetBuffer()
+    {
+      return buffer;
+    }
+
     uint64_t  offset; //! offset in the file
     uint32_t  length; //! length of the chunk
     void     *buffer; //! optional buffer pointer
+  };
+
+  struct PageInfoImpl;
+
+  struct PageInfo
+  {
+    //----------------------------------------------------------------------------
+    //! Default constructor
+    //----------------------------------------------------------------------------
+    PageInfo( uint64_t offset = 0, uint32_t length = 0, void *buffer = 0,
+              std::vector<uint32_t> &&cksums = std::vector<uint32_t>() );
+
+    //----------------------------------------------------------------------------
+    //! Move constructor
+    //----------------------------------------------------------------------------
+    PageInfo( PageInfo &&pginf );
+
+    //----------------------------------------------------------------------------
+    //! Move assigment operator
+    //----------------------------------------------------------------------------
+    PageInfo& operator=( PageInfo &&pginf );
+
+    //----------------------------------------------------------------------------
+    //! Destructor
+    //----------------------------------------------------------------------------
+    ~PageInfo();
+
+    //----------------------------------------------------------------------------
+    //! Get the offset
+    //----------------------------------------------------------------------------
+    uint64_t GetOffset() const;
+
+    //----------------------------------------------------------------------------
+    //! Get the data length
+    //----------------------------------------------------------------------------
+    uint32_t GetLength() const;
+
+    //----------------------------------------------------------------------------
+    //! Get the buffer
+    //----------------------------------------------------------------------------
+    void* GetBuffer();
+
+    //----------------------------------------------------------------------------
+    //! Get the checksums
+    //----------------------------------------------------------------------------
+    std::vector<uint32_t>& GetCksums();
+
+    //----------------------------------------------------------------------------
+    //! Get number of repaired pages
+    //----------------------------------------------------------------------------
+    size_t GetNbRepair();
+
+    //----------------------------------------------------------------------------
+    //! Set number of repaired pages
+    //----------------------------------------------------------------------------
+    void SetNbRepair( size_t nbrepair );
+
+    private:
+      //--------------------------------------------------------------------------
+      //! pointer to implementation
+      //--------------------------------------------------------------------------
+      std::unique_ptr<PageInfoImpl> pImpl;
+  };
+
+  struct RetryInfoImpl;
+
+  struct RetryInfo
+  {
+    //----------------------------------------------------------------------------
+    //! Constructor
+    //----------------------------------------------------------------------------
+    RetryInfo( std::vector<std::tuple<uint64_t, uint32_t>> && retries );
+
+    //----------------------------------------------------------------------------
+    //! Destructor
+    //----------------------------------------------------------------------------
+    ~RetryInfo();
+
+    //----------------------------------------------------------------------------
+    //! @return : true if some pages need retrying, false otherwise
+    //----------------------------------------------------------------------------
+    bool NeedRetry();
+
+    //----------------------------------------------------------------------------
+    //! @return number of pages that need to be retransmitted
+    //----------------------------------------------------------------------------
+    size_t Size();
+
+    //----------------------------------------------------------------------------
+    //! @return : offset and size of respective page that requires to be
+    //            retransmitted
+    //----------------------------------------------------------------------------
+    std::tuple<uint64_t, uint32_t> At( size_t i );
+
+    private:
+      //--------------------------------------------------------------------------
+      //! pointer to implementation
+      //--------------------------------------------------------------------------
+      std::unique_ptr<RetryInfoImpl> pImpl;
   };
 
   //----------------------------------------------------------------------------
@@ -886,6 +1158,22 @@ namespace XrdCl
       {
         (void)status; (void)response;
       }
+
+      //------------------------------------------------------------------------
+      //! Factory function for generating handler objects from lambdas
+      //!
+      //! @param func : the callback, must not throw
+      //! @return     : ResponseHandler wrapper with the user callback
+      //------------------------------------------------------------------------
+      static ResponseHandler* Wrap( std::function<void(XRootDStatus&, AnyObject&)> func );
+
+      //------------------------------------------------------------------------
+      //! Factory function for generating handler objects from lambdas
+      //!
+      //! @param func : the callback, must not throw
+      //! @return     : ResponseHandler wrapper with the user callback
+      //------------------------------------------------------------------------
+      static ResponseHandler* Wrap( std::function<void(XRootDStatus*, AnyObject*)> func );
   };
 }
 

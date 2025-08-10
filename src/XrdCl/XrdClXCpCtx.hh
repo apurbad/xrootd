@@ -29,7 +29,7 @@
 #include "XrdCl/XrdClXRootDResponses.hh"
 #include "XrdSys/XrdSysPthread.hh"
 
-#include <stdint.h>
+#include <cstdint>
 #include <iostream>
 
 namespace XrdCl
@@ -104,10 +104,10 @@ class XCpCtx
      *
      * @param chunk : the chunk
      */
-    void PutChunk( ChunkInfo* chunk );
+    void PutChunk( PageInfo* chunk );
 
     /**
-     * Get next block that has to be transfered
+     * Get next block that has to be transferred
      *
      * @return : pair of offset and block size
      */
@@ -147,9 +147,9 @@ class XCpCtx
      * Gets the next chunk from the sink, if the sink is empty blocks.
      *
      * @param ci : the chunk retrieved from sink (output parameter)
-     * @retrun   : stError if we failed to transfer the file,
+     * @return   : stError if we failed to transfer the file,
      *             stOK otherwise, with one of the following codes:
-     *             - suDone     : the whole file has been transfered,
+     *             - suDone     : the whole file has been transferred,
      *                            we are done
      *             - suContinue : a chunk has been written into ci,
      *                            continue calling GetChunk in order
@@ -157,7 +157,7 @@ class XCpCtx
      *             - suRetry    : a chunk has not been written into ci,
      *                            try again.
      */
-    XRootDStatus GetChunk( XrdCl::ChunkInfo &ci );
+    XRootDStatus GetChunk( XrdCl::PageInfo &ci );
 
     /**
      * Remove given source
@@ -180,11 +180,11 @@ class XCpCtx
     void NotifyIdleSrc();
 
     /**
-     * Returns true if all chunks have been transfered,
+     * Returns true if all chunks have been transferred,
      * otherwise blocks until NotifyIdleSrc is called,
      * or a 1 minute timeout occurs.
      *
-     * @return : true is all chunks have been transfered,
+     * @return : true is all chunks have been transferred,
      *           false otherwise.
      */
     bool AllDone();
@@ -270,7 +270,7 @@ class XCpCtx
      * A queue shared between all the sources (producers),
      * and the extreme copy context (consumer).
      */
-    SyncQueue<ChunkInfo*>      pSink;
+    SyncQueue<PageInfo*>       pSink;
 
     /**
      * Total amount of data received

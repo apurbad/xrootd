@@ -31,6 +31,7 @@
 /* Modified by Frank Winklmeier to add the full Posix file system definition. */
 /******************************************************************************/
 
+#include <string>
 #include <dirent.h>
 #include <unistd.h>
 #include <sys/stat.h>
@@ -49,16 +50,11 @@
 
 struct XrdOucIOVec;
 
-class XrdScheduler;
-class XrdOucCache;
-class XrdOucCache2;
-class XrdOucEnv;
-class XrdOucName2Name;
-class XrdSysLogger;
 class XrdPosixCallBack;
 class XrdPosixCallBackIO;
 class XrdPosixFile;
-class XrdPosixInfo;
+struct XrdPosixInfo;
+class XrdPosixAdmin;
 
 //-----------------------------------------------------------------------------
 //! POSIX interface to XRootD with some extensions, as noted.
@@ -68,6 +64,7 @@ class XrdPosixXrootd
 {
 public:
 friend class XrdPosixConfig;
+friend class XrdPosixExtra;
 
 //-----------------------------------------------------------------------------
 //! Access() conforms to POSIX.1-2001 access()
@@ -212,6 +209,27 @@ static int     QueryChksum(const char *path, time_t &mtime,
                                  char *buff, int     blen);
 
 //-----------------------------------------------------------------------------
+//! QueryError() is a POSIX extension and returns extended information about
+//! the last error returned from a call to a POSIX function.
+//!
+//! @param  emsg  Reference to a string to hold the retruned message text.
+//! @param  fd    The file descriptor associated with the error. A negative
+//!               value returns the last error encountered on the calling
+//!               thread for the last function not releated to a file descritor.
+//!         dirP  Get the error associated with the last directory operation.
+//! @param  reset When true (the default) clears the error information.
+//!
+//! @return The error code and the associated message via parameter emsg.
+//!         A zero return indicates that no error information is available.
+//!         A -1 return indicates the call was bad itself because either the
+//!         fd or dirP was invalid. 
+//-----------------------------------------------------------------------------
+
+static int     QueryError(std::string& emsg, int fd=-1, bool reset=true);
+
+static int     QueryError(std::string& emsg, DIR* dirP, bool reset=true);
+
+//-----------------------------------------------------------------------------
 //! QueryOpaque() is a POSIX extension and returns a file's implementation
 //! specific information.
 //!
@@ -326,9 +344,6 @@ static int     Unlink(const char *path);
 //! @param  n       the number of elements in the readV vector.
 //!
 //! @param  cbp     pointer to the callback object for async execution.
-//!
-//! @return Upon success returns the total number of bytes read. Otherwise, -1
-//!         is returned and errno is appropriately set.
 //-----------------------------------------------------------------------------
 
 static void    VRead(int fildes, const XrdOucIOVec *readV, int n,
@@ -359,6 +374,19 @@ static bool    isXrootdDir(DIR *dirp);
 
 static bool    myFD(int fd);
 
+// The XRootD client will fetch the information needed for a full `stat` call
+// as part of the directory listing.  By calling this function from XrdPss
+// layer, we enable the use of the `autoStat` functionality, which avoids
+// having to call `stat` for each entry in the directory listing.
+//
+// On error, returns errno; on success, returns 0 and stores the buffer
+// internally; on subsequent Readdir calls, the `buf` contents are filled in
+// as if one called `fstatat` on it.
+//
+// Note that this matches other XrdPosixXrootd methods in returning errno on
+// failure; this differs from the similar XrdOss method which returns -errno.
+static int     StatRet(DIR *dirp, struct stat *buf);
+
 /* There must be one instance of this object per executable image. Typically,
    this object is declared in main() or at file level. This is necessary to
    properly do one-time initialization of the static members. When declaring
@@ -367,35 +395,24 @@ static bool    myFD(int fd);
             The value returned by getrlimit() over-rides the passed value
             unless maxfd is negative. When negative, abs(maxfd) becomes the
             absolute maximum and shadow file descriptors are not used.
-   maxdir - Ignored, only here for backward compatability.
-   maxthr - Ignored, only here for backward compatability.
+   maxdir - Ignored, only here for backward compatibility.
+   maxthr - Ignored, only here for backward compatibility.
 */
                XrdPosixXrootd(int maxfd=255, int maxdir=0, int maxthr=0);
               ~XrdPosixXrootd();
 
-// The following methods were always considered private. They are no longer
-// used and will be removed on the next major release! They are only here for
-// now to keep ABI compatability for the 4.x and prior releases.
-//
-static void    setCache(XrdOucCache *cP);
-static void    setCache(XrdOucCache2 *cP);
-static void    setDebug(int val, bool doDebug=false);
-static void    setEnv(const char *kword, int kval);
-static void    setIPV4(bool userv4);
-static void    setLogger(XrdSysLogger *logP);
-static void    setNumCB(int numcb);
-static void    setN2N(XrdOucName2Name *pN2N, int opts=0);
-static void    setSched(XrdScheduler *sP);
-
 private:
 
-static int  Fault(XrdPosixFile *fp, int ecode);
-static void initStat(struct stat *buf);
-static void initXdev(dev_t &st_dev, dev_t &st_rdev);
+static int  Fault(XrdPosixFile *fp, int ecode, const char *msg=0);
 
 static int  Open(const char *path, int oflag, mode_t mode,
                  XrdPosixCallBack *cbP, XrdPosixInfo *infoP);
 static bool OpenCache(XrdPosixFile &file, XrdPosixInfo &Info);
+
+// functions that will be used when XrdEC is invoked
+static int  EcRename(const char*, const char*, XrdPosixAdmin&);
+static int  EcStat(const char*, struct stat*, XrdPosixAdmin&);
+static int  EcUnlink(const char*, XrdPosixAdmin&);
 
 static int  baseFD;
 static int  initDone;

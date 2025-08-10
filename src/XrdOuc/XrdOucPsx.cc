@@ -29,15 +29,15 @@
 /******************************************************************************/
 
 #include <unistd.h>
-#include <ctype.h>
-#include <stdio.h>
+#include <cctype>
+#include <cstdio>
 #include <sys/param.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 
 #include "XrdOuc/XrdOuca2x.hh"
-#include "XrdOuc/XrdOucCache2.hh"
+#include "XrdOuc/XrdOucCache.hh"
 #include "XrdOuc/XrdOucEnv.hh"
 #include "XrdOuc/XrdOucN2NLoader.hh"
 #include "XrdOuc/XrdOucName2Name.hh"
@@ -151,7 +151,7 @@ bool XrdOucPsx::ClientConfig(const char *pfx, bool hush)
        tFifo.Clear();
       }
 
-// Now check if any errors occured during file i/o
+// Now check if any errors occurred during file i/o
 //
    if ((retc = Config.LastError()))
       {eDest.Emsg("Config", retc, "read config file", configFN); aOK = false;}
@@ -171,38 +171,13 @@ bool XrdOucPsx::ClientConfig(const char *pfx, bool hush)
 bool XrdOucPsx::ConfigCache(XrdSysError &eDest)
 {
    XrdOucPinLoader  myLib(&eDest,myVersion,"cachelib",cPath);
-   const char *cName;
-   bool isCache2;
 
-// First find out if this is a cache2 or old cache library
+// Get the cache Object now
 //
-   if (myLib.Resolve("?XrdOucGetCache2") == 0)
-      {cName = "XrdOucGetCache";  isCache2 = false;
-      } else {
-       cName = "XrdOucGetCache2"; isCache2 = true;
-      } 
-
-// Get the Object now
-//
-   if (isCache2)
-     {XrdOucCache2     *(*ep)(XrdSysLogger *, const char *, const char *);
-      ep = (XrdOucCache2 *(*)(XrdSysLogger *, const char *, const char *))
-         (myLib.Resolve(cName));
-
-      if (!ep) return false;
-
-      theCache2 = (XrdOucCache2*)ep(eDest.logger(), configFN, cParm);
-      return theCache2 != 0;
-     } else {
-      XrdOucCache     *(*ep)(XrdSysLogger *, const char *, const char *);
-      ep = (XrdOucCache *(*)(XrdSysLogger *, const char *, const char *))
-         (myLib.Resolve(cName));
-
-      if (!ep) return false;
-
-      theCache = (XrdOucCache*)ep(eDest.logger(), configFN, cParm);
-      return theCache != 0;
-     }
+   XrdOucCache_t ep = (XrdOucCache_t)myLib.Resolve("XrdOucGetCache");
+   if (!ep) return false;
+   theCache = (XrdOucCache*)ep(eDest.logger(), configFN, cParm, theEnv);
+   return theCache != 0;
 }
   
 /******************************************************************************/
@@ -215,7 +190,11 @@ bool XrdOucPsx::ConfigN2N(XrdSysError &eDest)
 
 // Skip all of this we are not doing name mapping.
 //
-  if (!N2NLib && !LocalRoot) {xLfn2Pfn = xPfn2Lfn = false; return true;}
+  if (!N2NLib && !LocalRoot)
+     {xLfn2Pfn = false;
+      xPfn2Lfn = xP2Loff;
+      return true;
+     }
 
 // Check if the n2n is applicable
 //
@@ -255,7 +234,7 @@ bool XrdOucPsx::ConfigSetup(XrdSysError &eDest, bool hush)
            eDest.logger()->Capture(&tFifo);
           }
       } else {
-       if (mPath && theCache2 && !LoadCCM(eDest))
+       if (mPath && theCache && !LoadCCM(eDest))
           {aOK = false;
            if (hush)
               {eDest.logger()->Capture(0);
@@ -555,7 +534,13 @@ bool XrdOucPsx::ParseCLib(XrdSysError *Eroute, XrdOucStream &Config)
 // Save the path
 //
    if (cPath) free(cPath);
-   cPath = (strcmp(val,"default") ? strdup(val) : strdup("libXrdFileCache.so"));
+   if (!strcmp(val,"libXrdFileCache.so") || !strcmp(val,"libXrdFileCache-4.so"))
+      {Eroute->Say("Config warning: 'libXrdFileCache' has been replaced by "
+            "'libXrdPfc'; for future compatibility specify 'default' instead!");
+       cPath = strdup("libXrdPfc.so");
+      } else {
+       cPath = (strcmp(val,"default") ? strdup(val) : strdup("libXrdPfc.so"));
+      }
 
 // Get the parameters
 //
@@ -651,7 +636,7 @@ bool XrdOucPsx::ParseINet(XrdSysError *Eroute, XrdOucStream &Config)
 
    Purpose:  To parse the directive: namelib [<opts>] pfn<path> [<parms>]
 
-             <opts>    one or more: [-lfn2pfn] [-lfncache]
+             <opts>    one or more: [-lfn2pfn] [-lfncache[src[+]]]
              <path>    the path of the filesystem library to be used.
              <parms>   optional parms to be passed
 
@@ -661,18 +646,24 @@ bool XrdOucPsx::ParseINet(XrdSysError *Eroute, XrdOucStream &Config)
 bool XrdOucPsx::ParseNLib(XrdSysError *Eroute, XrdOucStream &Config)
 {
     char *val, parms[1024];
-    bool l2p = false, p2l = false;
+    bool l2p = false, p2l = false, p2lsrc = false, p2lsgi = false;
 
 // Parse options, if any
 //
    while((val = Config.GetWord()) && val[0])
-        {     if (!strcmp(val, "-lfn2pfn"))  l2p = true;
-         else if (!strcmp(val, "-lfncache")) p2l = true;
+        {     if (!strcmp(val, "-lfn2pfn"))      l2p = true;
+         else if (!strcmp(val, "-lfncache"))     p2l = true;
+         else if (!strcmp(val, "-lfncachesrc"))  p2l = p2lsrc = true;
+         else if (!strcmp(val, "-lfncachesrc+")) p2l = p2lsgi = true;
          else break;
         }
+
    if (!l2p && !p2l) l2p = true;
    xLfn2Pfn = l2p;
-   xPfn2Lfn = p2l;
+         if (!p2l)   xPfn2Lfn = xP2Loff;
+    else if (p2lsrc) xPfn2Lfn = xP2Lsrc;
+    else if (p2lsgi) xPfn2Lfn = xP2Lsgi;
+    else             xPfn2Lfn = xP2Lon;
 
 // Get the path
 //
@@ -712,7 +703,7 @@ bool XrdOucPsx::ParseSet(XrdSysError *Eroute, XrdOucStream &Config)
 {
     char  kword[256], *val;
     int   kval, noGo;
-    static struct {const char *Sopt; const char *Copt; int isT;} Sopts[]  =
+    static struct sopts {const char *Sopt; const char *Copt; int isT;} Sopts[] =
        {
          {"ConnectTimeout",        "ConnectionWindow",1},    // Default  120
          {"ConnectionRetry",       "ConnectionRetry",1},     // Default    5
@@ -724,7 +715,7 @@ bool XrdOucPsx::ParseSet(XrdSysError *Eroute, XrdOucStream &Config)
          {"DataServerTTL",         "DataServerTTL",1},       // Default  300
          {"LBServerConn_ttl",      "LoadBalancerTTL",1},     // Default 1200
          {"LoadBalancerTTL",       "LoadBalancerTTL",1},     // Default 1200
-         {"ParallelEvtLoop",       "ParallelEvtLoop",0},     // Default    3
+         {"ParallelEvtLoop",       "ParallelEvtLoop",0},     // Default   10
          {"ParStreamsPerPhyConn",  "SubStreamsPerChannel",0},// Default    1
          {"ReadAheadSize",         0,0},
          {"ReadAheadStrategy",     0,0},
@@ -741,7 +732,7 @@ bool XrdOucPsx::ParseSet(XrdSysError *Eroute, XrdOucStream &Config)
          {"TransactionTimeout",    "",1},
          {"WorkerThreads",         "WorkerThreads",0}        // Set To    64
        };
-    int i, numopts = sizeof(Sopts)/sizeof(const char *);
+    int i, numopts = sizeof(Sopts)/sizeof(struct sopts);
 
     if (!(val = Config.GetWord()))
        {Eroute->Emsg("Config", "setopt keyword not specified"); return false;}

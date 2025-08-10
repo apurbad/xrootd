@@ -123,11 +123,11 @@ class XCpSrc
      *
      * @param chunk : the chunk to be deleted
      */
-    static void DeleteChunk( ChunkInfo *&chunk )
+    static void DeleteChunk( PageInfo *&chunk )
     {
       if( chunk )
       {
-        delete[] static_cast<char*>( chunk->buffer );
+        delete[] static_cast<char*>( chunk->GetBuffer() );
         delete   chunk;
         chunk = 0;
       }
@@ -218,11 +218,11 @@ class XCpSrc
      * This method is used by ChunkHandler to report the result of a write,
      * to the source object.
      *
-     * @param stats  : operation status
+     * @param status : operation status
      * @param chunk  : the read chunk (if operation failed, should be null)
      * @param handle : the file object used to read the chunk
      */
-    void ReportResponse( XRootDStatus *status, ChunkInfo *chunk, File *handle );
+    void ReportResponse( XRootDStatus *status, PageInfo *chunk, File *handle );
 
     /**
      * Delets a pointer and sets it to null.
@@ -299,7 +299,7 @@ class XCpSrc
     std::map<File*, uint8_t>      pFailed;
 
     /**
-     * The offset of the next chunk to be transfered.
+     * The offset of the next chunk to be transferred.
      */
     uint64_t                      pCurrentOffset;
 
@@ -309,7 +309,7 @@ class XCpSrc
     uint64_t                      pBlkEnd;
 
     /**
-     * Total number of data transfered from this source.
+     * Total number of data transferred from this source.
      */
     uint64_t                      pDataTransfered;
 
@@ -360,6 +360,12 @@ class XCpSrc
      * the restart
      */
     time_t                        pTransferTime;
+
+    /**
+     * The total time we were transferring data, before
+     * the restart
+     */
+    bool                          pUsePgRead;
 };
 
 } /* namespace XrdCl */

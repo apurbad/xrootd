@@ -26,12 +26,12 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <unistd.h>
-#include <errno.h>
-#include <time.h>
+#include <cerrno>
+#include <ctime>
 #include <pwd.h>
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -139,13 +139,7 @@ const char *XrdSutBuckStr(int kbck)
 //______________________________________________________________________________
 volatile void *XrdSutMemSet(volatile void *dst, int c, int len)
 {
-   // To avoid problems due to compiler optmization
-   // Taken from Viega&Messier, "Secure Programming Cookbook", O'Really, #13.2
-   // (see discussion there)
-   volatile char *buf;
-
-   for (buf = (volatile char *)dst; len; buf[--len] = c) {}
-   return dst;
+   return memset((void*)dst, c, len);
 }
 
 #ifndef USE_EXTERNAL_GETPASS
@@ -170,7 +164,7 @@ int XrdSutGetPass(const char *prompt, XrdOucString &passwd)
          if (pw[i] > 0x20) pw[k++] = pw[i];
       pw[k] = 0;
       passwd = pw;
-      XrdSutMemSet((volatile void *)pw,0,len);
+      XrdSutMemSet((void *)pw,0,len);
    } else {
       DEBUG("error from getpass");
       return -1;
@@ -192,10 +186,10 @@ int XrdSutGetLine(XrdOucString &line, const char *prompt)
    
    // Print prompt, if requested
    if (prompt)
-      cout << prompt;
+      std::cout << prompt;
 
    // Get line
-   cin.getline(bin,XrdSutMAXBUF-1);
+   std::cin.getline(bin,XrdSutMAXBUF-1);
 
    // Fill input
    line = bin;
@@ -217,7 +211,7 @@ bool XrdSutAskConfirm(const char *msg1, bool defact, const char *msg2)
    bool rc = defact;
 
    if (msg2)
-      cout << msg2;
+      std::cout << msg2;
    XrdOucString ask;
    XrdOucString prompt = defact ? " [y]: " : " [n]: ";
    if (msg1)
@@ -294,7 +288,7 @@ int XrdSutFromHex(const char *in, char *out, int &lout)
    for ( ; i<lin; i += 2) {
       st[0] = in[i];
       st[1] = ((i+1) < lin) ? in[i+1] : 0;
-      int c;
+      unsigned int c;
       sscanf(st,"%x",&c);
       out[k++] = (char)(0x000000FF & c);
    }
@@ -315,8 +309,8 @@ int XrdSutTimeString(int t, char *st, int opt)
    //     24Apr2006-091023         (opt = 1)
    // The buffer st must be supplied by the caller to contain at least 20.
    // This length is returned when calling the function with t=-1 
-   static char month[12][4] = {"Jan","Feb","Mar","Apr","May","Jun",
-                               "Jul","Aug","Sep","Oct","Nov","Dec"};
+   static const char month[12][4] = {"Jan","Feb","Mar","Apr","May","Jun",
+                                     "Jul","Aug","Sep","Oct","Nov","Dec"};
    static short flen = strlen("24Apr2006:09:10:23");
 
    // Check if the length is required

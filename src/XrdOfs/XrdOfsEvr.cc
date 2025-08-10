@@ -28,9 +28,9 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <stdlib.h>
-#include <stdio.h>
-#include <string.h>
+#include <cstdlib>
+#include <cstdio>
+#include <cstring>
 
 #include "XrdCms/XrdCmsClient.hh"
 #include "XrdOfs/XrdOfsEvr.hh"
@@ -39,7 +39,6 @@
 #include "XrdSys/XrdSysError.hh"
 #include "XrdSys/XrdSysTimer.hh"
 #include "XrdOuc/XrdOucEnv.hh"
-#include "XrdOuc/XrdOucTrace.hh"
 #include "XrdNet/XrdNetOpts.hh"
 #include "XrdNet/XrdNetSocket.hh"
 #include "XrdSys/XrdSysHeaders.hh"
@@ -50,7 +49,7 @@
 
 extern XrdOfsStats OfsStats;
 
-extern XrdOucTrace OfsTrace;
+extern XrdSysTrace OfsTrace;
   
 void *XrdOfsEvRecv(void *pp)
 {
@@ -97,7 +96,7 @@ void XrdOfsEvr::flushEvents()
    if ((expWait = maxLife/4) == 0) expWait = 60;
    expClock = expWait;
 
-// We wait for the right period of time, unless there is a defered event
+// We wait for the right period of time, unless there is a deferred event
 //
    do {myMutex.Lock(); 
        if ((ntp = deferQ)) deferQ = 0;
@@ -174,7 +173,7 @@ int XrdOfsEvr::Init(XrdCmsClient *trgp)
 //
    Balancer = trgp;
 
-// Now start a thread to get incomming messages
+// Now start a thread to get incoming messages
 //
    if ((rc = XrdSysThread::Run(&tid, XrdOfsEvRecv, static_cast<void *>(this),
                           0, "Event receiver")))
@@ -347,7 +346,7 @@ void XrdOfsEvr::sendEvent(theEvent *ep)
    int doDel = 0, Result = (ep->finalRC ? SFS_ERROR : SFS_OK);
 
 // For each client, issue a call back sending the result back
-// The event also goes in the defered delete queue as we need to hold on
+// The event also goes in the deferred delete queue as we need to hold on
 // to it just in case a client is in-transit
 //
    while((cp = ep->aClient))

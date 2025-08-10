@@ -65,7 +65,7 @@ typedef XrdOucString String;
 //
 // Message codes either returned by server or included in buffers
 enum kpwdStatus {
-   kpST_error    = -1,      // error occured
+   kpST_error    = -1,      // error occurred
    kpST_ok       =  0,      // ok
    kpST_more     =  1       // need more info
 };
@@ -200,7 +200,7 @@ typedef struct {
 #define REL3(x,y,z) { if (x) delete x; if (y) delete y; if (z) delete z; }
 #if 0
 #ifndef NODEBUG
-#define PRINT(y) {{SecTrace->Beg(epname); cerr <<y; SecTrace->End();}}
+#define PRINT(y) {{SecTrace->Beg(epname); std::cerr <<y; SecTrace->End();}}
 #else
 #define PRINT(y) { }
 #endif

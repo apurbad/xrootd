@@ -31,7 +31,8 @@
 /* OpenSSL implementation of XrdCryptoCipher                                  */
 /*                                                                            */
 /* ************************************************************************** */
-#include <string.h>
+#include <cstring>
+#include <cassert>
 
 #include "XrdSut/XrdSutRndm.hh"
 #include "XrdCrypto/XrdCryptosslTrace.hh"
@@ -41,6 +42,30 @@
 #include <openssl/bio.h>
 #include <openssl/pem.h>
 #include <openssl/dh.h>
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+#include <openssl/core_names.h>
+#include <openssl/param_build.h>
+#endif
+
+// Hardcoded DH parameters that are acceptable to both OpenSSL 3.0 (RHEL9)
+// and 1.0.2 (RHEL7).  OpenSSL 3.0 reworked the DH parameter generation algorithm
+// and now produces DH params that don't pass OpenSSL 1.0.2's parameter verification
+// function (`DH_check`).  Accordingly, since these are safe to reuse, we generated
+// a single set of parameters for the server to always utilize.
+static const char dh_param_enc[] =
+R"(
+-----BEGIN DH PARAMETERS-----
+MIIBiAKCAYEAzcEAf3ZCkm0FxJLgKd1YoT16Hietl7QV8VgJNc5CYKmRu/gKylxT
+MVZJqtUmoh2IvFHCfbTGEmZM5LdVaZfMLQf7yXjecg0nSGklYZeQQ3P0qshFLbI9
+u3z1XhEeCbEZPq84WWwXacSAAxwwRRrN5nshgAavqvyDiGNi+GqYpqGPb9JE38R3
+GJ51FTPutZlvQvEycjCbjyajhpItBB+XvIjWj2GQyvi+cqB0WrPQAsxCOPrBTCZL
+OjM0NfJ7PQfllw3RDQev2u1Q+Rt8QyScJQCFUj/SWoxpw2ydpWdgAkrqTmdVYrev
+x5AoXE52cVIC8wfOxaaJ4cBpnJui3Y0jZcOQj0FtC0wf4WcBpHnLLBzKSOQwbxts
+WE8LkskPnwwrup/HqWimFFg40bC9F5Lm3CTDCb45mtlBxi3DydIbRLFhGAjlKzV3
+s9G3opHwwfgXpFf3+zg7NPV3g1//HLgWCvooOvMqaO+X7+lXczJJLMafEaarcAya
+Kyo8PGKIAORrAgEF
+-----END DH PARAMETERS-----
+)";
 
 // ---------------------------------------------------------------------------//
 //
@@ -49,6 +74,14 @@
 // ---------------------------------------------------------------------------//
 
 #if OPENSSL_VERSION_NUMBER < 0x10100000L
+static DH *EVP_PKEY_get0_DH(EVP_PKEY *pkey)
+{
+    if (pkey->type != EVP_PKEY_DH) {
+        return NULL;
+    }
+    return pkey->pkey.dh;
+}
+
 static void DH_get0_pqg(const DH *dh,
                         const BIGNUM **p, const BIGNUM **q, const BIGNUM **g)
 {
@@ -133,25 +166,50 @@ static int DSA_set0_key(DSA *d, BIGNUM *pub_key, BIGNUM *priv_key)
 }
 #endif
 
-#if !defined(HAVE_DH_PADDED)
-#if defined(HAVE_DH_PADDED_FUNC)
-int DH_compute_key_padded(unsigned char *, const BIGNUM *, DH *);
-#else
-static int DH_compute_key_padded(unsigned char *key, const BIGNUM *pub_key, DH *dh)
-{
-    int rv, pad;
-    rv = dh->meth->compute_key(key, pub_key, dh);
-    if (rv <= 0)
-        return rv;
-    pad = BN_num_bytes(dh->p) - rv;
-    if (pad > 0) {
-        memmove(key + pad, key, rv);
-        memset(key, 0, pad);
-    }
-    return rv + pad;
+static EVP_PKEY *getFixedDHParams() {
+    static EVP_PKEY *dhparms = [] {
+        EVP_PKEY *dhParam = 0;
+
+        BIO *biop = BIO_new(BIO_s_mem());
+        BIO_write(biop, dh_param_enc, strlen(dh_param_enc));
+        PEM_read_bio_Parameters(biop, &dhParam);
+        BIO_free(biop);
+        return dhParam;
+    }();
+
+    assert(dhparms);
+    return dhparms;
 }
+
+static int XrdCheckDH (EVP_PKEY *pkey) {
+   // If the DH parameters we received are our fixed set we know they
+   // are acceptable. The parameter check requires computation and more
+   // with openssl 3 than previously. So skip if DH params are known.
+   const EVP_PKEY *dhparms = getFixedDHParams();
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+   const bool skipcheck = EVP_PKEY_parameters_eq(pkey, dhparms);
+#else
+   const bool skipcheck = EVP_PKEY_cmp_parameters(pkey, dhparms);
 #endif
+   if (skipcheck) return 1;
+
+   int rc;
+#if OPENSSL_VERSION_NUMBER < 0x10101000L
+   DH *dh = EVP_PKEY_get0_DH(pkey);
+   if (dh) {
+      DH_check(dh, &rc);
+      rc = (rc == 0 ? 1 : 0);
+   }
+   else {
+      rc = -2;
+   }
+#else
+   EVP_PKEY_CTX *ckctx = EVP_PKEY_CTX_new(pkey, 0);
+   rc = EVP_PKEY_param_check(ckctx);
+   EVP_PKEY_CTX_free(ckctx);
 #endif
+   return rc;
+}
 
 //_____________________________________________________________________________
 bool XrdCryptosslCipher::IsSupported(const char *cip)
@@ -369,7 +427,6 @@ XrdCryptosslCipher::XrdCryptosslCipher(XrdSutBucket *bck)
       }
       // DH, if any
       if (lp > 0 || lg > 0 || lpub > 0 || lpri > 0) {
-         if ((fDH = DH_new())) {
             char *buf = 0;
             BIGNUM *p = NULL, *g = NULL;
             BIGNUM *pub = NULL, *pri = NULL;
@@ -397,7 +454,6 @@ XrdCryptosslCipher::XrdCryptosslCipher(XrdSutBucket *bck)
                   valid = 0;
                cur += lg;
             }
-            DH_set0_pqg(fDH, p, NULL, g);
             // pub_key
             if (lpub > 0) {
                buf = new char[lpub+1];
@@ -422,13 +478,32 @@ XrdCryptosslCipher::XrdCryptosslCipher(XrdSutBucket *bck)
                   valid = 0;
                cur += lpri;
             }
-            DH_set0_key(fDH, pub, pri);
-            int dhrc = 0;
-            DH_check(fDH,&dhrc);
-            if (dhrc == 0)
-               valid = 1;
-         } else
-            valid = 0;
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+            OSSL_PARAM_BLD *bld = OSSL_PARAM_BLD_new();
+            if (p) OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_FFC_P, p);
+            if (g) OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_FFC_G, g);
+            if (pub) OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_PUB_KEY, pub);
+            if (pri) OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_PRIV_KEY, pri);
+            OSSL_PARAM *params = OSSL_PARAM_BLD_to_param(bld);
+            OSSL_PARAM_BLD_free(bld);
+            if (p) BN_free(p);
+            if (g) BN_free(g);
+            if (pub) BN_free(pub);
+            if (pri) BN_free(pri);
+            EVP_PKEY_CTX *pkctx = EVP_PKEY_CTX_new_id(EVP_PKEY_DH, 0);
+            EVP_PKEY_fromdata_init(pkctx);
+            EVP_PKEY_fromdata(pkctx, &fDH, EVP_PKEY_KEYPAIR, params);
+            EVP_PKEY_CTX_free(pkctx);
+            OSSL_PARAM_free(params);
+#else
+            DH* dh = DH_new();
+            DH_set0_pqg(dh, p, NULL, g);
+            DH_set0_key(dh, pub, pri);
+            fDH = EVP_PKEY_new();
+            EVP_PKEY_assign_DH(fDH, dh);
+#endif
+            if (XrdCheckDH(fDH) != 1)
+               valid = 0;
       }
    }
    //
@@ -459,7 +534,7 @@ XrdCryptosslCipher::XrdCryptosslCipher(bool padded, int bits, char *pub,
    // Constructor for key agreement.
    // If pub is not defined, generates a DH full key,
    // the public part and parameters can be retrieved using Public().
-   // The number of random bits to be used in 'bits'.
+   // 'bits' is ignored (DH key is generated once)
    // If pub is defined with the public part and parameters of the
    // counterpart fully initialize a cipher with that information.
    // Sets also the name to 't', if different from the default one.
@@ -475,33 +550,59 @@ XrdCryptosslCipher::XrdCryptosslCipher(bool padded, int bits, char *pub,
    deflength = 1;
 
    if (!pub) {
-      DEBUG("generate DH full key");
+
+      DEBUG("generate DH parameters");
+      EVP_PKEY *dhparms = getFixedDHParams();
+//
+// Important historical context:
+// - We used to generate DH params on every server startup (commented
+//   out below).  This was prohibitively costly to do on startup for
+//   DH parameters large enough to be considered secure.
+// - OpenSSL 3.0 improved the DH parameter generation to avoid leaking
+//   the first bit of the session key (see https://github.com/openssl/openssl/issues/9792
+//   for more information).  However, a side-effect is that the new
+//   parameters are not recognized as valid in OpenSSL 1.0.2.
+// - Since we can't control old client versions and new servers can't
+//   generate compatible DH parameters, we switch to a fixed, much stronger
+//   set of DH parameters (3072 bits).
+//
+// The impact is that we continue leaking the first bit of the session key
+// (meaning it's effectively 127 bits not 128 bits -- still plenty secure)
+// but upgrade the DH parameters to something more modern (3072; previously,
+// it was 512 bits which was not considered secure).  The downside
+// of fixed DH parameters is that if a nation-state attacked our selected
+// parameters (using technology not currently available), we would have
+// to upgrade all servers with a new set of DH parameters.
+//
+
+/*
+         EVP_PKEY_CTX *pkctx = EVP_PKEY_CTX_new_id(EVP_PKEY_DH, 0);
+         EVP_PKEY_paramgen_init(pkctx);
+         EVP_PKEY_CTX_set_dh_paramgen_prime_len(pkctx, kDHMINBITS);
+         EVP_PKEY_CTX_set_dh_paramgen_generator(pkctx, 5);
+         EVP_PKEY_paramgen(pkctx, &dhParam);
+         EVP_PKEY_CTX_free(pkctx);
+*/
+
+      DEBUG("configure DH parameters");
       //
-      // at least 128 bits
-      bits = (bits < kDHMINBITS) ? kDHMINBITS : bits;
-      //
-      // Generate params for DH object
-      fDH = DH_new();
-      if (fDH && DH_generate_parameters_ex(fDH, bits, DH_GENERATOR_5, NULL)) {
-         int prc = 0;
-         DH_check(fDH,&prc);
-         if (prc == 0) {
-            //
-            // Generate DH key
-            if (DH_generate_key(fDH)) {
-               // Init context
-               ctx = EVP_CIPHER_CTX_new();
-               if (ctx)
-                  valid = 1;
-            }
-         }
+      // Set params for DH object
+      EVP_PKEY_CTX *pkctx = EVP_PKEY_CTX_new(dhparms, 0);
+      EVP_PKEY_keygen_init(pkctx);
+      EVP_PKEY_keygen(pkctx, &fDH);
+      EVP_PKEY_CTX_free(pkctx);
+      if (fDH) {
+         // Init context
+         ctx = EVP_CIPHER_CTX_new();
+         if (ctx)
+            valid = 1;
       }
 
    } else {
       DEBUG("initialize cipher from key-agreement buffer");
       //
       char *ktmp = 0;
-      int ltmp = 0;
+      size_t ltmp = 0;
       // Extract string with bignumber
       BIGNUM *bnpub = 0;
       char *pb = strstr(pub,"---BPUB---");
@@ -522,30 +623,73 @@ XrdCryptosslCipher::XrdCryptosslCipher(bool padded, int bits, char *pub,
             // Write buffer into BIO
             BIO_write(biop,pub,lpub);
             //
-            // Create a key object
-            if ((fDH = DH_new())) {
-               //
-               // Read parms from BIO
-               PEM_read_bio_DHparams(biop,&fDH,0,0);
-               int prc = 0;
-               DH_check(fDH,&prc);
-               if (prc == 0) {
+            // Read params from BIO
+            EVP_PKEY *dhParam = 0;
+            PEM_read_bio_Parameters(biop, &dhParam);
+            if (dhParam) {
+               if (XrdCheckDH(dhParam) == 1) {
                   //
                   // generate DH key
-                  if (DH_generate_key(fDH)) {
+                  EVP_PKEY_CTX *pkctx = EVP_PKEY_CTX_new(dhParam, 0);
+                  EVP_PKEY_keygen_init(pkctx);
+                  EVP_PKEY_keygen(pkctx, &fDH);
+                  EVP_PKEY_CTX_free(pkctx);
+                  if (fDH) {
                      // Now we can compute the cipher
-                     ktmp = new char[DH_size(fDH)];
-                     memset(ktmp, 0, DH_size(fDH));
+                     ltmp = EVP_PKEY_size(fDH);
+                     ktmp = new char[ltmp];
+                     memset(ktmp, 0, ltmp);
                      if (ktmp) {
-                        if (padded) {
-                           ltmp = DH_compute_key_padded((unsigned char *)ktmp,bnpub,fDH);
-                        } else {
-                           ltmp = DH_compute_key((unsigned char *)ktmp,bnpub,fDH);
+                        // Create peer public key
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+                        EVP_PKEY *peer = 0;
+                        OSSL_PARAM *params1 = 0;
+                        EVP_PKEY_todata( dhParam, EVP_PKEY_KEY_PARAMETERS, &params1 );
+                        OSSL_PARAM_BLD *bld = OSSL_PARAM_BLD_new();
+                        OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_PUB_KEY, bnpub);
+                        OSSL_PARAM *params2 = OSSL_PARAM_BLD_to_param(bld);
+                        OSSL_PARAM_BLD_free(bld);
+                        OSSL_PARAM *params = OSSL_PARAM_merge( params1, params2 );
+                        pkctx = EVP_PKEY_CTX_new_id(EVP_PKEY_DH, 0);
+                        EVP_PKEY_fromdata_init(pkctx);
+                        EVP_PKEY_fromdata(pkctx, &peer, EVP_PKEY_KEYPAIR, params);
+                        EVP_PKEY_CTX_free(pkctx);
+                        OSSL_PARAM_free(params);
+                        OSSL_PARAM_free(params1);
+                        OSSL_PARAM_free(params2);
+#else
+                        DH* dh = DH_new();
+                        DH_set0_key(dh, BN_dup(bnpub), NULL);
+                        EVP_PKEY *peer = EVP_PKEY_new();
+                        EVP_PKEY_assign_DH(peer, dh);
+#endif
+                        // Derive shared secret
+                        pkctx = EVP_PKEY_CTX_new(fDH, 0);
+                        EVP_PKEY_derive_init(pkctx);
+#if OPENSSL_VERSION_NUMBER >= 0x10101000L
+                        EVP_PKEY_CTX_set_dh_pad(pkctx, padded);
+#endif
+                        EVP_PKEY_derive_set_peer(pkctx, peer);
+                        EVP_PKEY_derive(pkctx, (unsigned char *)ktmp, &ltmp);
+                        EVP_PKEY_CTX_free(pkctx);
+                        EVP_PKEY_free(peer);
+                        if (ltmp > 0) {
+#if OPENSSL_VERSION_NUMBER < 0x10101000L
+                           if (padded) {
+                              int pad = EVP_PKEY_size(fDH) - ltmp;
+                              if (pad > 0) {
+                                 memmove(ktmp + pad, ktmp, ltmp);
+                                 memset(ktmp, 0, pad);
+                                 ltmp += pad;
+                              }
+                           }
+#endif
+                           valid = 1;
                         }
-                        if (ltmp > 0) valid = 1;
                      }
                   }
                }
+               EVP_PKEY_free(dhParam);
             }
             BIO_free(biop);
          }
@@ -568,11 +712,11 @@ XrdCryptosslCipher::XrdCryptosslCipher(bool padded, int bits, char *pub,
                ltmp = (ltmp > EVP_MAX_KEY_LENGTH) ? EVP_MAX_KEY_LENGTH : ltmp;
                int ldef = EVP_CIPHER_key_length(cipher);
                // Try setting the key length
-               if (ltmp != ldef) {
+               if ((int)ltmp != ldef) {
                   EVP_CipherInit_ex(ctx, cipher, 0, 0, 0, 1);
                   EVP_CIPHER_CTX_set_key_length(ctx,ltmp);
                   EVP_CipherInit_ex(ctx, 0, 0, (unsigned char *)ktmp, 0, 1);
-                  if (ltmp == EVP_CIPHER_CTX_key_length(ctx)) {
+                  if ((int)ltmp == EVP_CIPHER_CTX_key_length(ctx)) {
                      // Use the ltmp bytes at ktmp
                      SetBuffer(ltmp,ktmp);
                      deflength = 0;
@@ -622,16 +766,46 @@ XrdCryptosslCipher::XrdCryptosslCipher(const XrdCryptosslCipher &c)
    fDH = 0;
    if (valid && c.fDH) {
       valid = 0;
-      if ((fDH = DH_new())) {
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+      BIGNUM *p = BN_new();
+      BIGNUM *g = BN_new();
+      BIGNUM *pub = BN_new();
+      BIGNUM *pri = BN_new();
+      OSSL_PARAM_BLD *bld = OSSL_PARAM_BLD_new();
+      if (EVP_PKEY_get_bn_param(c.fDH, OSSL_PKEY_PARAM_FFC_P, &p) == 1)
+         OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_FFC_P, p);
+      if (EVP_PKEY_get_bn_param(c.fDH, OSSL_PKEY_PARAM_FFC_G, &g) == 1)
+         OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_FFC_G, g);
+      if (EVP_PKEY_get_bn_param(c.fDH, OSSL_PKEY_PARAM_PUB_KEY, &pub) == 1)
+         OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_PUB_KEY, pub);
+      if (EVP_PKEY_get_bn_param(c.fDH, OSSL_PKEY_PARAM_PRIV_KEY, &pri) == 1)
+         OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_PRIV_KEY, pri);
+      OSSL_PARAM *params = OSSL_PARAM_BLD_to_param(bld);
+      OSSL_PARAM_BLD_free(bld);
+      BN_free(p);
+      BN_free(g);
+      BN_free(pub);
+      BN_free(pri);
+      EVP_PKEY_CTX *pkctx = EVP_PKEY_CTX_new_id(EVP_PKEY_DH, 0);
+      EVP_PKEY_fromdata_init(pkctx);
+      EVP_PKEY_fromdata(pkctx, &fDH, EVP_PKEY_KEYPAIR, params);
+      EVP_PKEY_CTX_free(pkctx);
+      OSSL_PARAM_free(params);
+#else
+      DH* dh = DH_new();
+      if (dh) {
          const BIGNUM *p, *g;
-         DH_get0_pqg(c.fDH, &p, NULL, &g);
-         DH_set0_pqg(fDH, p ? BN_dup(p) : NULL, NULL, g ? BN_dup(g) : NULL);
+         DH_get0_pqg(EVP_PKEY_get0_DH(c.fDH), &p, NULL, &g);
+         DH_set0_pqg(dh, p ? BN_dup(p) : NULL, NULL, g ? BN_dup(g) : NULL);
          const BIGNUM *pub, *pri;
-         DH_get0_key(c.fDH, &pub, &pri);
-         DH_set0_key(fDH, pub ? BN_dup(pub) : NULL, pri ? BN_dup(pri) : NULL);
-         int dhrc = 0;
-         DH_check(fDH,&dhrc);
-         if (dhrc == 0)
+         DH_get0_key(EVP_PKEY_get0_DH(c.fDH), &pub, &pri);
+         DH_set0_key(dh, pub ? BN_dup(pub) : NULL, pri ? BN_dup(pri) : NULL);
+         fDH = EVP_PKEY_new();
+         EVP_PKEY_assign_DH(fDH, dh);
+      }
+#endif
+      if (fDH) {
+         if (XrdCheckDH(fDH) == 1)
             valid = 1;
       }
    }
@@ -668,14 +842,14 @@ void XrdCryptosslCipher::Cleanup()
 
    // Cleanup IV
    if (fDH) {
-      DH_free(fDH);
+      EVP_PKEY_free(fDH);
       fDH = 0;
    }
 }
 
 //____________________________________________________________________________
 bool XrdCryptosslCipher::Finalize(bool padded,
-                                  char *pub, int /*lpub*/, const char *t)
+                                  char *pub, int lpub, const char *t)
 {
    // Finalize cipher during key agreement. Should be called
    // for a cipher build with special constructor defining member fDH.
@@ -691,14 +865,14 @@ bool XrdCryptosslCipher::Finalize(bool padded,
    }
 
    char *ktmp = 0;
-   int ltmp = 0;
+   size_t ltmp = 0;
    valid = 0;
    if (pub) {
       //
       // Extract string with bignumber
       BIGNUM *bnpub = 0;
-      char *pb = strstr(pub,"---BPUB---");
-      char *pe = strstr(pub,"---EPUB--");
+      char *pb = static_cast<char*>(memmem(pub, lpub, "---BPUB---", 10));
+      char *pe = static_cast<char*>(memmem(pub, lpub, "---EPUB--", 9));
       if (pb && pe) {
          //lpub = (int)(pb-pub);
          pb += 10;
@@ -708,15 +882,57 @@ bool XrdCryptosslCipher::Finalize(bool padded,
       }
       if (bnpub) {
          // Now we can compute the cipher
-         ktmp = new char[DH_size(fDH)];
-         memset(ktmp, 0, DH_size(fDH));
+         ltmp = EVP_PKEY_size(fDH);
+         ktmp = new char[ltmp];
          if (ktmp) {
-            if (padded) {
-               ltmp = DH_compute_key_padded((unsigned char *)ktmp,bnpub,fDH);
-            } else {
-               ltmp = DH_compute_key((unsigned char *)ktmp,bnpub,fDH);
+            memset(ktmp, 0, ltmp);
+            // Create peer public key
+            EVP_PKEY_CTX *pkctx;
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+            EVP_PKEY *peer = nullptr;
+            OSSL_PARAM *params1 = nullptr;
+            EVP_PKEY_todata(fDH, EVP_PKEY_KEY_PARAMETERS, &params1);
+            OSSL_PARAM_BLD *bld = OSSL_PARAM_BLD_new();
+            OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_PUB_KEY, bnpub);
+            OSSL_PARAM *params2 = OSSL_PARAM_BLD_to_param(bld);
+            OSSL_PARAM_BLD_free(bld);
+            OSSL_PARAM *params = OSSL_PARAM_merge(params1, params2);
+            pkctx = EVP_PKEY_CTX_new_id(EVP_PKEY_DH, 0);
+            EVP_PKEY_fromdata_init(pkctx);
+            EVP_PKEY_fromdata(pkctx, &peer, EVP_PKEY_PUBLIC_KEY, params);
+            OSSL_PARAM_free(params1);
+            OSSL_PARAM_free(params2);
+            OSSL_PARAM_free(params);
+            EVP_PKEY_CTX_free(pkctx);
+#else
+            DH* dh = DH_new();
+            DH_set0_key(dh, BN_dup(bnpub), NULL);
+            EVP_PKEY *peer = EVP_PKEY_new();
+            EVP_PKEY_assign_DH(peer, dh);
+#endif
+            // Derive shared secret
+            pkctx = EVP_PKEY_CTX_new(fDH, 0);
+            EVP_PKEY_derive_init(pkctx);
+#if OPENSSL_VERSION_NUMBER >= 0x10101000L
+            EVP_PKEY_CTX_set_dh_pad(pkctx, padded);
+#endif
+            EVP_PKEY_derive_set_peer(pkctx, peer);
+            EVP_PKEY_derive(pkctx, (unsigned char *)ktmp, &ltmp);
+            EVP_PKEY_CTX_free(pkctx);
+            EVP_PKEY_free(peer);
+            if (ltmp > 0) {
+#if OPENSSL_VERSION_NUMBER < 0x10101000L
+               if (padded) {
+                  int pad = EVP_PKEY_size(fDH) - ltmp;
+                  if (pad > 0) {
+                     memmove(ktmp + pad, ktmp, ltmp);
+                     memset(ktmp, 0, pad);
+                     ltmp += pad;
+                  }
+               }
+#endif
+               valid = 1;
             }
-            if (ltmp > 0) valid = 1;
          }
          BN_free(bnpub);
          bnpub=0;
@@ -735,11 +951,11 @@ bool XrdCryptosslCipher::Finalize(bool padded,
             ltmp = (ltmp > EVP_MAX_KEY_LENGTH) ? EVP_MAX_KEY_LENGTH : ltmp;
             int ldef = EVP_CIPHER_key_length(cipher);
             // Try setting the key length
-            if (ltmp != ldef) {
+            if ((int)ltmp != ldef) {
                EVP_CipherInit_ex(ctx, cipher, 0, 0, 0, 1);
                EVP_CIPHER_CTX_set_key_length(ctx,ltmp);
                EVP_CipherInit_ex(ctx, 0, 0, (unsigned char *)ktmp, 0, 1);
-               if (ltmp == EVP_CIPHER_CTX_key_length(ctx)) {
+               if ((int)ltmp == EVP_CIPHER_CTX_key_length(ctx)) {
                   // Use the ltmp bytes at ktmp
                   SetBuffer(ltmp,ktmp);
                   deflength = 0;
@@ -775,7 +991,7 @@ int XrdCryptosslCipher::Publen()
                             "-----END DH PARAMETERS-----") + 3;
    if (fDH) {
       // minimum length of the core is 22 bytes
-      int l = 2*DH_size(fDH);
+      int l = 2 * EVP_PKEY_size(fDH);
       if (l < 22) l = 22;
       // for headers
       l += lhdr;
@@ -796,9 +1012,16 @@ char *XrdCryptosslCipher::Public(int &lpub)
    if (fDH) {
       //
       // Calculate and write public key hex
-      const BIGNUM *pub;
-      DH_get0_key(fDH, &pub, NULL);
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+      BIGNUM *pub = BN_new();
+      EVP_PKEY_get_bn_param(fDH, OSSL_PKEY_PARAM_PUB_KEY, &pub);
       char *phex = BN_bn2hex(pub);
+      BN_free(pub);
+#else
+      const BIGNUM *pub;
+      DH_get0_key(EVP_PKEY_get0_DH(fDH), &pub, NULL);
+      char *phex = BN_bn2hex(pub);
+#endif
       int lhex = strlen(phex);
       //
       // Prepare bio to export info buffer
@@ -808,7 +1031,7 @@ char *XrdCryptosslCipher::Public(int &lpub)
          char *pub = new char[ltmp];
          if (pub) {
             // Write parms first
-            PEM_write_bio_DHparams(biop,fDH);
+            PEM_write_bio_Parameters(biop, fDH);
             // Read key from BIO to buf
             BIO_read(biop,(void *)pub,ltmp);
             BIO_free(biop);
@@ -855,20 +1078,35 @@ void XrdCryptosslCipher::PrintPublic(BIGNUM *pub)
    BIO *biop = BIO_new(BIO_s_mem());
    if (biop) {
       // Use a DSA structure to export the public part
-      DSA *dsa = DSA_new();
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+      EVP_PKEY *dsa = 0;
+      OSSL_PARAM_BLD *bld = OSSL_PARAM_BLD_new();
+      OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_PUB_KEY, pub);
+      OSSL_PARAM *params = OSSL_PARAM_BLD_to_param(bld);
+      OSSL_PARAM_BLD_free(bld);
+      EVP_PKEY_CTX *pkctx = EVP_PKEY_CTX_new_id(EVP_PKEY_DSA, 0);
+      EVP_PKEY_fromdata_init(pkctx);
+      EVP_PKEY_fromdata(pkctx, &dsa, EVP_PKEY_PUBLIC_KEY, params);
+      EVP_PKEY_CTX_free(pkctx);
+      OSSL_PARAM_free(params);
+#else
+      EVP_PKEY *dsa = EVP_PKEY_new();
+      DSA *fdsa = DSA_new();
+      DSA_set0_key(fdsa, BN_dup(pub), NULL);
+      EVP_PKEY_assign_DSA(dsa, fdsa);
+#endif
       if (dsa) {
-         DSA_set0_key(dsa, BN_dup(pub), NULL);
          // Write public key to BIO
-         PEM_write_bio_DSA_PUBKEY(biop,dsa);
+         PEM_write_bio_PUBKEY(biop, dsa);
          // Read key from BIO to buf
          int lpub = Publen();
          char *bpub = new char[lpub];
          if (bpub) {
             BIO_read(biop,(void *)bpub,lpub);
-            cerr << bpub << endl;
+            std::cerr << bpub << std::endl;
             delete[] bpub;
          }
-         DSA_free(dsa);
+         EVP_PKEY_free(dsa);
       }
       BIO_free(biop);
    }
@@ -889,14 +1127,31 @@ XrdSutBucket *XrdCryptosslCipher::AsBucket()
       kXR_int32 lbuf = Length();
       kXR_int32 ltyp = Type() ? strlen(Type()) : 0;
       kXR_int32 livc = lIV;
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+      BIGNUM *p = BN_new();
+      BIGNUM *g = BN_new();
+      BIGNUM *pub = BN_new();
+      BIGNUM *pri = BN_new();
+      EVP_PKEY_get_bn_param(fDH, OSSL_PKEY_PARAM_FFC_P, &p);
+      EVP_PKEY_get_bn_param(fDH, OSSL_PKEY_PARAM_FFC_G, &g);
+      EVP_PKEY_get_bn_param(fDH, OSSL_PKEY_PARAM_PUB_KEY, &pub);
+      EVP_PKEY_get_bn_param(fDH, OSSL_PKEY_PARAM_PRIV_KEY, &pri);
+#else
       const BIGNUM *p, *g;
       const BIGNUM *pub, *pri;
-      DH_get0_pqg(fDH, &p, NULL, &g);
-      DH_get0_key(fDH, &pub, &pri);
+      DH_get0_pqg(EVP_PKEY_get0_DH(fDH), &p, NULL, &g);
+      DH_get0_key(EVP_PKEY_get0_DH(fDH), &pub, &pri);
+#endif
       char *cp = BN_bn2hex(p);
       char *cg = BN_bn2hex(g);
       char *cpub = BN_bn2hex(pub);
       char *cpri = BN_bn2hex(pri);
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+      BN_free(p);
+      BN_free(g);
+      BN_free(pub);
+      BN_free(pri);
+#endif
       kXR_int32 lp = cp ? strlen(cp) : 0;
       kXR_int32 lg = cg ? strlen(cg) : 0;
       kXR_int32 lpub = cpub ? strlen(cpub) : 0;

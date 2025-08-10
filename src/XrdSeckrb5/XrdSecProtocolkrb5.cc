@@ -32,11 +32,12 @@
 /******************************************************************************/
 
 #include <unistd.h>
-#include <ctype.h>
-#include <errno.h>
-#include <stdlib.h>
+#include <cctype>
+#include <cerrno>
+#include <cstdlib>
+#include <string>
 #include <strings.h>
-#include <stdio.h>
+#include <cstdio>
 #include <sys/param.h>
 #include <pwd.h>
 #include <sys/types.h>
@@ -78,8 +79,8 @@ extern "C" {
 
 #define XrdSecMAXPATHLEN      4096
 
-#define CLDBG(x) if (client_options & XrdSecDEBUG) cerr <<"Seckrb5: " <<x <<endl;
-#define CLPRT(x) cerr <<"Seckrb5: " <<x <<endl;
+#define CLDBG(x) if (client_options & XrdSecDEBUG) std::cerr <<"Seckrb5: " <<x <<std::endl;
+#define CLPRT(x) std::cerr <<"Seckrb5: " <<x <<std::endl;
 
 typedef  krb5_error_code krb_rc;
 
@@ -139,7 +140,8 @@ private:
 
        ~XrdSecProtocolkrb5() {} // Delete() does it all
 
-static int Fatal(XrdOucErrInfo *erp,int rc,const char *msg1,char *KP=0,int krc=0);
+static int Fatal(XrdOucErrInfo *erp, int rc, const char *msg1,
+                 const char *KP=0, int krc=0, bool isClient=false);
 static int get_krbCreds(char *KP, krb5_creds **krb_creds);
        void SetAddr(krb5_address &ipadd);
 
@@ -247,7 +249,8 @@ XrdSecCredentials *XrdSecProtocolkrb5::getCredentials(XrdSecParameters *noparm,
 // Initialize the context and get the cache default.
 //
    if ((rc = krb5_init_context(&krb_client_context)))
-      {Fatal(error, ENOPROTOOPT, "Kerberos initialization failed", Service, rc);
+      {krbClientContext.UnLock();
+       Fatal(error, ENOPROTOOPT, "Kerberos initialization failed", Service, rc);
        return (XrdSecCredentials *)0;
       }
 
@@ -256,7 +259,8 @@ XrdSecCredentials *XrdSecProtocolkrb5::getCredentials(XrdSecParameters *noparm,
 // Set the name of the default credentials cache for the Kerberos context
 //
    if ((rc = krb5_cc_set_default_name(krb_client_context, kccn)))
-      {Fatal(error, ENOPROTOOPT, "Kerberos default credentials cache setting failed", Service, rc);
+      {krbClientContext.UnLock();
+       Fatal(error, ENOPROTOOPT, "Kerberos default credentials cache setting failed", Service, rc);
        return (XrdSecCredentials *)0;
       }
 
@@ -265,7 +269,8 @@ XrdSecCredentials *XrdSecProtocolkrb5::getCredentials(XrdSecParameters *noparm,
 // Obtain the default cache location
 //
    if ((rc = krb5_cc_default(krb_client_context, &krb_client_ccache)))
-      {Fatal(error, ENOPROTOOPT, "Unable to locate cred cache", Service, rc);
+      {krbClientContext.UnLock();
+       Fatal(error, ENOPROTOOPT, "Unable to locate cred cache", Service, rc);
        return (XrdSecCredentials *)0;
       }
 
@@ -415,7 +420,9 @@ int XrdSecProtocolkrb5::Authenticate(XrdSecCredentials *cred,
    krb5_data         inbuf;                 /* Kerberos data */
    krb5_address      ipadd;
    krb_rc rc = 0;
-   char *iferror = 0;
+   const char *iferror = 0;
+   std::string cPrincipal;
+   bool isCP = false;
 
 // Check if we have any credentials or if no credentials really needed.
 // In either case, use host name as client name
@@ -446,7 +453,7 @@ int XrdSecProtocolkrb5::Authenticate(XrdSecCredentials *cred,
 //
    if (Step > 0)
       {if ((rc = exp_krbTkn(cred, error)))
-          iferror = (char *)"Unable to export the token to file";
+          iferror = "Unable to export the token to file";
        if (rc && iferror) {
           krbContext.UnLock();
           return Fatal(error, EINVAL, iferror, Principal, rc);
@@ -477,12 +484,12 @@ int XrdSecProtocolkrb5::Authenticate(XrdSecCredentials *cred,
    krbContext.Lock();
 
 // Check if whether the IP address in the credentials must match that of
-// the incomming host.
+// the incoming host.
 //
    CLDBG("Context Locked");
    if (!(XrdSecProtocolkrb5::options & XrdSecNOIPCHK))
       {SetAddr(ipadd);
-       iferror = (char *)"Unable to validate ip address;";
+       iferror = "Unable to validate ip address;";
        if (!(rc=krb5_auth_con_init(krb_context, &AuthContext)))
              rc=krb5_auth_con_setaddrs(krb_context, AuthContext, NULL, &ipadd);
       }
@@ -493,11 +500,30 @@ int XrdSecProtocolkrb5::Authenticate(XrdSecCredentials *cred,
       {if ((rc = krb5_rd_req(krb_context, &AuthContext, &inbuf,
                             (krb5_const_principal)krb_principal,
                              krb_keytab, NULL, &Ticket)))
-           iferror = (char *)"Unable to authenticate credentials;";
+           iferror = "Unable to authenticate credentials;";
        else if ((rc = krb5_aname_to_localname(krb_context,
                                   Ticket->enc_part2->client,
                                   sizeof(CName)-1, CName)))
-             iferror = (char *)"Unable to extract client name;";
+             iferror = "Unable to get client localname";
+
+       if (rc)
+          {char* cpName;
+           int ec;
+           isCP = true;
+           if (!Ticket || !Ticket->enc_part2)
+               cPrincipal = "[principal not available]";
+           else if ((ec = krb5_unparse_name(krb_context,
+                          (krb5_const_principal)Ticket->enc_part2->client,
+                          (char **)&cpName)))
+              {char mBuff[1024];
+               snprintf(mBuff, sizeof(mBuff), 
+                       "[principal unparse failed; %s]", krb_etxt(ec));
+               cPrincipal = mBuff;
+              } else {
+               cPrincipal = cpName;
+               krb5_free_unparsed_name(krb_context, cpName);
+              }
+          }
       }
 
 // Make sure the name is null-terminated
@@ -524,7 +550,8 @@ int XrdSecProtocolkrb5::Authenticate(XrdSecCredentials *cred,
 // Diagnose any errors
 //
    if (rc && iferror)
-      return Fatal(error, EACCES, iferror, Principal, rc);
+      return Fatal(error, EACCES, iferror,
+                   (isCP ? cPrincipal.c_str() : Principal), rc, isCP);
 
 // All done
 //
@@ -593,13 +620,13 @@ int XrdSecProtocolkrb5::Init(XrdOucErrInfo *erp, char *KP, char *kfn)
 // Now, extract the "principal/instance@realm" from the stream
 //
    if ((rc = krb5_parse_name(krb_context,KP,&krb_principal)))
-     return Fatal(erp, EINVAL, "Cannot parse service name", KP, rc);
+     return Fatal(erp, EINVAL, "Cannot parse service principal name", KP, rc);
 
 // Establish the correct principal to use
 //
    if ((rc = krb5_unparse_name(krb_context,(krb5_const_principal)krb_principal,
                               (char **)&Principal)))
-      return Fatal(erp, EINVAL, "Unable to unparse principal;", KP, rc);
+      return Fatal(erp, EINVAL, "Unable to unparse service principal;", KP, rc);
 
 // All done
 //
@@ -614,7 +641,7 @@ int XrdSecProtocolkrb5::Init(XrdOucErrInfo *erp, char *KP, char *kfn)
 /******************************************************************************/
 
 int XrdSecProtocolkrb5::Fatal(XrdOucErrInfo *erp, int rc, const char *msg,
-                             char *KP, int krc)
+                             const char *KP, int krc, bool isClient)
 {
    const char *msgv[8];
    int k, i = 0;
@@ -624,13 +651,14 @@ int XrdSecProtocolkrb5::Fatal(XrdOucErrInfo *erp, int rc, const char *msg,
    if (krc)  {msgv[i++] = "; ";           //2
               msgv[i++] =  krb_etxt(krc); //3
              }
-   if (KP)   {msgv[i++] = " (p=";         //4
+   if (KP)   {const char* who = (isClient ? "(client=" : "(server=");
+              msgv[i++] = who;            //4
               msgv[i++] = KP;             //5
               msgv[i++] = ").";           //6
              }
    if (erp) erp->setErrInfo(rc, msgv, i);
-      else {for (k = 0; k < i; k++) cerr <<msgv[k];
-            cerr <<endl;
+      else {for (k = 0; k < i; k++) std::cerr <<msgv[k];
+            std::cerr <<std::endl;
            }
 
    return -1;
@@ -902,7 +930,7 @@ char  *XrdSecProtocolkrb5Init(const char     mode,
    if (parms) strlcpy(parmbuff, parms, sizeof(parmbuff));
       else {char *msg = (char *)"Seckrb5: Kerberos parameters not specified.";
             if (erp) erp->setErrInfo(EINVAL, msg);
-               else cerr <<msg <<endl;
+               else std::cerr <<msg <<std::endl;
             return (char *)0;
            }
 
@@ -933,7 +961,7 @@ char  *XrdSecProtocolkrb5Init(const char     mode,
    if (!KPrincipal)
       {char *msg = (char *)"Seckrb5: Kerberos principal not specified.";
        if (erp) erp->setErrInfo(EINVAL, msg);
-          else cerr <<msg <<endl;
+          else std::cerr <<msg <<std::endl;
        return (char *)0;
       }
 
@@ -1018,7 +1046,7 @@ XrdSecProtocol *XrdSecProtocolkrb5Object(const char              mode,
        if (!KPrincipal || !*KPrincipal)
           {char *msg = (char *)"Seckrb5: Kerberos principal not specified.";
            if (erp) erp->setErrInfo(EINVAL, msg);
-              else cerr <<msg <<endl;
+              else std::cerr <<msg <<std::endl;
            return (XrdSecProtocol *)0;
           }
       }
@@ -1028,7 +1056,7 @@ XrdSecProtocol *XrdSecProtocolkrb5Object(const char              mode,
    if (!(prot = new XrdSecProtocolkrb5(KPrincipal, hostname, endPoint)))
       {char *msg = (char *)"Seckrb5: Insufficient memory for protocol.";
        if (erp) erp->setErrInfo(ENOMEM, msg);
-          else cerr <<msg <<endl;
+          else std::cerr <<msg <<std::endl;
        return (XrdSecProtocol *)0;
       }
 

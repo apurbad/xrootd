@@ -10,6 +10,8 @@
 #define TRACE_IOPS      0x0002
 #define TRACE_IOLOAD    0x0004
 #define TRACE_DEBUG     0x0008
+#define TRACE_FILES     0x0010
+#define TRACE_CONNS     0x0020
 
 #ifndef NODEBUG
 
@@ -22,11 +24,11 @@
 
 #define TRACE(act, x) \
    if (XRD_TRACE What & TRACE_ ## act) \
-      {XRD_TRACE Beg(TraceID);   cerr <<x; XRD_TRACE End();}
+      {XRD_TRACE Beg(TraceID);   std::cerr <<x; XRD_TRACE End();}
 
 #define TRACEI(act, x) \
    if (XRD_TRACE What & TRACE_ ## act) \
-      {XRD_TRACE Beg(TraceID,TRACELINK->ID); cerr <<x; \
+      {XRD_TRACE Beg(TraceID,TRACELINK->ID); std::cerr <<x; \
        XRD_TRACE End();}
 
 #define TRACING(x) XRD_TRACE What & x

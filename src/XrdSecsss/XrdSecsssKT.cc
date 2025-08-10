@@ -29,10 +29,11 @@
 /******************************************************************************/
 
 #include <fcntl.h>
-#include <stdio.h>
+#include <iostream>
+#include <cstdio>
 #include <stddef.h>
-#include <stdlib.h>
-#include <string.h>
+#include <cstdlib>
+#include <cstring>
 #include <sys/time.h>
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -42,7 +43,11 @@
 #include "XrdOuc/XrdOucErrInfo.hh"
 #include "XrdOuc/XrdOucStream.hh"
 #include "XrdOuc/XrdOucUtils.hh"
-#include "XrdSys/XrdSysHeaders.hh"
+#include "XrdSys/XrdSysE2T.hh"
+
+#ifndef ENODATA
+#define ENODATA ENOATTR
+#endif
   
 /******************************************************************************/
 /*                    S t a t i c   D e f i n i t i o n s                     */
@@ -199,7 +204,7 @@ int XrdSecsssKT::delKey(ktEnt &ktDel)
 /*                                g e t K e y                                 */
 /******************************************************************************/
   
-int XrdSecsssKT::getKey(ktEnt &theEnt)
+int XrdSecsssKT::getKey(ktEnt &theEnt, bool andKeyID)
 {
    ktEnt *ktP, *ktN;
 
@@ -208,19 +213,23 @@ int XrdSecsssKT::getKey(ktEnt &theEnt)
    myMutex.Lock();
    ktP = ktList;
 
-// Find first key by key name (used normally by clients) or by keyID
+// Find first key by key name (used normally by clients), by keyID, or both
 //
-   if (!*theEnt.Data.Name)
-      {if (theEnt.Data.ID >= 0) 
-          while(ktP && ktP->Data.ID != theEnt.Data.ID)  ktP = ktP->Next;
-      }
-      else {while(ktP && strcmp(ktP->Data.Name,theEnt.Data.Name)) ktP=ktP->Next;
-            while(ktP && ktP->Data.Exp <= time(0))
-                 {if (!(ktN=ktP->Next) 
-                  ||  strcmp(ktN->Data.Name,theEnt.Data.Name)) break;
-                  ktP = ktN;
-                 }
-           }
+     if (!*theEnt.Data.Name)
+        {if (theEnt.Data.ID >= 0)
+            while(ktP && ktP->Data.ID != theEnt.Data.ID)  ktP = ktP->Next;
+        }
+   else if (andKeyID)
+        {while(ktP && ((ktP->Data.ID != theEnt.Data.ID)
+            || strcmp(ktP->Data.Name,theEnt.Data.Name))) ktP=ktP->Next;
+        }
+   else {while(ktP && strcmp(ktP->Data.Name,theEnt.Data.Name)) ktP=ktP->Next;
+         while(ktP && ktP->Data.Exp <= time(0))
+              {if (!(ktN=ktP->Next) 
+               ||  strcmp(ktN->Data.Name,theEnt.Data.Name)) break;
+               ktP = ktN;
+              }
+        }
 
 // If we found a match, export it
 //
@@ -362,10 +371,11 @@ int XrdSecsssKT::Rewrite(int Keep, int &numKeys, int &numTot, int &numExp)
          if (ktP->Data.Exp && ktP->Data.Exp <= time(0)) {numExp++; continue;}
          if (!isKey(ktCurr, ktP, 0)) {ktCurr.NUG(ktP); numID = 0;}
             else if (Keep && numID >= Keep) continue;
-         n = sprintf(buff, "%s0 u:%s g:%s n:%s N:%lld c:%ld e:%ld f:%lld k:",
+         n = sprintf(buff, "%s0 u:%s g:%s n:%s N:%lld c:%lld e:%lld f:%lld k:",
                     (numKeys ? "\n" : ""),
                      ktP->Data.User,ktP->Data.Grup,ktP->Data.Name,ktP->Data.ID,
-                     ktP->Data.Crt, ktP->Data.Exp, ktP->Data.Flags);
+                     (long long) ktP->Data.Crt, (long long) ktP->Data.Exp,
+                     ktP->Data.Flags);
          numID++; numKeys++; keyB2X(ktP, kbuff);
          if (write(ktFD, buff, n) < 0
          ||  write(ktFD, kbuff, ktP->Data.Len*2) < 0) break;
@@ -398,13 +408,13 @@ int XrdSecsssKT::eMsg(const char *epname, int rc,
                       const char *txt1, const char *txt2,
                       const char *txt3, const char *txt4)
 {
-              cerr <<"Secsss (" << epname <<"): ";
-              cerr <<txt1;
-   if (txt2)  cerr <<txt2;
-   if (txt3)  cerr <<txt3;
-   if (txt4)  cerr <<txt4;
-  {if (rc>0) {cerr <<"; " <<strerror(rc);}}
-              cerr <<endl;
+              std::cerr <<"Secsss (" << epname <<"): ";
+              std::cerr <<txt1;
+   if (txt2)  std::cerr <<txt2;
+   if (txt3)  std::cerr <<txt3;
+   if (txt4)  std::cerr <<txt4;
+  {if (rc>0) {std::cerr <<"; " <<XrdSysE2T(rc);}}
+              std::cerr <<"\n" <<std::endl;
 
    return (rc ? (rc < 0 ? rc : -rc) : -1);
 }
@@ -418,7 +428,7 @@ XrdSecsssKT::ktEnt* XrdSecsssKT::getKeyTab(XrdOucErrInfo *eInfo,
 {
    static const int altMode = S_IRWXG | S_IRWXO;
    XrdOucStream myKT;
-   int ktFD, retc, tmpID, recno = 0, NoGo = 0;
+   int ktFD = -1, retc, tmpID, recno = 0, NoGo = 0;
    const char *What = 0, *ktFN;
    char *lp, *tp, rbuff[64];
    ktEnt *ktP, *ktPP, *ktNew, *ktBase = 0;
@@ -444,7 +454,11 @@ XrdSecsssKT::ktEnt* XrdSecsssKT::getKeyTab(XrdOucErrInfo *eInfo,
 
 // Attach the fd to the stream
 //
-   myKT.Attach(ktFD);
+   if (ktFD < 0 || myKT.Attach(ktFD) != 0)
+      {if (eInfo) eInfo->setErrInfo(EBADF, "Unable to attach to keytab file descriptor for reading.");
+       eMsg("getKeyTab", -1, "Unable to attach to keytab file descriptor.");
+       return nullptr;
+      }
 
 // Now start reading the keytable which always has the form:
 //
@@ -501,7 +515,7 @@ do{while((lp = myKT.GetLine()))
 
 // Check if an error should be returned
 //
-   if (!NoGo) eInfo->setErrCode(0);
+   if (eInfo && !NoGo) eInfo->setErrCode(0);
 
 // All done
 //
@@ -620,7 +634,7 @@ XrdSecsssKT::ktEnt *XrdSecsssKT::ktDecode0(XrdOucStream  &kTab,
    };
    static const int ktDnum = sizeof(ktDesc)/sizeof(ktDesc[0]);
 
-   ktEnt *ktNew = new ktEnt;
+   ktEnt ktNew{};
    const char *Prob = 0, *What = "Whatever";
    char Tag, *Dest, *ep, *tp;
    long long nVal;
@@ -634,11 +648,11 @@ while((tp = kTab.GetToken()) && !Prob)
       if (*tp++ == ':')
          for (i = 0; i < ktDnum; i++)
              if (ktDesc[i].Tag == Tag)
-                {Dest = (char *)&(ktNew->Data) + ktDesc[i].Offset;
+                {Dest = (char *)&(ktNew.Data) + ktDesc[i].Offset;
                  Have |= ktDesc[i].What; What = ktDesc[i].Name;
                  if (ktDesc[i].Ctl)
                     {if ((int)strlen(tp) > ktDesc[i].Ctl) Prob=" is too long";
-                        else if (Tag == 'k') keyX2B(ktNew, tp);
+                        else if (Tag == 'k') keyX2B(&ktNew, tp);
                                 else strcpy(Dest, tp);
                     } else {
                      nVal = strtoll(tp, &ep, 10);
@@ -653,13 +667,13 @@ while((tp = kTab.GetToken()) && !Prob)
 // If no problem, make sure we have the essential elements
 //
    if (!Prob)
-      {if (!(Have & haveGRP)) strcpy(ktNew->Data.Grup, "nogroup");
-       if (!(Have & haveNAM)) strcpy(ktNew->Data.Name, "nowhere");
-          else {int n = strlen(ktNew->Data.Name);
-                if (ktNew->Data.Name[n-1] == '+')
-                   ktNew->Data.Opts |= ktEnt::noIPCK;
+      {if (!(Have & haveGRP)) strcpy(ktNew.Data.Grup, "nogroup");
+       if (!(Have & haveNAM)) strcpy(ktNew.Data.Name, "nowhere");
+          else {int n = strlen(ktNew.Data.Name);
+                if (ktNew.Data.Name[n-1] == '+')
+                   ktNew.Data.Opts |= ktEnt::noIPCK;
                }
-       if (!(Have & haveUSR)) strcpy(ktNew->Data.User, "nobody");
+       if (!(Have & haveUSR)) strcpy(ktNew.Data.User, "nobody");
             if (!(Have & haveKEY)) {What = "keyval"; Prob = " not found";}
        else if (!(Have & haveNUM)) {What = "keynum"; Prob = " not found";}
       }
@@ -669,20 +683,21 @@ while((tp = kTab.GetToken()) && !Prob)
    if (Prob)
       {const char *eVec[] = {What, Prob};
        if (eInfo) eInfo->setErrInfo(-1, eVec, 2);
-       delete ktNew;
        return 0;
       }
 
 // Set special value options
 //
-   if (!strcmp(ktNew->Data.Grup, "anygroup"))       
-      ktNew->Data.Opts|=ktEnt::anyGRP;
-      else if (!strcmp(ktNew->Data.Grup, "usrgroup"))
-              ktNew->Data.Opts|=ktEnt::usrGRP;
-   if (!strcmp(ktNew->Data.User, "anybody"))
-      ktNew->Data.Opts|=ktEnt::anyUSR;
+   if (!strcmp(ktNew.Data.Grup, "anygroup"))
+      ktNew.Data.Opts|=ktEnt::anyGRP;
+      else if (!strcmp(ktNew.Data.Grup, "usrgroup"))
+              ktNew.Data.Opts|=ktEnt::usrGRP;
+   if (!strcmp(ktNew.Data.User, "anybody"))
+      ktNew.Data.Opts|=ktEnt::anyUSR;
+      else if (!strcmp(ktNew.Data.User, "allusers"))
+              ktNew.Data.Opts|=ktEnt::allUSR;
 
 // All done
 //
-   return ktNew;
+   return new ktEnt(ktNew);
 }

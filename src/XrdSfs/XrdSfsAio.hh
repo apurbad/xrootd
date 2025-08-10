@@ -29,6 +29,7 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
+#include <cstdint>
 #include <signal.h>
 #include <sys/types.h>
 // _POSIX_ASYNCHRONOUS_IO, if it is defined, is in unistd.h.
@@ -58,7 +59,8 @@ class XrdSfsAio
 {
 public:
 
-struct aiocb sfsAio;
+struct aiocb  sfsAio;
+uint32_t     *cksVec; // For pgRead and pgWrite
 
 ssize_t      Result; // If >= 0 valid result; else is -errno
 
@@ -85,7 +87,8 @@ virtual void Recycle() = 0;
 #endif
                          sfsAio.aio_sigevent.sigev_notify = SIGEV_SIGNAL;
                          sfsAio.aio_reqprio = 0;
-                         TIdent = (char *)"";
+                         cksVec = 0;
+                         TIdent = "";
                         }
 virtual     ~XrdSfsAio() {}
 };

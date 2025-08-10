@@ -125,7 +125,7 @@ namespace PyXRootD
   {
       static PyObject* Convert( XrdCl::StatInfo *info )
       {
-        return Py_BuildValue("{sOsOsOsOsO}",
+        return Py_BuildValue("{sNsNsNsNsN}",
             "id",         Py_BuildValue("s", info->GetId().c_str()),
             "size",       Py_BuildValue("k", info->GetSize()),
             "flags",      Py_BuildValue("I", info->GetFlags()),
@@ -194,10 +194,11 @@ namespace PyXRootD
           for ( unsigned int i = 0; i < list->size(); ++i ) {
             XrdCl::HostInfo *info = &list->at( i );
 
-            PyObject *url = PyObject_CallObject( (PyObject*) &URLType,
-                Py_BuildValue( "(s)", info->url.GetURL().c_str() ) );
+            PyObject *args = Py_BuildValue( "(s)", info->url.GetURL().c_str() ) ;
+            PyObject *url = PyObject_CallObject( (PyObject*) &URLType, args );
+            Py_XDECREF( args );
 
-            PyObject *pyhostinfo = Py_BuildValue( "{sIsIsOsO}",
+            PyObject *pyhostinfo = Py_BuildValue( "{sIsIsNsO}",
                 "flags",         info->flags,
                 "protocol",      info->protocol,
                 "load_balancer", PyBool_FromLong(info->loadBalancer),
@@ -222,7 +223,7 @@ namespace PyXRootD
         for ( XrdCl::LocationInfo::Iterator it = info->Begin(); it < info->End();
             ++it ) {
           PyList_SET_ITEM( locationList, i,
-              Py_BuildValue( "{sssIsIsOsO}",
+              Py_BuildValue( "{sssIsIsNsN}",
                   "address",     it->GetAddress().c_str(),
                   "type",        it->GetType(),
                   "accesstype",  it->GetAccessType(),
@@ -270,8 +271,10 @@ namespace PyXRootD
 
           PyObject *buffer = PyBytes_FromStringAndSize( (const char *) chunk.buffer,
                                                         chunk.length );
+          delete[] (char*) chunk.buffer;
+
           PyList_SET_ITEM( pychunks, i,
-              Py_BuildValue( "{sOsOsO}",
+              Py_BuildValue( "{sNsNsO}",
                   "offset", Py_BuildValue( "k", chunk.offset ),
                   "length", Py_BuildValue( "I", chunk.length ),
                   "buffer", buffer ) );
@@ -387,6 +390,50 @@ namespace PyXRootD
             PyList_SetItem(pylist, i, Py_BuildValue("s", str.c_str()));
           }
         }
+        return pylist;
+      }
+  };
+
+  template<> struct PyDict<std::vector<XrdCl::XAttrStatus>>
+  {
+      static PyObject* Convert( std::vector<XrdCl::XAttrStatus> *resp )
+      {
+        PyObject *pylist = NULL;
+
+        if( resp )
+        {
+          pylist = PyList_New( resp->size() );
+          for( size_t i = 0; i < resp->size(); ++i )
+          {
+            XrdCl::XAttrStatus &xst = (*resp)[i];
+            PyObject *pystatus = ConvertType( &xst.status );
+            PyList_SetItem( pylist, i, Py_BuildValue( "(sO)", xst.name.c_str(), pystatus ) );
+            Py_DECREF( pystatus );
+          }
+        }
+
+        return pylist;
+      }
+  };
+
+  template<> struct PyDict<std::vector<XrdCl::XAttr>>
+  {
+      static PyObject* Convert( std::vector<XrdCl::XAttr> *resp )
+      {
+        PyObject *pylist = NULL;
+
+        if( resp )
+        {
+          pylist = PyList_New( resp->size() );
+          for( size_t i = 0; i < resp->size(); ++i )
+          {
+            XrdCl::XAttr &xattr = (*resp)[i];
+            PyObject *pystatus = ConvertType( &xattr.status );
+            PyList_SetItem( pylist, i, Py_BuildValue( "(ssO)", xattr.name.c_str(), xattr.value.c_str(), pystatus ) );
+            Py_DECREF( pystatus );
+          }
+        }
+
         return pylist;
       }
   };

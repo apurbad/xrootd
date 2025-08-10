@@ -36,7 +36,7 @@
 /* (OpenSSL, Botan, ...)                                                      */
 /*                                                                            */
 /* ************************************************************************** */
-#include <time.h>
+#include <ctime>
 
 #include "XrdCrypto/XrdCryptoX509.hh"
 #include "XrdCrypto/XrdCryptoTrace.hh"
@@ -104,12 +104,10 @@ int XrdCryptoX509::BitStrength()
 //_____________________________________________________________________________
 bool XrdCryptoX509::IsValid(int when)
 {
-   // Check validity at local time 'when'. Use when =0 (default) to check
+   // Check validity at UTC time 'when'. Use when =0 (default) to check
    // at present time.
 
    int now = (when > 0) ? when : (int)time(0);
-   // Correct for time zone (certificate times are UTC plus, eventually, DST
-   now -= XrdCryptoTZCorr();
    return (now >= (NotBefore()-kAllowedSkew) && now <= NotAfter());
 }
 
@@ -120,8 +118,6 @@ bool XrdCryptoX509::IsExpired(int when)
    // at present time.
 
    int now = (when > 0) ? when : (int)time(0);
-   // Correct for time zone (certificate times are UTC plus, eventually, DST
-   now -= XrdCryptoTZCorr();
    return (now > NotAfter());
 }
 
@@ -284,7 +280,8 @@ bool XrdCryptoX509::MatchHostnames(const char * match_pattern, const char * host
     bool theydomatch = false;
 
     // Get first token of both strings
-    int mfrom = -1, hfrom = -1;
+//  int mfrom = -1, hfrom = -1;
+    int mfrom =  0, hfrom =  0;
     XrdOucString mfirst, hfirst;
     if (((mfrom = mpatt.tokenize(mfirst, mfrom, '.')) != -1) &&
         ((hfrom = hname.tokenize(hfirst, hfrom, '.')) != -1)) {

@@ -26,10 +26,10 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <inttypes.h>
-#include <stdio.h>
-#include <string.h>
-#include <errno.h>
+#include <cinttypes>
+#include <cstdio>
+#include <cstring>
+#include <cerrno>
 #include <netinet/in.h>
 #include <sys/types.h>
 
@@ -302,11 +302,11 @@ void XrdSutBuffer::Message(const char *prepose)
          if (bp->size > 0 && bp->buffer) {
             if (pripre) {
                XrdOucString premsg(prepose);
-               cerr << premsg << endl;
+               std::cerr << premsg << std::endl;
                pripre = 0;
             }
             XrdOucString msg(bp->buffer,bp->size);
-            cerr << msg << endl;
+            std::cerr << msg << std::endl;
          }
       }
       // Get next

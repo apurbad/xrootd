@@ -27,10 +27,10 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <errno.h>
+#include <cerrno>
 #include <fcntl.h>
 #include <signal.h>
-#include <stdio.h>
+#include <cstdio>
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -41,7 +41,9 @@
 
 #include "Xrd/XrdJob.hh"
 #include "Xrd/XrdScheduler.hh"
+#include "XrdOuc/XrdOucTrace.hh"    // For ABI compatibility only!
 #include "XrdSys/XrdSysError.hh"
+#include "XrdSys/XrdSysLogger.hh"
 
 #define XRD_TRACE XrdTrace->
 #include "Xrd/XrdTrace.hh"
@@ -92,76 +94,82 @@ void *XrdStartWorking(void *carg)
 /*                           C o n s t r u c t o r                            */
 /******************************************************************************/
   
+XrdScheduler::XrdScheduler(XrdSysError *eP, XrdSysTrace *tP,
+                           int minw, int maxw, int maxi)
+              : XrdJob("underused thread monitor"),
+                 XrdTraceOld(0), WorkAvail(0, "sched work")
+{
+   Boot(eP, tP, minw, maxw, maxi);
+}
+ 
+/******************************************************************************/
+
+  
 XrdScheduler::XrdScheduler(XrdSysError *eP, XrdOucTrace *tP,
                            int minw, int maxw, int maxi)
               : XrdJob("underused thread monitor"),
-                WorkAvail(0, "sched work")
+                XrdTraceOld(tP), WorkAvail(0, "sched work")
 {
-    struct rlimit rlim;
 
-    XrdLog      =  eP;
-    XrdTrace    =  tP;
-    min_Workers =  minw;
-    max_Workers =  maxw;
-    max_Workidl =  maxi;
-    num_Workers =  0;
-    num_JobsinQ =  0;
-    stk_Workers =  maxw - (maxw/4*3);
-    idl_Workers =  0;
-    num_Jobs    =  0;
-    max_QLength =  0;
-    num_TCreate =  0;
-    num_TDestroy=  0;
-    num_Layoffs =  0;
-    num_Limited =  0;
-    firstPID    =  0;
-    WorkFirst = WorkLast = TimerQueue = 0;
-
-// Make sure we are using the maximum number of threads allowed (Linux only)
+// Invoke the main initialization function with a new style trace object
 //
-#if defined(__linux__) && defined(RLIMIT_NPROC)
+   Boot(eP, new XrdSysTrace("Xrd", eP->logger()), minw, maxw, maxi);
+}
 
-// First determine the absolute maximum we can have
-//
-   rlim_t theMax = MAX_SCHED_PROCS;
-   int pdFD, rdsz;
-   if ((pdFD = open("/proc/sys/kernel/pid_max", O_RDONLY)) >= 0)
-      {char pmBuff[32];
-       if ((rdsz = read(pdFD, pmBuff, sizeof(pmBuff))) > 0)
-          {rdsz = atoi(pmBuff);
-           if (rdsz < 16384) theMax = 16384; // This is unlikely
-              else if (rdsz < MAX_SCHED_PROCS)
-                      theMax = static_cast<rlim_t>(rdsz-2000);
-          }
-       close(pdFD);
-      }
+/******************************************************************************/
 
-// Get the resource thread limit and set to maximum. In Linux this may be -1
-// to indicate useless infnity, so we have to come up with a number, sigh.
+// This constructor creates a self contained scheduler.
 //
-   if (!getrlimit(RLIMIT_NPROC, &rlim))
-      {if (rlim.rlim_max == RLIM_INFINITY || rlim.rlim_max > theMax)
-          {rlim.rlim_cur = theMax;
-           setrlimit(RLIMIT_NPROC, &rlim);
-          } else {
-           if (rlim.rlim_cur != rlim.rlim_max)
-              {rlim.rlim_cur = rlim.rlim_max;
-               setrlimit(RLIMIT_NPROC, &rlim);
-              }
-          }
-      }
+XrdScheduler::XrdScheduler(int minw, int maxw, int maxi)
+              : XrdJob("underused thread monitor"),
+                XrdTraceOld(0), WorkAvail(0, "sched work")
+{
+   XrdSysLogger *Logger;
+   int eFD;
 
-// Readjust our internal maximum to be the actual maximum
+// Get a file descriptor mirroring standard error
 //
-   if (!getrlimit(RLIMIT_NPROC, &rlim))
-      {if (rlim.rlim_cur == RLIM_INFINITY || rlim.rlim_cur > theMax)
-               max_Workers = static_cast<int>(theMax);
-          else max_Workers = static_cast<int>(rlim.rlim_cur);
-      }
+#if ( defined(__linux__) || defined(__GNU__) ) && defined(F_DUPFD_CLOEXEC)
+   eFD = fcntl(STDERR_FILENO, F_DUPFD_CLOEXEC, 0);
+#else
+   eFD = dup(STDERR_FILENO);
+   fcntl(eFD, F_SETFD, FD_CLOEXEC);
 #endif
 
+// Now we need to get a logger object. We make this a real dumb one.
+//
+   Logger = new XrdSysLogger(eFD, 0);
+   XrdLog = new XrdSysError(Logger);
+
+// Now get a trace object
+//
+   XrdTrace = new XrdSysTrace("Xrd", Logger);
+   if (getenv("XRDDEBUG") != 0) XrdTrace->What = TRACE_SCHED;
+
+// Set remaining values. We do no use maximum possible threads here.
+//
+   Init(minw, maxw, maxi);
 }
- 
+
+/******************************************************************************/
+/* Private:                         B o o t                                   */
+/******************************************************************************/
+
+void XrdScheduler::Boot(XrdSysError *eP, XrdSysTrace *tP,
+                        int minw, int maxw, int maxi)
+{
+// Perform common initialization
+//
+   XrdLog      =  eP;
+   XrdTrace    =  tP;
+   Init(minw, maxw, maxi);
+
+  // possibly raise the nproc limit. In some cases (e.g. for servers)
+  // this method may be called again with argument true, to allow
+  // a more stringent limit than the current one.
+  setNproc(false);
+}
+
 /******************************************************************************/
 /*                            D e s t r u c t o r                             */
 /******************************************************************************/
@@ -460,6 +468,80 @@ void XrdScheduler::Schedule(XrdJob *jp, time_t atime)
 }
 
 /******************************************************************************/
+/*                               s e t N p r o c                              */
+/******************************************************************************/
+  
+void XrdScheduler::setNproc(const bool limlower)
+{
+  // If supported change the NPROC resource limit and set max_Workers.
+  // Caller can select leaving or increasing the limit, or potentially
+  // setting a more restrictive limit than the current one.
+
+  // If this method is called the setParms method should be called after, so
+  // that a caller supplied value of max_Workers can override the value here.
+
+  // We attempt to set the limit to our maximum supported threads in the
+  // XrdScheduler (with a margin for pid_max).
+
+// Reset the soft limit applied to our process concerning the system wide
+// number threads for our uid (Linux only).
+//
+#if ( defined(__linux__) || defined(__GNU__) || (defined(__FreeBSD_kernel__) && defined(__GLIBC__)) ) && defined(RLIMIT_NPROC)
+
+   struct rlimit rlim;
+
+// First determine the absolute maximum we can have
+//
+   rlim_t theMax = MAX_SCHED_PROCS;
+   int pdFD, rdsz;
+   if ((pdFD = open("/proc/sys/kernel/pid_max", O_RDONLY)) >= 0)
+      {char pmBuff[32];
+       if ((rdsz = read(pdFD, pmBuff, sizeof(pmBuff))) > 0)
+          {rdsz = atoi(pmBuff);
+           if (rdsz < 16384) theMax = 16384; // This is unlikely
+              else if (rdsz < MAX_SCHED_PROCS)
+                      theMax = static_cast<rlim_t>(rdsz-2000);
+          }
+       close(pdFD);
+      }
+
+// We allow disabling the NPROC setting entirely.
+//
+   const bool setnp = (getenv("XRDLEAVENPROC") == 0);
+
+// Get the resource thread limit and set to maximum. In Linux this may be -1
+// to indicate useless infnity, so we have to come up with a number, sigh.
+//
+   if (setnp && !getrlimit(RLIMIT_NPROC, &rlim))
+      {if (rlim.rlim_max == RLIM_INFINITY || rlim.rlim_max > theMax)
+          {if (limlower || (rlim.rlim_cur != RLIM_INFINITY && rlim.rlim_cur < theMax))
+              {rlim.rlim_cur = theMax;
+               setrlimit(RLIMIT_NPROC, &rlim);
+              }
+          } else {
+           if (rlim.rlim_cur != rlim.rlim_max)
+              {rlim.rlim_cur = rlim.rlim_max;
+               setrlimit(RLIMIT_NPROC, &rlim);
+              }
+          }
+      }
+
+// Readjust our internal maximum to be the actual maximum
+//
+   if (!getrlimit(RLIMIT_NPROC, &rlim))
+      {if (rlim.rlim_cur == RLIM_INFINITY || rlim.rlim_cur > theMax)
+               max_Workers = static_cast<int>(theMax);
+          else max_Workers = static_cast<int>(rlim.rlim_cur);
+      }
+
+// The above may allow way too many threads. We make sure that the default
+// maximum threads is adhered to.
+//
+   if (max_Workers > DFL_SCHED_PROCS) max_Workers = DFL_SCHED_PROCS;
+#endif
+}
+
+/******************************************************************************/
 /*                              s e t P a r m s                               */
 /******************************************************************************/
   
@@ -511,8 +593,13 @@ void XrdScheduler::setParms(int minw, int maxw, int avlw, int maxi, int once)
   
 void XrdScheduler::Start() // Serialized one time call!
 {
-    int retc, numw;
-    pthread_t tid;
+   int retc, numw;
+   pthread_t tid;
+
+// Provide ABI compatibility for XrdOucTrace which is deprecated!
+//
+   if (getenv("XRDDEBUG") != 0) XrdTrace->What = TRACE_SCHED;
+      else if (XrdTraceOld) XrdTrace->What |= XrdTraceOld->What;
 
 // Start a time based scheduler
 //
@@ -542,7 +629,7 @@ int XrdScheduler::Stats(char *buff, int blen, int do_sync)
 {
     int cnt_Jobs, cnt_JobsinQ, xam_QLength, cnt_Workers, cnt_idl;
     int cnt_TCreate, cnt_TDestroy, cnt_Limited;
-    static char statfmt[] = "<stats id=\"sched\"><jobs>%d</jobs>"
+    static const char statfmt[] = "<stats id=\"sched\"><jobs>%d</jobs>"
                 "<inq>%d</inq><maxinq>%d</maxinq>"
                 "<threads>%d</threads><idle>%d</idle>"
                 "<tcr>%d</tcr><tde>%d</tde>"
@@ -648,6 +735,29 @@ void XrdScheduler::hireWorker(int dotrace)
       } else if (dotrace) TRACE(SCHED, "Now have " <<num_Workers <<" workers" );
 }
  
+/******************************************************************************/
+/*                                  I n i t                                   */
+/******************************************************************************/
+
+void XrdScheduler::Init(int minw, int maxw, int maxi)
+{
+   min_Workers =  minw;
+   max_Workers =  maxw;
+   max_Workidl =  maxi;
+   num_Workers =  0;
+   num_JobsinQ =  0;
+   stk_Workers =  maxw - (maxw/4*3);
+   idl_Workers =  0;
+   num_Jobs    =  0;
+   max_QLength =  0;
+   num_TCreate =  0;
+   num_TDestroy=  0;
+   num_Layoffs =  0;
+   num_Limited =  0;
+   firstPID    =  0;
+   WorkFirst = WorkLast = TimerQueue = 0;
+}
+
 /******************************************************************************/
 /*                             t r a c e E x i t                              */
 /******************************************************************************/

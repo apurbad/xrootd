@@ -1,10 +1,12 @@
 
 #include <fcntl.h>
+#include <cerrno>
 
 #include <openssl/bio.h>
 #include <openssl/evp.h>
 
 #include <XrdOuc/XrdOucStream.hh>
+#include <XrdSys/XrdSysE2T.hh>
 
 #include "XrdMacaroonsHandler.hh"
 
@@ -47,6 +49,8 @@ bool Handler::Config(const char *config, XrdOucEnv *env, XrdSysError *log,
     return log->Emsg("Config", errno, "open config file", config);
   }
   config_obj.Attach(cfg_fd);
+  static const char *cvec[] = { "*** macaroons plugin config:", 0 };
+  config_obj.Capture(cvec);
 
   // Set default mask for logging.
   log->setMsgMask(LogMask::Error | LogMask::Warning);
@@ -93,53 +97,52 @@ bool Handler::Config(const char *config, XrdOucEnv *env, XrdSysError *log,
 }
 
 
-bool Handler::xtrace(XrdOucStream &config_obj, XrdSysError *log)
+bool Handler::xtrace(XrdOucStream &Config, XrdSysError *log)
 {
-    char *val = config_obj.GetWord();
-    if (!val || !val[0])
-    {
-        log->Emsg("Config", "macaroons.trace requires at least one directive [all | error | warning | info | debug | none]");
-        return false;
+  static struct traceopts { const char *opname; enum LogMask opval; } tropts[] = {
+    { "all",     LogMask::All     },
+    { "error",   LogMask::Error   },
+    { "warning", LogMask::Warning },
+    { "info",    LogMask::Info    },
+    { "debug",   LogMask::Debug   }
+  };
+
+  int i, neg, trval = 0, numopts = sizeof(tropts)/sizeof(struct traceopts);
+
+  char *val = Config.GetWord();
+
+  if (!val || !*val) {
+    log->Emsg("Config", "macaroons.trace requires at least one directive"
+                        " [ all | error | warning | info | debug | none | off ]");
+    return false;
+  }
+
+  while (val && *val) {
+    if (strcmp(val, "off") == 0 || strcmp(val, "none") == 0) {
+      trval = 0;
+    } else {
+      if ((neg = (val[0] == '-' && val[1])))
+        val++;
+      for (i = 0; i < numopts; i++) {
+        if (!strcmp(val, tropts[i].opname)) {
+          if (neg)
+            trval &= ~tropts[i].opval;
+          else
+            trval |= tropts[i].opval;
+          break;
+        }
+      }
+      if (neg) --val;
+      if (i >= numopts)
+        log->Emsg("Config", "macaroons.trace: ignoring invalid trace option:", val);
     }
-    // If the config option is given, reset the log mask.
-    log->setMsgMask(0);
+    val = Config.GetWord();
+  }
 
-    do {
-        if (!strcmp(val, "all"))
-        {
-            log->setMsgMask(log->getMsgMask() | LogMask::All);
-        }
-        else if (!strcmp(val, "error"))
-        {
-            log->setMsgMask(log->getMsgMask() | LogMask::Error);
-        }
-        else if (!strcmp(val, "warning"))
-        {
-            log->setMsgMask(log->getMsgMask() | LogMask::Warning);
-        }
-        else if (!strcmp(val, "info"))
-        {
-            log->setMsgMask(log->getMsgMask() | LogMask::Info);
-        }
-        else if (!strcmp(val, "debug"))
-        {
-            log->setMsgMask(log->getMsgMask() | LogMask::Debug);
-        }
-        else if (!strcmp(val, "none"))
-        {
-            log->setMsgMask(0);
-        }
-        else
-        {
-            log->Emsg("Config", "macaroons.trace encountered an unknown directive:", val);
-            return false;
-        }
-        val = config_obj.GetWord();
-    } while (val);
+  log->setMsgMask(trval);
 
-    return true;
+  return true;
 }
-
 
 bool Handler::xmaxduration(XrdOucStream &config_obj, XrdSysError *log, ssize_t &max_duration)
 {
@@ -158,7 +161,7 @@ bool Handler::xmaxduration(XrdOucStream &config_obj, XrdSysError *log, ssize_t &
   }
   if (errno != 0)
   {
-    log->Emsg("Config", "Failure when parsing macaroons.maxduration as an integer", strerror(errno));
+    log->Emsg("Config", errno, "parse macaroons.maxduration as an integer.");
   }
   max_duration = max_duration_parsed;
 
@@ -190,8 +193,7 @@ bool Handler::xsecretkey(XrdOucStream &config_obj, XrdSysError *log, std::string
   FILE *fp = fopen(val, "rb");
 
   if (fp == NULL) {
-    log->Emsg("Config", "Cannot open shared secret key file '", val, "'");
-    log->Emsg("Config", "Cannot open shared secret key file. err: ", strerror(errno));
+    log->Emsg("Config", errno, "open shared secret key file", val);
     return false;
   }
 
@@ -234,13 +236,13 @@ bool Handler::xsecretkey(XrdOucStream &config_obj, XrdSysError *log, std::string
   if (inlen < 0) {
     BIO_free_all(b64);
     BIO_free_all(bio_out);
-    log->Emsg("Config", "Failure when reading secret key", strerror(errno));
+    log->Emsg("Config", errno, "read secret key.");
     return false;
   }
   if (!BIO_flush(bio_out)) {
     BIO_free_all(b64);
     BIO_free_all(bio_out);
-    log->Emsg("Config", "Failure when flushing secret key", strerror(errno));
+    log->Emsg("Config", errno, "flush secret key.");
     return false;
   }
 

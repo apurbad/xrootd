@@ -36,10 +36,13 @@
 #include "XrdCl/XrdClFileSystem.hh"
 #include "XrdCl/XrdClURL.hh"
 #include "XrdCl/XrdClXRootDResponses.hh"
+#include "XrdOuc/XrdOucECMsg.hh"
 
 /******************************************************************************/
 /*                         X r d P o s i x A d m i n                          */
 /******************************************************************************/
+
+struct stat;
   
 class XrdPosixAdmin
 {
@@ -47,8 +50,12 @@ public:
 
 XrdCl::URL        Url;
 XrdCl::FileSystem Xrd;
+XrdOucECMsg&      ecMsg;
 
 bool           isOK() {if (Url.IsValid()) return true;
+                       ecMsg.Set(EINVAL, 0);
+                       ecMsg.Msgf("PosixAdmin", "url '%s' is invalid",
+                                  Url.GetObfuscatedURL().c_str());
                        errno = EINVAL;    return false;
                       }
 
@@ -56,11 +63,12 @@ XrdCl::URL    *FanOut(int &num);
 
 int            Query(XrdCl::QueryCode::Code reqCode, void *buff, int bsz);
 
-bool           Stat(mode_t *flags=0, time_t *mtime=0,
-                    size_t *size=0,  ino_t  *id=0, dev_t *rdv=0);
+bool           Stat(mode_t *flags=0, time_t *mtime=0);
 
-      XrdPosixAdmin(const char *path)
-                      : Url((std::string)path), Xrd(Url) {}
+bool           Stat(struct stat &Stat);
+
+      XrdPosixAdmin(const char *path, XrdOucECMsg &ecm)
+                      : Url((std::string)path), Xrd(Url), ecMsg(ecm) {}
      ~XrdPosixAdmin() {}
 };
 #endif

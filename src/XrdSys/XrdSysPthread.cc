@@ -27,7 +27,7 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
  
-#include <errno.h>
+#include <cerrno>
 #include <pthread.h>
 #ifndef WIN32
 #include <unistd.h>
@@ -35,7 +35,7 @@
 #else
 #undef ETIMEDOUT       // Make sure that the definition from Winsock2.h is used ... 
 #include <Winsock2.h>
-#include <time.h>
+#include <ctime>
 #include "XrdSys/XrdWin32.hh"
 #endif
 #include <sys/types.h>
@@ -161,13 +161,58 @@ int XrdSysCondVar::WaitMS(int msec)
 }
  
 /******************************************************************************/
+/*                        X r d S y s C o n d V a r 2                         */
+/******************************************************************************/
+/******************************************************************************/
+/*                                W a i t M S                                 */
+/******************************************************************************/
+  
+bool XrdSysCondVar2::WaitMS(int msec)
+{
+ int sec, retc, usec;
+ struct timeval tnow;
+ struct timespec tval;
+
+// Adjust millseconds
+//
+   if (msec < 1000) sec = 0;
+      else {sec = msec / 1000; msec = msec % 1000;}
+   usec = msec * 1000;
+
+// Get current time of day
+//
+   gettimeofday(&tnow, 0);
+
+// Add the second and microseconds
+//
+   tval.tv_sec  = tnow.tv_sec  +  sec;
+   tval.tv_nsec = tnow.tv_usec + usec;
+   if (tval.tv_nsec >= 1000000)
+      {tval.tv_sec += tval.tv_nsec / 1000000;
+       tval.tv_nsec = tval.tv_nsec % 1000000;
+      }
+   tval.tv_nsec *= 1000;
+
+
+// Now wait for the condition or timeout
+//
+   do {retc = pthread_cond_timedwait(&cvar, mtxP, &tval);}
+   while (retc && (retc == EINTR));
+
+// Determine how to return
+//
+   if (retc && retc != ETIMEDOUT) {throw "cond_timedwait() failed";}
+   return retc == ETIMEDOUT;
+}
+  
+/******************************************************************************/
 /*                       X r d S y s S e m a p h o r e                        */
 /******************************************************************************/
 /******************************************************************************/
 /*                              C o n d W a i t                               */
 /******************************************************************************/
   
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(__GNU__)
 
 int XrdSysSemaphore::CondWait()
 {
@@ -188,7 +233,7 @@ int XrdSysSemaphore::CondWait()
 void XrdSysSemaphore::Post()
 {
 // Add one to the semaphore counter. If we the value is > 0 and there is a
-// thread waiting for the sempagore, signal it to get the semaphore.
+// thread waiting for the semaphore, signal it to get the semaphore.
 //
    semVar.Lock();
    semVal++;
@@ -276,6 +321,30 @@ int XrdSysThread::Run(pthread_t *tid, void *(*proc)(void *), void *arg,
        pthread_attr_setstacksize(&tattr, stackSize);
    return pthread_create(tid, &tattr, XrdSysThread_Xeq,
    			 static_cast<void *>(myargs));
+}
+
+/******************************************************************************/
+/*                          s e t S t a c k S i z e                           */
+/******************************************************************************/
+
+void XrdSysThread::setStackSize(size_t stksz, bool force)
+{
+// If not being forced, then we set the stacksize only if the requested
+// size is greater than the default size.
+//
+if (!force)
+   {pthread_attr_t tattr;
+    size_t dflt_stk_sz;
+    pthread_attr_init(&tattr);
+    if (pthread_attr_getstacksize(&tattr, &dflt_stk_sz) || stksz <= dflt_stk_sz)
+       {stackSize = 0;
+        return;
+       }
+   }
+
+// Record the stack size for future use
+//
+   stackSize = stksz;
 }
 
 /******************************************************************************/

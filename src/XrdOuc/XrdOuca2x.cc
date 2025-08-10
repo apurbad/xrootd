@@ -27,14 +27,15 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <stdlib.h>
-#include <stdio.h>
+#include <cstdlib>
+#include <cstdio>
 #include <sys/stat.h>
-#include <errno.h>
+#include <cerrno>
 
 #ifdef WIN32
 #include "XrdSys/XrdWin32.hh"
 #endif
+#include "XrdNet/XrdNetUtils.hh"
 #include "XrdOuc/XrdOuca2x.hh"
 
 /******************************************************************************/
@@ -133,6 +134,34 @@ int XrdOuca2x::a2fm(XrdSysError &Eroute, const char *emsg, const char *item,
 }
 
 /******************************************************************************/
+/*                                   a 2 p                                    */
+/******************************************************************************/
+
+int XrdOuca2x::a2p(XrdSysError &eDest, const char *ptype, const char *val,
+                   bool anyOK)
+{
+    int pnum;
+
+    if (!strcmp("any", val))
+       {if (anyOK) return 0;
+        eDest.Emsg("Config", "port 'any' is not allowed");
+        return -1;
+       }
+
+    const char *invp = (*ptype == 't' ? "tcp port" : "udp port" );
+    const char *invs = (*ptype == 't' ? "Unable to find tcp service" :
+                                        "Unable to find udp service" );
+
+    if (isdigit(*val))
+       {if (XrdOuca2x::a2i(eDest,invp,val,&pnum,1,65535)) return -1;}
+       else if (!(pnum = XrdNetUtils::ServPort(val, (*ptype != 't'))))
+               {eDest.Emsg("Config", invs, val);
+                return -1;
+               }
+    return pnum;
+}
+  
+/******************************************************************************/
 /*                                  a 2 s n                                   */
 /******************************************************************************/
 
@@ -227,13 +256,13 @@ int XrdOuca2x::a2sp(XrdSysError &Eroute, const char *emsg, const char *item,
 
 int XrdOuca2x::a2sz(XrdSysError &Eroute, const char *emsg, const char *item,
                                 long long *val, long long minv, long long maxv)
-{   long long qmult;
-    char *eP, *fP = (char *)item + strlen(item) - 1;
-
-    if (!item || !*item)
+{   if (!item || !*item)
        {Eroute.Emsg("a2x", emsg, "value not specified"); return -1;}
 
-         if (*fP == 'k' || *fP == 'K') qmult = 1024LL;
+    long long qmult;
+    char *eP, *fP = (char *)item + strlen(item) - 1;
+
+             if (*fP == 'k' || *fP == 'K') qmult = 1024LL;
     else if (*fP == 'm' || *fP == 'M') qmult = 1024LL*1024LL;
     else if (*fP == 'g' || *fP == 'G') qmult = 1024LL*1024LL*1024LL;
     else if (*fP == 't' || *fP == 'T') qmult = 1024LL*1024LL*1024LL*1024LL;
@@ -258,11 +287,11 @@ int XrdOuca2x::a2sz(XrdSysError &Eroute, const char *emsg, const char *item,
 
 int XrdOuca2x::a2tm(XrdSysError &Eroute, const char *emsg, const char *item, int *val,
                           int minv, int maxv)
-{   int qmult;
-    char *eP, *fP = (char *)item + strlen(item) - 1;
-
-    if (!item || !*item)
+{   if (!item || !*item)
        {Eroute.Emsg("a2x", emsg, "value not specified"); return -1;}
+
+    int qmult;
+    char *eP, *fP = (char *)item + strlen(item) - 1;
 
          if (*fP == 's' || *fP == 'S') qmult = 1;
     else if (*fP == 'm' || *fP == 'M') qmult = 60;

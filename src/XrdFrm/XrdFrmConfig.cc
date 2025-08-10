@@ -28,10 +28,10 @@
 /******************************************************************************/
   
 #include <unistd.h>
-#include <ctype.h>
+#include <cctype>
 #include <dirent.h>
-#include <string.h>
-#include <stdio.h>
+#include <cstring>
+#include <cstdio>
 #include <fcntl.h>
 #include <sys/param.h>
 #include <sys/types.h>
@@ -150,6 +150,8 @@ XrdFrmConfig::XrdFrmConfig(SubSys ss, const char *vopts, const char *uinfo)
    QPath    = 0;
    AdminMode= 0740;
    xfrMax   = 2;
+   xfrMaxIn = 0;
+   xfrMaxOt = 0;
    FailHold = 3*60*60;
    IdleHold = 10*60;
    WaitMigr = 60*60;
@@ -231,7 +233,6 @@ int XrdFrmConfig::Configure(int argc, char **argv, int (*ppf)())
 {
    extern XrdOss *XrdOssGetSS(XrdSysLogger *, const char *, const char *,
                               const char   *, XrdOucEnv *,  XrdVersionInfo &);
-   extern int *XrdOssRunMode;
    static XrdNetAddr myAddr(0);
    XrdFrmConfigSE theSE;
    int retc, isMum = 0, myXfrMax = -1, NoGo = 0, optBG = 0;
@@ -382,7 +383,7 @@ int XrdFrmConfig::Configure(int argc, char **argv, int (*ppf)())
 
 // Put out the herald
 //
-   sprintf(buff, "Scalla %s is starting. . .", myProg);
+   sprintf(buff, "File Residency Manager %s is starting. . .", myProg);
    Say.Say(0, buff);
    Say.Say(XrdBANNER);
 
@@ -411,7 +412,6 @@ int XrdFrmConfig::Configure(int argc, char **argv, int (*ppf)())
                     OfsCfg->Plugin(ossFS);
                     OfsCfg->Plugin(CksMan);
                     doStatPF = ossFS->StatPF("/", &Stat) != -ENOTSUP;
-                    runNew = !(runOld = XrdOssRunMode ? *XrdOssRunMode : 0);
                    }
           }
       }
@@ -513,7 +513,7 @@ int XrdFrmConfig::NeedsCTA(const char *Lfn)
 {
    extern XrdOucPListAnchor *XrdOssRPList;
 
-   return (XrdOssRPList->Find(Lfn) & XRDEXP_MAKELF) != 0;
+   return (XrdOssRPList->Find(Lfn) & XRDEXP_MIGPRG) != 0;
 }
 
 /******************************************************************************/
@@ -672,7 +672,7 @@ int XrdFrmConfig::ConfigMP(const char *pType)
         if (*psVal == '/')
            {pOpts = XrdOssRPList->Find(psVal);
             if (pOpts & xOpt) mypList = InsertPL(mypList, psVal, psLen,
-                                                (pOpts & XRDEXP_MAKELF ? 1:0));
+                                                (pOpts & XRDEXP_MIGPRG ? 1:0));
                else {Say.Say("Config", psVal, "not marked", pType); NoGo = 1;}
            } else {
             VPInfo *vP = VPList;
@@ -694,7 +694,7 @@ int XrdFrmConfig::ConfigMP(const char *pType)
       {XrdOucPList *fP = XrdOssRPList->First();
        short sval[4];    // Last two elements are unused
        while(fP)
-            {sval[0] = (fP->Flag() & XRDEXP_MAKELF ? 1 : 0);
+            {sval[0] = (fP->Flag() & XRDEXP_MIGPRG ? 1 : 0);
              sval[1] = fP->Plen();
              if (fP->Flag() & xOpt)
                  mypList = new XrdOucTList(fP->Path(), sval, mypList);
@@ -736,7 +736,7 @@ int XrdFrmConfig::ConfigMP(const char *pType)
 
 // The oss would have already set NORCREATE and NOCHECK for all stageable paths.
 // But now, we must also off the R/O flag on every purgeable and stageable path
-// to prevent oss complaints. This needs to be defered to here because we need
+// to prevent oss complaints. This needs to be deferred to here because we need
 // to know which paths are actually r/o and r/w.
 //
    if (!NoGo)
@@ -972,6 +972,8 @@ int XrdFrmConfig::ConfigProc()
        return 1;
       }
    cfgFile.Attach(cfgFD); cFile = &cfgFile;
+   static const char *cvec[] = { "*** frm server config:", 0 };
+   cfgFile.Capture(cvec);
 
 // Now start reading records until eof.
 //
@@ -981,7 +983,7 @@ int XrdFrmConfig::ConfigProc()
          if(ConfigXeq(var, mbok)) {cfgFile.Echo(); NoGo = 1;}
         }
 
-// Now check if any errors occured during file i/o
+// Now check if any errors occurred during file i/o
 //
    if ((retc = cfgFile.LastError()))
       NoGo = Say.Emsg("Config", retc, "read config file", ConfigFN);
@@ -1016,9 +1018,9 @@ int XrdFrmConfig::ConfigXeq(char *var, int mbok)
        if (!strcmp(var, "ofs.ckslib"    )) PARSEPI(theCksLib);
        if (!strcmp(var, "ofs.osslib"    )) PARSEPI(theOssLib);
        if (!strcmp(var, "ofs.xattrlib"  )) PARSEPI(theAtrLib);
-       if (!strcmp(var, "oss.cache"     )){hasCache = 1; // runOld
-                                           return xspace(0,0);
-                                          }
+//     if (!strcmp(var, "oss.cache"     )){hasCache = 1; // runOld
+//                                         return xspace(0,0);
+//                                        }
        if (!strcmp(var, "oss.localroot" )) return Grab(var, &LocalRoot, 0);
        if (!strcmp(var, "oss.namelib"   )) return xnml();
        if (!strcmp(var, "oss.remoteroot")) return Grab(var, &RemoteRoot, 0);
@@ -1247,7 +1249,7 @@ void XrdFrmConfig::InsertXD(const char *Path)
   
 void XrdFrmConfig::Usage(int rc)
 {
-     cerr <<"\nUsage: " <<myProg <<" " <<uInfo <<endl;
+     std::cerr <<"\nUsage: " <<myProg <<" " <<uInfo <<std::endl;
      _exit(rc);
 }
 
@@ -1402,10 +1404,10 @@ int XrdFrmConfig::xcnsd()
 
    Options:  [in] [noalloc] [out] [rmerr] [stats] [timeout <sec>] [url] [xpd]
 
-             in        use command for incomming copies.
-             noalloc   do not pre-allocate space for incomming copies.
+             in        use command for incoming copies.
+             noalloc   do not pre-allocate space for incoming copies.
              out       use command for outgoing copies.
-             rmerr     remove incomming file when copy ends with an error.
+             rmerr     remove incoming file when copy ends with an error.
                        Default unless noalloc is specified.
              stats     print transfer statistics in the log.
              timeout   how long the cmd can run before it is killed.
@@ -1499,20 +1501,32 @@ int XrdFrmConfig::xcopy(int &TLim)
 
 /* Function: copymax
 
-   Purpose:  To parse the directive: copymax  <num>
+   Purpose:  To parse the directive: copymax  <num> | split <inmax> <outmax>
 
              <num>     maximum number of simultaneous transfers
+             <inmax>   maximum number of simultaneous transfers in  (get|stage)
+             <outmax>  maximum number of simultaneous transfers out (put|migr)
 
    Output: 0 upon success or !0 upon failure.
 */
 int XrdFrmConfig::xcmax()
-{   int xmax = 1;
-    char *val;
+{   char *val;
 
     if (!(val = cFile->GetWord()))
-       {Say.Emsg("Config", "maxio value not specified"); return 1;}
-    if (XrdOuca2x::a2i(Say, "maxio", val, &xmax, 1)) return 1;
-    xfrMax = xmax;
+       {Say.Emsg("Config", "copymax value not specified"); return 1;}
+
+    if (!strcmp(val, "split"))
+       {if (!(val = cFile->GetWord()))
+           {Say.Emsg("Config", "copymax in value not specified"); return 1;}
+        if (XrdOuca2x::a2i(Say,"copymax in",  val, &xfrMaxIn, 1)) return 1;
+        if (!(val = cFile->GetWord()))
+           {Say.Emsg("Config", "copymax out value not specified"); return 1;}
+        if (XrdOuca2x::a2i(Say,"copymax out", val, &xfrMaxOt, 1))  return 1;
+        xfrMax = xfrMaxIn + xfrMaxOt;
+       } else {
+        if (XrdOuca2x::a2i(Say, "copymax", val, &xfrMax, 1)) return 1;
+        xfrMaxIn = xfrMaxOt = 0;
+       }
     return 0;
 }
 
@@ -2017,6 +2031,14 @@ int XrdFrmConfig::xspace(int isPrg, int isXA)
           {Say.Emsg("Config","invalid cache option - ",val); return 1;}
           else isXA = 1;
       }
+
+// We only support xa caches now
+//
+    if (!isXA)
+       {Say.Emsg("Config","old-style spaces using oss.cache are no longer "
+                 "supported!");
+        return 1;
+       }
 
    if (fn[k-1] != '*')
       {for (i = k-1; i; i--) if (fn[i] != '/') break;

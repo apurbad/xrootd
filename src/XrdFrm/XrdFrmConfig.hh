@@ -29,7 +29,7 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <string.h>
+#include <cstring>
 #include <unistd.h>
 
 #include "XrdOss/XrdOssSpace.hh"
@@ -97,6 +97,8 @@ int                 cmdHold;
 int                 AdminMode;
 int                 isAgent;
 int                 xfrMax;
+int                 xfrMaxIn;
+int                 xfrMaxOt;
 int                 FailHold;
 int                 IdleHold;
 int                 WaitQChk;
@@ -108,10 +110,10 @@ int                 Fix;
 int                 Test;
 int                 TrackDC;
 int                 Verbose;
-int                 runOld;    // Backward compatability
-int                 runNew;    // Forward  compatability
-int                 nonXA;     // Backward compatability for noXA spaces
-int                 hasCache;  // Backward compatability for noXA spaces
+int                 runOld;    // Backward compatibility
+int                 runNew;    // Forward  compatibility
+int                 nonXA;     // Backward compatibility for noXA spaces
+int                 hasCache;  // Backward compatibility for noXA spaces
 char              **vectArg;
 int                 nextArg;
 int                 numcArg;

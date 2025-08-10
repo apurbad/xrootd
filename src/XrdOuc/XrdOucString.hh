@@ -243,11 +243,9 @@
 /******************************************************************************/
 #include "XrdSys/XrdSysHeaders.hh"
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <stdarg.h>
-
-using namespace std;
+#include <cstdio>
+#include <cstdlib>
+#include <cstdarg>
 
 #define STR_NPOS -1
 
@@ -378,7 +376,7 @@ public:
 };
 
 // Operator << is useful to print a string into a stream
-ostream &operator<< (ostream &, const XrdOucString s);
+std::ostream &operator<< (std::ostream &, const XrdOucString s);
 
 XrdOucString const operator+(const char *s1, const XrdOucString s2);
 XrdOucString const operator+(const char c, const XrdOucString s);

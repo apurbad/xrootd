@@ -28,13 +28,13 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <stdlib.h>
-#include <stdio.h>
-#include <errno.h>
+#include <cstdlib>
+#include <cstdio>
+#include <cerrno>
 #include <fcntl.h>
 #include <limits.h>
 #include <strings.h>
-#include <time.h>
+#include <ctime>
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/times.h>
@@ -42,7 +42,7 @@
 #include <sys/uio.h>
 #include <sys/wait.h>
 #include <netinet/in.h>
-#include <inttypes.h>
+#include <cinttypes>
 
 #include "XrdVersion.hh"
   
@@ -88,7 +88,7 @@ namespace XrdCms
 {
 XrdSysError  Say(0, "cms_");
   
-XrdOucTrace  Trace(&Say);
+XrdSysTrace  Trace("cms");
 
 XrdVERSIONINFODEF(myVersion,cmsclient,XrdVNUMBER,XrdVERSION);
 };
@@ -114,6 +114,7 @@ XrdCmsFinderRMT::XrdCmsFinderRMT(XrdSysLogger *lp, int whoami, int Port)
      isTarget    = whoami & IsTarget;
      savePath    = 0;
      Say.logger(lp);
+     Trace.SetLogger(lp);
 }
  
 /******************************************************************************/
@@ -243,8 +244,8 @@ int XrdCmsFinderRMT::Forward(XrdOucErrInfo &Resp, const char *cmd,
    Data.Path    = (char *)arg1;
    Data.Mode    = (char *)arg2;
    Data.Path2   = (char *)arg2;
-   Data.Opaque  = (Env1 ? Env1->Env(opQ1Len) : 0);
-   Data.Opaque2 = (Env2 ? Env2->Env(opQ2Len) : 0);
+   Data.Opaque  = (Env1 ? Env1->EnvTidy(opQ1Len) : 0);
+   Data.Opaque2 = (Env2 ? Env2->EnvTidy(opQ2Len) : 0);
 
 // Pack the arguments
 //
@@ -345,7 +346,7 @@ int XrdCmsFinderRMT::Locate(XrdOucErrInfo &Resp, const char *path, int flags,
 //
    Data.Ident   = (char *)(XrdCmsClientMan::doDebug ? Resp.getErrUser() : "");
    Data.Path    = (char *)path;
-   Data.Opaque  = (Env ? Env->Env(n)       : 0);
+   Data.Opaque  = (Env ? Env->EnvTidy(n)   : 0);
    Data.Avoid   = (Env ? Env->Get("tried") : 0);
 
 // Set options and command
@@ -943,19 +944,27 @@ void XrdCmsFinderTRG::Added(const char *path, int Pend)
       {CMSp->Close(); Active = 0;}
    myData.UnLock();
 }
-
+  
 /******************************************************************************/
 /*                             C o n f i g u r e                              */
 /******************************************************************************/
 
-void *XrdCmsStartRsp(void *carg)
+namespace
+{
+void *StartPM(void *carg)
+      {XrdCmsFinderTRG *mp = (XrdCmsFinderTRG *)carg;
+       return mp->RunPM();
+      }
+
+void *StartRsp(void *carg)
       {XrdCmsFinderTRG *mp = (XrdCmsFinderTRG *)carg;
        return mp->Start();
       }
+}
   
 int XrdCmsFinderTRG::Configure(const char *cfn, char *Ags, XrdOucEnv *envP)
 {
-   XrdCmsClientConfig             config;
+   XrdCmsClientConfig             config(this);
    XrdCmsClientConfig::configWhat What;
 
 // Establish what we will be configuring
@@ -976,7 +985,24 @@ int XrdCmsFinderTRG::Configure(const char *cfn, char *Ags, XrdOucEnv *envP)
 // security function pointer or the network object pointer from the
 // environment as we don't need these at all.
 //
-   return RunAdmin(config.CMSPath, config.myVNID);
+   if (RunAdmin(config.CMSPath, config.myVNID)
+   &&  config.perfMon && config.perfInt)
+      {pthread_t tid;
+       perfMon = config.perfMon;
+       perfInt = config.perfInt;
+       if (XrdSysThread::Run(&tid, StartPM, (void *)this, 0, "perfmon"))
+//     if (XrdSysThread::Run(&tid, StartRsp, (void *)this, 0, "cms i/f"))
+          {Say.Emsg("Config", errno, "start performance monitor."); return 0;}
+      }
+
+// Record the address of this cms client
+//
+   if (What == XrdCmsClientConfig::configServer)
+      envP->PutPtr("XrdCmsClientT*", (XrdCmsClient*)this);
+
+// All done
+//
+   return 1;
 }
   
 /******************************************************************************/
@@ -1007,6 +1033,37 @@ int XrdCmsFinderTRG::Locate(XrdOucErrInfo &Resp, const char *path, int flags,
    return SFS_DATA;
 }
   
+
+/******************************************************************************/
+/*                               P u t I n f o                                */
+/******************************************************************************/
+  
+void XrdCmsFinderTRG::PutInfo(XrdCmsPerfMon::PerfInfo &perfInfo, bool alert)
+{
+   char  buff[256];
+   char *data[2] = {buff, 0};
+   int   dlen[2];
+   uint32_t cpu_load, mem_load, net_load, pag_load, xeq_load;
+
+   cpu_load = (perfInfo.cpu_load <= 100 ? perfInfo.cpu_load : 100);
+   mem_load = (perfInfo.mem_load <= 100 ? perfInfo.mem_load : 100);
+   net_load = (perfInfo.net_load <= 100 ? perfInfo.net_load : 100);
+   pag_load = (perfInfo.pag_load <= 100 ? perfInfo.pag_load : 100);
+   xeq_load = (perfInfo.xeq_load <= 100 ? perfInfo.xeq_load : 100);
+
+   dlen[0] = snprintf(buff, sizeof(buff), "%s %u %u %u %u %u\n",
+                      (alert ? "PERF" : "perf"),
+                      xeq_load, cpu_load, mem_load, pag_load, net_load);
+   dlen[1] = 0;
+
+// Now send the notification
+//
+   myData.Lock();
+   if (Active && CMSp->Put((const char **)data, (const int *)dlen))
+      {CMSp->Close(); Active = 0;}
+   myData.UnLock();
+}
+
 /******************************************************************************/
 /*                               R e l e a s e                                */
 /******************************************************************************/
@@ -1181,10 +1238,29 @@ int XrdCmsFinderTRG::RunAdmin(char *Path, const char *vnid)
 
 // Start a thread to connect with the local cmsd
 //
-   if (XrdSysThread::Run(&tid, XrdCmsStartRsp, (void *)this, 0, "cms i/f"))
+   if (XrdSysThread::Run(&tid, StartRsp, (void *)this, 0, "cms i/f"))
       {Say.Emsg("Config", errno, "start cmsd interface"); return 0;}
 
    return 1;
+}
+  
+/******************************************************************************/
+/*                                 R u n P M                                  */
+/******************************************************************************/
+
+void *XrdCmsFinderTRG::RunPM()
+{
+   XrdCmsPerfMon::PerfInfo perfInfo;
+
+// Keep asking the plugin for statistics.
+//
+   while(1)
+        {perfMon->GetInfo(perfInfo);
+         PutInfo(perfInfo);
+         perfInfo.Clear();
+         XrdSysTimer::Snooze(perfInt);
+        }
+   return (void *)0;
 }
 
 /******************************************************************************/
@@ -1235,6 +1311,28 @@ void *XrdCmsFinderTRG::Start()
    return (void *)0;
 }
   
+/******************************************************************************/
+/*                           U t i l i z a t i o n                            */
+/******************************************************************************/
+  
+void XrdCmsFinderTRG::Utilization(unsigned int util, bool alert)
+{
+   XrdCmsPerfMon::PerfInfo perfInfo;
+
+// Make sure value is in range
+//
+   if (util > 100) util = 100;
+  
+// Send this out as a performance figure
+//
+   perfInfo.cpu_load = util;
+   perfInfo.mem_load = util;
+   perfInfo.net_load = util;
+   perfInfo.pag_load = util;
+   perfInfo.xeq_load = util;
+   PutInfo(perfInfo, alert);
+}
+
 /******************************************************************************/
 /*                                V C h e c k                                 */
 /******************************************************************************/

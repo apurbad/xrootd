@@ -28,8 +28,8 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <stdio.h>
-#include <string.h>
+#include <cstdio>
+#include <cstring>
 #include <strings.h>
 #include <utime.h>
 #include <sys/param.h>
@@ -384,7 +384,7 @@ const char *XrdFrmPurge::Eligible(XrdFrmFileset *sP, time_t &xTime, int hTime)
 //
    if (sP->pinInfo.Attr.Flags & XrdFrcXAttrPin::pinIdle
    &&  sP->pinInfo.Attr.pinTime > static_cast<long long>(xTime))
-      return "is pin defered";
+      return "is pin deferred";
    return 0;
 }
 
@@ -416,7 +416,6 @@ int XrdFrmPurge::Init(XrdOucTList *sP, long long minV, int hVal)
                         };
 
    XrdFrmConfig::VPInfo *vP;
-   XrdOssVSInfo vsInfo;
    XrdFrmPurge *xP, *ppP = 0, *spP = First;
    XrdOucTList  *tP;
    char xBuff[32];
@@ -459,7 +458,8 @@ int XrdFrmPurge::Init(XrdOucTList *sP, long long minV, int hVal)
 //
    spP = First; ppP = 0;
    while(spP)
-        {if ((rc = Config.ossFS->StatVS(&vsInfo, spP->SName, 1)))
+        {XrdOssVSInfo vsInfo;
+         if ((rc = Config.ossFS->StatVS(&vsInfo, spP->SName, 1)))
             {Say.Emsg("Init", rc, "calculate space for", spP->SName);
              if (ppP) ppP->Next = spP->Next;
                 else  First =     spP->Next;
@@ -516,7 +516,6 @@ int XrdFrmPurge::Init(XrdOucTList *sP, long long minV, int hVal)
   
 int XrdFrmPurge::LowOnSpace()
 {
-   XrdOssVSInfo VSInfo;
    XrdFrmPurge *psP = First;
    time_t eNow;
 
@@ -525,7 +524,8 @@ int XrdFrmPurge::LowOnSpace()
    Left2Do = 0;
    while(psP)
         {if (psP->Enabled)
-            {if (Config.ossFS->StatVS(&VSInfo, psP->SName, 1)) psP->Stop = 1;
+            {XrdOssVSInfo VSInfo;
+             if (Config.ossFS->StatVS(&VSInfo, psP->SName, 1)) psP->Stop = 1;
                 else {psP->freeSpace = VSInfo.Free;
                       psP->contSpace = VSInfo.LFree;
                       psP->usedSpace = VSInfo.Usage;

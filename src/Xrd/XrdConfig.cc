@@ -35,25 +35,38 @@
 */
   
 #include <unistd.h>
-#include <ctype.h>
+#include <cctype>
+#include <fcntl.h>
 #include <pwd.h>
-#include <string.h>
-#include <stdio.h>
+#include <cstdint>
+#include <string>
+#include <cstring>
+#include <cstdio>
 #include <sys/param.h>
 #include <sys/resource.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/un.h>
+#include <algorithm>
+#include <limits>
 
 #include "XrdVersion.hh"
 
+#include "Xrd/XrdBuffer.hh"
 #include "Xrd/XrdBuffXL.hh"
 #include "Xrd/XrdConfig.hh"
+#include "Xrd/XrdInet.hh"
 #include "Xrd/XrdInfo.hh"
 #include "Xrd/XrdLink.hh"
+#include "Xrd/XrdLinkCtl.hh"
+#include "Xrd/XrdMonitor.hh"
 #include "Xrd/XrdPoll.hh"
+#include "Xrd/XrdScheduler.hh"
 #include "Xrd/XrdStats.hh"
+#include "Xrd/XrdTrace.hh"
 
 #include "XrdNet/XrdNetAddr.hh"
+#include "XrdNet/XrdNetIdentity.hh"
 #include "XrdNet/XrdNetIF.hh"
 #include "XrdNet/XrdNetSecurity.hh"
 #include "XrdNet/XrdNetUtils.hh"
@@ -61,26 +74,54 @@
 #include "XrdOuc/XrdOuca2x.hh"
 #include "XrdOuc/XrdOucEnv.hh"
 #include "XrdOuc/XrdOucLogging.hh"
+#include "XrdOuc/XrdOucPinKing.hh"
 #include "XrdOuc/XrdOucSiteName.hh"
 #include "XrdOuc/XrdOucStream.hh"
+#include "XrdOuc/XrdOucString.hh"
 #include "XrdOuc/XrdOucUtils.hh"
 
+#include "XrdSys/XrdSysError.hh"
+#include "XrdSys/XrdSysFD.hh"
 #include "XrdSys/XrdSysHeaders.hh"
+#include "XrdSys/XrdSysLogger.hh"
 #include "XrdSys/XrdSysTimer.hh"
 #include "XrdSys/XrdSysUtils.hh"
 
-#ifdef __linux__
+#include "XrdTcpMonPin.hh"
+
+#include "XrdTls/XrdTls.hh"
+#include "XrdTls/XrdTlsContext.hh"
+
+#if defined(__linux__) || defined(__GNU__)
 #include <netinet/tcp.h>
+#endif
+#if defined(__linux__)
+#include <sys/epoll.h>
 #endif
 #ifdef __APPLE__
 #include <AvailabilityMacros.h>
 #endif
 
 /******************************************************************************/
-/*                        S t a t i c   O b j e c t s                         */
+/*                        G l o b a l   O b j e c t s                         */
 /******************************************************************************/
-  
-       const char       *XrdConfig::TraceID = "Config";
+
+namespace XrdGlobal
+{
+       XrdOucString      totalCF;
+extern XrdSysLogger      Logger;
+extern XrdSysError       Log;
+extern XrdSysTrace       XrdTrace;
+extern XrdScheduler      Sched;
+extern XrdBuffManager    BuffPool;
+extern XrdTlsContext    *tlsCtx;
+extern XrdInet          *XrdNetTCP;
+extern XrdBuffXL         xlBuff;
+extern XrdTcpMonPin     *TcpMonPin;
+extern int               devNull;
+};
+
+using namespace XrdGlobal;
 
 namespace XrdNetSocketCFG
 {
@@ -88,16 +129,26 @@ extern int ka_Idle;
 extern int ka_Itvl;
 extern int ka_Icnt;
 };
-
-namespace XrdGlobal
-{
-extern XrdBuffXL xlBuff;
-}
+  
+/******************************************************************************/
+/*                    F i l e   L o c a l   O b j e c t s                     */
+/******************************************************************************/
 
 namespace
 {
 XrdOucEnv  theEnv;
+XrdVERSIONINFODEF(myVer, Xrd, XrdVNUMBER, XrdVERSION);
+bool SSLmsgs = true;
+
+void TlsError(const char *tid, const char *msg, bool sslmsg)
+             {if (!sslmsg || SSLmsgs) XrdGlobal::Log.Emsg("TLS", tid, msg);}
 };
+  
+/******************************************************************************/
+/*                        S t a t i c   M e m b e r s                         */
+/******************************************************************************/
+  
+       const char       *XrdConfig::TraceID = "Config";
 
 /******************************************************************************/
 /*                               d e f i n e s                                */
@@ -124,13 +175,44 @@ XrdConfigProt  *Next;
 char           *proname;
 char           *libpath;
 char           *parms;
-int             port;
-int             wanopt;
 
-                XrdConfigProt(char *pn, char *ln, char *pp, int np=-1, int wo=0)
-                    {Next = 0; proname = pn; libpath = ln; parms = pp; 
-                     port=np; wanopt = wo;
+int             numP;
+union {int      port;
+       int      portVec[XrdProtLoad::PortoMax];
+      };
+union {bool     dotls;
+       bool     tlsVec[XrdProtLoad::PortoMax];
+      };
+
+bool            AddPort(int pnum, bool isTLS)
+                       {for (int i = 0; i < numP; i++)
+                            if (pnum == portVec[i])
+                               {tlsVec[i] = isTLS; return true;}
+                        if (numP >= (XrdProtLoad::PortoMax)) return false;
+                        portVec[numP] = pnum; tlsVec[numP] = isTLS;
+                        numP++;
+                        return true;
+                       }
+
+void             Reset(char *ln, char *pp, int np=-1, bool to=false)
+                      {if (libpath) free(libpath);
+                       libpath = ln;
+                       if (parms)   free(parms);
+                       parms = pp;
+                       memset(portVec, 0, sizeof(portVec));
+                       port = np;
+                       memset(tlsVec, 0, sizeof(tlsVec));
+                       dotls = to;
+                       numP = 1;
+                      }
+
+                XrdConfigProt(char *pn, char *ln, char *pp, int np=-1,
+                              bool to=false)
+                    : Next(0), proname(pn), libpath(ln), parms(pp), numP(1)
+                    {memset(portVec, 0, sizeof(portVec)); port = np;
+                     memset(tlsVec, 0, sizeof(tlsVec)); dotls = to;
                     }
+
                ~XrdConfigProt()
                     {free(proname);
                      if (libpath) free(libpath);
@@ -139,39 +221,67 @@ int             wanopt;
 };
 
 /******************************************************************************/
+/*                         X r d T c p M o n I n f o                          */
+/******************************************************************************/
+
+class XrdTcpMonInfo
+{
+public:
+
+XrdOucPinKing<XrdTcpMonPin> KingPin;
+
+      XrdTcpMonInfo(const char *drctv, const char *cfn, XrdSysError &errR)
+                   : KingPin(drctv, theEnv, errR, &myVer)
+                   {theEnv.Put("configFN", cfn);}
+
+     ~XrdTcpMonInfo() {}
+
+XrdOucEnv theEnv;
+};
+  
+/******************************************************************************/
 /*                           C o n s t r u c t o r                            */
 /******************************************************************************/
   
-XrdConfig::XrdConfig() : Log(&Logger, "Xrd"), Trace(&Log), Sched(&Log, &Trace),
-                         BuffPool(&Log, &Trace)
+XrdConfig::XrdConfig()
 {
 
 // Preset all variables with common defaults
 //
    PortTCP  = -1;
    PortUDP  = -1;
-   PortWAN  = 0;
+   PortTLS  = -1;
    ConfigFN = 0;
+   tmoInfo  = 0;
    myInsName= 0;
    mySitName= 0;
    AdminPath= strdup("/tmp");
    HomePath = 0;
-   AdminMode= 0700;
-   HomeMode = 0700;
+   PidPath  = strdup("/tmp");
+   tlsCert  = 0;
+   tlsKey   = 0;
+   caDir    = 0;
+   caFile   = 0;
+   AdminMode= S_IRWXU;
+   HomeMode = S_IRWXU;
    Police   = 0;
-   Net_Blen = 0;  // Accept OS default (leave Linux autotune in effect)
+   theMon   = 0;
    Net_Opts = XRDNET_KEEPALIVE;
-   Wan_Blen = 1024*1024; // Default window size 1M
-   Wan_Opts = XRDNET_KEEPALIVE;
+   TLS_Blen = 0;  // Accept OS default (leave Linux autotune in effect)
+   TLS_Opts = XRDNET_KEEPALIVE | XRDNET_USETLS;
    repDest[0] = 0;
    repDest[1] = 0;
    repInt     = 600;
    repOpts    = 0;
    ppNet      = 0;
-   NetTCPlep  = -1;
+   tlsOpts    = 9ULL | XrdTlsContext::servr | XrdTlsContext::logVF;
+   tlsNoVer   = false;
+   tlsNoCAD   = true;
    NetADM     = 0;
    coreV      = 1;
-   memset(NetTCP, 0, sizeof(NetTCP));
+   Specs      = 0;
+   isStrict   = false;
+   maxFD      = 256*1024;  // 256K default
 
    Firstcp = Lastcp = 0;
 
@@ -181,14 +291,13 @@ XrdConfig::XrdConfig() : Log(&Logger, "Xrd"), Trace(&Log), Sched(&Log, &Trace),
    ProtInfo.Sched   = &Sched;           // Stable -> System Scheduler
    ProtInfo.ConfigFN= 0;                // We will fill this in later
    ProtInfo.Stats   = 0;                // We will fill this in later
-   ProtInfo.Trace   = &Trace;           // Stable -> Trace Information
    ProtInfo.AdmPath = AdminPath;        // Stable -> The admin path
    ProtInfo.AdmMode = AdminMode;        // Stable -> The admin path mode
    ProtInfo.theEnv  = &theEnv;          // Additional information
+   ProtInfo.xrdFlags= 0;                // Additional information
 
    ProtInfo.Format   = XrdFORMATB;
-   ProtInfo.WANPort  = 0;
-   ProtInfo.WANWSize = 0;
+   memset(ProtInfo.rsvd3, 0, sizeof(ProtInfo.rsvd3));
    ProtInfo.WSize    = 0;
    ProtInfo.ConnMax  = -1;     // Max       connections (fd limit)
    ProtInfo.readWait = 3*1000; // Wait time for data before we reschedule
@@ -197,8 +306,16 @@ XrdConfig::XrdConfig() : Log(&Logger, "Xrd"), Trace(&Log), Sched(&Log, &Trace),
    ProtInfo.DebugON  = 0;      // 1 if started with -d
    ProtInfo.argc     = 0;
    ProtInfo.argv     = 0;
+   ProtInfo.tlsPort  = 0;
+   ProtInfo.tlsCtx   = 0;
+   ProtInfo.totalCF  = &totalCF;
 
    XrdNetAddr::SetCache(3*60*60); // Cache address resolutions for 3 hours
+
+   // This may reset the NPROC resource limit, which is done here as we
+   // expect to be operating as a daemon. We set the argument limlower=true
+   // to potentially set a more restrictive limit than the current one.
+   Sched.setNproc(true);
 }
   
 /******************************************************************************/
@@ -216,7 +333,7 @@ int XrdConfig::Configure(int argc, char **argv)
 */
    const char *xrdInst="XRDINSTANCE=";
 
-   int retc, NoGo = 0, clPort = -1, optbg = 0;
+   int retc, NoGo = 0, clPort = -1;
    const char *temp;
    char c, buff[512], *dfltProt, *libProt = 0;
    uid_t myUid = 0;
@@ -231,27 +348,35 @@ int XrdConfig::Configure(int argc, char **argv)
    char *argbP = argBuff, *argbE = argbP+sizeof(argBuff)-4;
    char *ifList = 0;
    int   myArgc = 1, urArgc = argc, i;
-   bool noV6, ipV4 = false, ipV6 = false;
+   bool noV6, ipV4 = false, ipV6 = false, rootChk = true, optbg = false;
 
-// Obtain the protocol name we will be using
+// Reconstruct the command line so we can put it in the log
+//
+   XrdOucString CmdLine(argv[0]);
+   for (int k = 1; k < argc; k++)
+       {CmdLine += ' '; CmdLine += argv[k];}
+
+// Obtain the program name we will be using
 //
     retc = strlen(argv[0]);
     while(retc--) if (argv[0][retc] == '/') break;
-    myProg = dfltProt = &argv[0][retc+1];
+    myProg = &argv[0][retc+1];
 
 // Setup the initial required protocol. The program name matches the protocol
 // name but may be arbitrarily suffixed. We need to ignore this suffix. So we
 // look for it here and it it exists we duplicate argv[0] (yes, loosing some
 // bytes - sorry valgrind) without the suffix.
 //
-  {char *p = dfltProt;
+  {char *p = dfltProt = strdup(myProg);
    while(*p && (*p == '.' || *p == '-')) p++;
    if (*p)
-      {char *dot = index(p, '.'), *dash = index(p, '-'), sepc;
+      {char *dot = index(p, '.'), *dash = index(p, '-');
        if (dot  && (dot < dash || !dash)) p = dot;
           else if (dash) p = dash;
                   else   p = 0;
-       if (p) {sepc = *p; *p = '\0'; dfltProt = strdup(dfltProt); *p = sepc;}
+       if (p) *p = '\0';
+            if (!strcmp("xrootd", dfltProt)) dfltProt[5] = 0;
+       else if (!strcmp("cmsd",   dfltProt)) dfltProt[3] = 0;
       }
   }
    myArgv[0] = argv[0];
@@ -284,16 +409,26 @@ int XrdConfig::Configure(int argc, char **argv)
 //
    opterr = 0;
    if (argc > 1 && '-' == *argv[1]) 
-      while ((c = getopt(urArgc,argv,":bc:dhHI:k:l:L:n:p:P:R:s:S:vz"))
+      while ((c = getopt(urArgc,argv,":a:A:bc:dhHI:k:l:L:n:N:p:P:R:s:S:vw:W:z"))
              && ((unsigned char)c != 0xff))
      { switch(c)
        {
-       case 'b': optbg = 1;
+       case 'a': if (AdminPath) free(AdminPath);
+                 AdminPath = strdup(optarg);
+                 AdminMode = ProtInfo.AdmMode = S_IRWXU;
+                 ProtInfo.xrdFlags |= XrdProtocol_Config::admPSet;
+                 break;
+       case 'A': if (AdminPath) free(AdminPath);
+                 AdminPath = strdup(optarg);
+                 AdminMode = ProtInfo.AdmMode = S_IRWXU | S_IRWXG;
+                 ProtInfo.xrdFlags |= XrdProtocol_Config::admPSet;
+                 break;
+       case 'b': optbg = true;
                  break;
        case 'c': if (ConfigFN) free(ConfigFN);
                  ConfigFN = strdup(optarg);
                  break;
-       case 'd': Trace.What |= TRACE_ALL;
+       case 'd': XrdTrace.What |= TRACE_ALL;
                  ProtInfo.DebugON = 1;
                  XrdOucEnv::Export("XRDDEBUG",  "1");
                  break;
@@ -324,11 +459,15 @@ int XrdConfig::Configure(int argc, char **argv)
        case 'n': myInsName = (!strcmp(optarg,"anon")||!strcmp(optarg,"default")
                            ? 0 : optarg);
                  break;
-       case 'p': if ((clPort = yport(&Log, "tcp", optarg)) < 0) Usage(1);
+       case 'N': XrdNetIdentity::SetFQN(optarg);
                  break;
-       case 'P': dfltProt = optarg;
+       case 'p': if ((clPort = XrdOuca2x::a2p(Log,"tcp",optarg)) < 0) Usage(1);
+                 break;
+       case 'P': if (dfltProt) free(dfltProt);
+                 dfltProt = strdup(optarg);
                  break;
        case 'R': if (!(getUG(optarg, myUid, myGid))) Usage(1);
+                 rootChk = false;
                  break;
        case 's': pidFN = optarg;
                  break;
@@ -338,8 +477,18 @@ int XrdConfig::Configure(int argc, char **argv)
                  Log.Emsg("Config", buff, "parameter not specified.");
                  Usage(1);
                  break;
-       case 'v': cerr <<XrdVSTRING <<endl;
+       case 'v': std::cerr <<XrdVSTRING <<std::endl;
                  _exit(0);
+                 break;
+       case 'w': if (HomePath) free(HomePath);
+                 HomePath = strdup(optarg);
+                 HomeMode = S_IRWXU;
+                 Specs |= hpSpec;
+                 break;
+       case 'W': if (HomePath) free(HomePath);
+                 HomePath = strdup(optarg);
+                 HomeMode = S_IRWXU | S_IRGRP | S_IXGRP;
+                 Specs |= hpSpec;
                  break;
        case 'z': LogInfo.hiRes = true;
                  break;
@@ -357,6 +506,25 @@ int XrdConfig::Configure(int argc, char **argv)
                 break;
        }
      }
+
+// If an adminpath specified, make sure it's absolute
+//
+   if ((ProtInfo.xrdFlags & XrdProtocol_Config::admPSet) && *AdminPath != '/')
+      {Log.Emsg("Config", "Command line adminpath is not absolute.");
+       exit(17);
+      }
+
+// If an homepath specified, make sure it's absolute
+//
+   if (HomePath && *HomePath != '/')
+      {Log.Emsg("Config", "Command line home path is not absolute.");
+       exit(17);
+      }
+
+// If the configuration file is relative to where we are, get the absolute
+// path as we may be changing the home path. This also starts capturing.
+//
+   if (ConfigFN) setCFG(true);
 
 // The first thing we must do is to set the correct networking mode
 //
@@ -379,6 +547,14 @@ int XrdConfig::Configure(int argc, char **argv)
       {Log.Emsg("Config", errno, "set effective gid"); exit(17);}
    if (myUid && seteuid(myUid))
       {Log.Emsg("Config", errno, "set effective uid"); exit(17);}
+
+// Prohibit this program from executing as superuser unless -R was specified.
+//
+   if (rootChk && geteuid() == 0)
+      {Log.Emsg("Config", "Security reasons prohibit running as "
+                "superuser; program is terminating.");
+       _exit(8);
+      }
 
 // Pass over any parameters
 //
@@ -439,6 +615,7 @@ int XrdConfig::Configure(int argc, char **argv)
        LogInfo.iName  = myInsName;
        LogInfo.cfgFn  = ConfigFN;
        if (!XrdOucLogging::configLog(Log, LogInfo)) _exit(16);
+       Log.logger()->AddMsg(CmdLine.c_str());
        Log.logger()->AddMsg(XrdBANNER);
       }
 
@@ -463,6 +640,7 @@ int XrdConfig::Configure(int argc, char **argv)
    retc = strlen(buff);
    XrdSysUtils::FmtUname(buff+retc, sizeof(buff)-retc);
    Log.Say(0, buff);
+   Log.Say(0, CmdLine.c_str());
    Log.Say(XrdBANNER);
 
 // Verify that we have a real name. We've had problems with people setting up
@@ -487,18 +665,58 @@ int XrdConfig::Configure(int argc, char **argv)
 //
    Log.Say("++++++ ", myInstance, " initialization started.");
 
+// Allocate /dev/null as we need it and can't live without it
+//
+   devNull = XrdSysFD_Open("/dev/null", O_RDONLY);
+   if (devNull < 0)
+      {Log.Emsg("Config", errno, "open '/dev/null' which is required!");
+       NoGo = 1;
+      }
+
 // Process the configuration file, if one is present
 //
-   if (ConfigFN && *ConfigFN)
+   if (ConfigFN)
       {Log.Say("Config using configuration file ", ConfigFN);
        ProtInfo.ConfigFN = ConfigFN;
-       setCFG();
        NoGo = ConfigProc();
       }
    if (clPort >= 0) PortTCP = clPort;
    if (ProtInfo.DebugON) 
-      {Trace.What = TRACE_ALL;
+      {XrdTrace.What = TRACE_ALL;
        XrdSysThread::setDebug(&Log);
+      }
+
+// Setup the admin path now
+//
+   NoGo |= SetupAPath();
+
+// If tls enabled, set it up. We skip this if we failed to avoid confusing msgs
+//
+   if (!NoGo)
+      {if (!tlsCert) ProtInfo.tlsCtx= 0;
+          else {Log.Say("++++++ ", myInstance, " TLS initialization started.");
+                if (SetupTLS())
+                   {Log.Say("------ ",myInstance," TLS initialization ended.");
+                    if ((ProtInfo.tlsCtx = XrdGlobal::tlsCtx))
+                       theEnv.PutPtr("XrdTlsContext*", XrdGlobal::tlsCtx);
+                   } else {
+                    NoGo = 1;
+                    Log.Say("------ ",myInstance," TLS initialization failed.");
+                   }
+               }
+      }
+
+// If there is TLS port verify that it can be used. We ignore this if we
+// will fail anyway so as to not issue confusing messages.
+//
+   if (!NoGo)
+      {if (PortTLS > 0 && !XrdGlobal::tlsCtx)
+          {Log.Say("Config TLS port specification ignored; TLS not configured!");
+           PortTLS = -1;
+          } else {
+           ProtInfo.tlsCtx  = XrdGlobal::tlsCtx;
+           ProtInfo.tlsPort = (PortTLS > 0 ? PortTLS : 0);
+         }
       }
 
 // Put largest buffer size in the env
@@ -517,32 +735,50 @@ int XrdConfig::Configure(int argc, char **argv)
        NoGo = 1;
       }
 
-// Now initialize the default protocl
-//
-   if (!NoGo) NoGo = Setup(dfltProt);
-
-// If we hae a net name change the working directory
+// If we have an instance name change the working directory
 //
    if ((myInsName || HomePath)
    &&  !XrdOucUtils::makeHome(Log, myInsName, HomePath, HomeMode)) NoGo = 1;
+
+// Create the pid file
+//
+   if (!PidFile(pidFN, optbg)) NoGo = 1;
+
+// Establish a manifest file for auto-collection
+//
+   if (!NoGo) Manifest(pidFN);
+
+// Now initialize the protocols and other stuff
+//
+   if (!NoGo) NoGo = Setup(dfltProt, libProt);
+
+// End config capture
+//
+   setCFG(false);
+
+// If we have a tcpmon plug-in try loading it now. We won't do that unless
+// tcp monitoring was enabled by the monitoring framework.
+//
+   if (tmoInfo && !NoGo)
+      {void *theGS = theEnv.GetPtr("TcpMon.gStream*");
+       if (!theGS) Log.Say("Config warning: TCP monitoring not enabled; "
+                   "tcpmonlib plugin not loaded!");
+           else {tmoInfo->theEnv.PutPtr("TcpMon.gStream*", theGS);
+                 TcpMonPin = tmoInfo->KingPin.Load("TcpMonPin");
+                 if (!TcpMonPin) NoGo = 1;
+                }
+      }
 
    // if we call this it means that the daemon has forked and we are
    // in the child process
 #ifndef WIN32
    if (optbg)
    {
-      if (pidFN && !XrdOucUtils::PidFile(Log, pidFN ) )
-         NoGo = 1;
-
       int status = NoGo ? 1 : 0;
       if(write( pipeFD[1], &status, sizeof( status ) )) {};
       close( pipeFD[1]);
    }
 #endif
-
-// Establish a pid/manifest file for auto-collection
-//
-   if (!NoGo) Manifest(pidFN);
 
 // All done, close the stream and return the return code.
 //
@@ -585,11 +821,17 @@ int XrdConfig::ConfigXeq(char *var, XrdOucStream &Config, XrdSysError *eDest)
    TS_Xeq("adminpath",     xapath);
    TS_Xeq("allow",         xallow);
    TS_Xeq("homepath",      xhpath);
+   TS_Xeq("maxfd",         xmaxfd);
+   TS_Xeq("pidpath",       xpidf);
    TS_Xeq("port",          xport);
    TS_Xeq("protocol",      xprot);
    TS_Xeq("report",        xrep);
    TS_Xeq("sitename",      xsit);
+   TS_Xeq("tcpmonlib",     xtcpmon);
    TS_Xeq("timeout",       xtmo);
+   TS_Xeq("tls",           xtls);
+   TS_Xeq("tlsca",         xtlsca);
+   TS_Xeq("tlsciphers",    xtlsci);
    }
 
    // No match found, complain.
@@ -608,24 +850,15 @@ int XrdConfig::ConfigXeq(char *var, XrdOucStream &Config, XrdSysError *eDest)
   
 int XrdConfig::ASocket(const char *path, const char *fname, mode_t mode)
 {
-   char xpath[MAXPATHLEN+8], sokpath[108];
+   struct sockaddr_un unixvar;
    int  plen = strlen(path), flen = strlen(fname);
-   int rc;
 
 // Make sure we can fit everything in our buffer
 //
-   if ((plen + flen + 3) > (int)sizeof(sokpath))
+   if ((plen + flen + 3) > (int)sizeof(unixvar.sun_path))
       {Log.Emsg("Config", "admin path", path, "too long");
        return 1;
       }
-
-// Create the directory path
-//
-   strcpy(xpath, path);
-   if ((rc = XrdOucUtils::makePath(xpath, mode)))
-       {Log.Emsg("Config", rc, "create admin path", xpath);
-        return 1;
-       }
 
 // *!*!* At this point we do not yet support the admin path for xrd.
 // sp we comment out all of the following code.
@@ -633,6 +866,8 @@ int XrdConfig::ASocket(const char *path, const char *fname, mode_t mode)
 /*
 // Construct the actual socket name
 //
+  char sokpath[sizeof(Unix.sun_path)];
+
   if (sokpath[plen-1] != '/') sokpath[plen++] = '/';
   strcpy(&sokpath[plen], fname);
 
@@ -676,10 +911,11 @@ int XrdConfig::ConfigProc()
    while((var = Config.GetMyFirstWord()))
         if (!strncmp(var, "xrd.", 4)
         ||  !strcmp (var, "all.adminpath")
+        ||  !strcmp (var, "all.pidpath")
         ||  !strcmp (var, "all.sitename" ))
            if (ConfigXeq(var+4, Config)) {Config.Echo(); NoGo = 1;}
 
-// Now check if any errors occured during file i/o
+// Now check if any errors occurred during file i/o
 //
    if ((retc = Config.LastError()))
       NoGo = Log.Emsg("Config", retc, "read config file", ConfigFN);
@@ -690,6 +926,44 @@ int XrdConfig::ConfigProc()
    return NoGo;
 }
 
+/******************************************************************************/
+/*                                g e t N e t                                 */
+/******************************************************************************/
+
+XrdInet *XrdConfig::getNet(int port, bool isTLS)
+{
+   int the_Opts, the_Blen;
+
+// Try to find an existing network for this port
+//
+   for (int i = 0; i < (int)NetTCP.size(); i++)
+       if (port == NetTCP[i]->Port()) return NetTCP[i];
+
+// Create a new network for this port
+//
+   XrdInet *newNet = new XrdInet(&Log, Police);
+   NetTCP.push_back(newNet);
+
+// Set options
+//
+   if (isTLS)
+      {the_Opts = TLS_Opts; the_Blen = TLS_Blen;
+      } else {
+       the_Opts = Net_Opts; the_Blen = Net_Blen;
+      }
+   if (the_Opts || the_Blen) newNet->setDefaults(the_Opts, the_Blen);
+
+// Set the domain if we have one
+//
+   if (myDomain) newNet->setDomain(myDomain);
+
+// Attempt to bind to this socket.
+//
+   if (newNet->BindSD(port, "tcp") == 0) return newNet;
+   delete newNet;
+   return 0;
+}
+  
 /******************************************************************************/
 /*                                 g e t U G                                  */
 /******************************************************************************/
@@ -731,7 +1005,7 @@ int XrdConfig::getUG(char *parm, uid_t &newUid, gid_t &newGid)
 void XrdConfig::Manifest(const char *pidfn)
 {
    const char *Slash;
-   char envBuff[8192], pwdBuff[1024], manBuff[1024], *pidP, *sP, *xP;
+   char envBuff[8192], pwdBuff[2048], manBuff[1024], *pidP, *sP, *xP;
    int envFD, envLen;
 
 // Get the current working directory
@@ -740,6 +1014,11 @@ void XrdConfig::Manifest(const char *pidfn)
       {Log.Emsg("Config", "Unable to get current working directory!");
        return;
       }
+
+// The above is the authoratative home directory, so recorded here.
+//
+   if (HomePath) free(HomePath);
+   HomePath = strdup(pwdBuff);
 
 // Prepare for symlinks
 //
@@ -779,9 +1058,9 @@ void XrdConfig::Manifest(const char *pidfn)
 // Create environment string
 //
    envLen = snprintf(envBuff, sizeof(envBuff), "pid=%d&host=%s&inst=%s&ver=%s"
-                     "&cfgfn=%s&cwd=%s&apath=%s&logfn=%s\n",
+                     "&home=%s&cfgfn=%s&cwd=%s&apath=%s&logfn=%s",
                      static_cast<int>(getpid()), ProtInfo.myName,
-                     ProtInfo.myInst, XrdVSTRING,
+                     ProtInfo.myInst, XrdVSTRING, HomePath,
                      (getenv("XRDCONFIGFN") ? getenv("XRDCONFIGFN") : ""),
                      pwdBuff, ProtInfo.AdmPath, Log.logger()->xlogFN());
 
@@ -789,12 +1068,13 @@ void XrdConfig::Manifest(const char *pidfn)
 //
    if (pidfn && (Slash = rindex(pidfn, '/')))
       {strncpy(manBuff, pidfn, Slash-pidfn); pidP = manBuff+(Slash-pidfn);}
-      else {strcpy(manBuff, "/tmp");         pidP = manBuff+4;}
+      else {strcpy(manBuff, ProtInfo.AdmPath); pidP = manBuff+strlen(ProtInfo.AdmPath);}
 
 // Construct the pid file name for ourselves
 //
    snprintf(pidP, sizeof(manBuff)-(pidP-manBuff), "/%s.%s.env",
                      ProtInfo.myProg, ProtInfo.myInst);
+   theEnv.Put("envFile", manBuff);
 
 // Open the file
 //
@@ -807,39 +1087,104 @@ void XrdConfig::Manifest(const char *pidfn)
 //
    if (write(envFD, envBuff, envLen) < 0)
       Log.Emsg("Config", errno, "write to envfile", manBuff);
+   close(envFD);
+}
+
+/******************************************************************************/
+/*                               P i d F i l e                                */
+/******************************************************************************/
+  
+bool XrdConfig::PidFile(const char *clpFN, bool optbg)
+{
+   int rc, xfd;
+   char *ppath, buff[32], pidFN[1200];
+   const char *xop = 0;
+
+// If a command line pidfn was specified, we must successfully write it
+// if we are in background mode. Otherwise, we simply continue.
+//
+   if (clpFN && !XrdOucUtils::PidFile(Log, clpFN) && optbg) return false;
+
+// Generate the old-style pidpath we will use
+//
+   ppath=XrdOucUtils::genPath(PidPath,XrdOucUtils::InstName(-1));
+
+// Create the path if it does not exist and write out the pid
+//
+   if ((rc = XrdOucUtils::makePath(ppath,XrdOucUtils::pathMode)))
+      {xop = "create"; snprintf(pidFN, sizeof(pidFN), "%s", ppath); errno = rc;}
+      else {snprintf(pidFN, sizeof(pidFN), "%s/%s.pid", ppath, myProg);
+
+           if ((xfd = open(pidFN, O_WRONLY|O_CREAT|O_TRUNC,0644)) < 0)
+              xop = "open";
+              else {if (write(xfd,buff,snprintf(buff,sizeof(buff),"%d",
+                        static_cast<int>(getpid()))) < 0) xop = "write";
+                    close(xfd);
+                   }
+           }
 
 // All done
 //
-   close(envFD);
+   free(ppath);
+   if (xop) Log.Emsg("Config", errno, xop, pidFN);
+   return true;
 }
 
 /******************************************************************************/
 /*                                s e t C F G                                 */
 /******************************************************************************/
   
-void XrdConfig::setCFG()
+void XrdConfig::setCFG(bool start)
 {
-   char cwdBuff[1024], *cfnP = cwdBuff;
-   int n;
 
-// If the config file is absolute, export it as is
+// If there is no config file there is nothing to do
 //
-   if (*ConfigFN == '/')
-      {XrdOucEnv::Export("XRDCONFIGFN", ConfigFN);
+   if (!ConfigFN || !(*ConfigFN))
+      {if (ConfigFN)
+          {free(ConfigFN);
+           ConfigFN = 0;
+          }
        return;
       }
 
-// Prefix current working directory to the config file
+// If ending, post process the config capture
 //
-   if (!getcwd(cwdBuff, sizeof(cwdBuff)-strlen(ConfigFN)-2)) cfnP = ConfigFN;
-      else {n = strlen(cwdBuff);
-            if (cwdBuff[n-1] != '/') cwdBuff[n++] = '/';
-            strcpy(cwdBuff+n, ConfigFN);
-           }
+   if (!start)
+      {XrdOucStream::Capture((XrdOucString *)0);
+       if (totalCF.length())
+          {char *temp = (char *)malloc(totalCF.length()+1);
+           strcpy(temp, totalCF.c_str());
+           totalCF.resize();
+           totalCF = temp;
+           free(temp);
+          }
+       return;
+      }
+
+// Prefix current working directory to the config file if not absolute
+//
+   if (*ConfigFN != '/')
+      {char cwdBuff[1024];
+       if (getcwd(cwdBuff,sizeof(cwdBuff)-strlen(ConfigFN)-2))
+          {int n = strlen(cwdBuff);
+           if (cwdBuff[n-1] != '/') cwdBuff[n++] = '/';
+           strcpy(cwdBuff+n, ConfigFN);
+           free(ConfigFN);
+           ConfigFN = strdup(cwdBuff);
+          }
+      }
 
 // Export result
 //
-   XrdOucEnv::Export("XRDCONFIGFN", cfnP);
+   XrdOucEnv::Export("XRDCONFIGFN", ConfigFN);
+
+// Setup capturing for the XrdOucStream that will be used by all others to
+// process config files.
+//
+   XrdOucStream::Capture(&totalCF);
+   totalCF.resize(1024*1024);
+   const char *cvec[] = { "*** ", myProg, " config from '", ConfigFN, "':", 0 };
+   XrdOucStream::Capture(cvec);
 }
 
 /******************************************************************************/
@@ -848,7 +1193,6 @@ void XrdConfig::setCFG()
   
 int XrdConfig::setFDL()
 {
-   static const int maxFD = 65535; // was 1048576 see XrdNetAddrInfo::sockNum
    struct rlimit rlim;
    char buff[100];
 
@@ -859,10 +1203,16 @@ int XrdConfig::setFDL()
 
 // Set the limit to the maximum allowed
 //
-   if (rlim.rlim_max == RLIM_INFINITY) rlim.rlim_cur = maxFD;
+   if (rlim.rlim_max == RLIM_INFINITY || (isStrict && rlim.rlim_max > maxFD))
+      rlim.rlim_cur = maxFD;
       else rlim.rlim_cur = rlim.rlim_max;
 #if (defined(__APPLE__) && defined(MAC_OS_X_VERSION_10_5))
    if (rlim.rlim_cur > OPEN_MAX) rlim.rlim_max = rlim.rlim_cur = OPEN_MAX;
+#endif
+#if defined(__linux__)
+// Setting a limit beyond this value on Linux is guaranteed to fail during epoll_wait()
+   unsigned int epoll_max_fd = (INT_MAX / sizeof(struct epoll_event));
+   if (rlim.rlim_cur > (rlim_t)epoll_max_fd) rlim.rlim_max = rlim.rlim_cur = epoll_max_fd;
 #endif
    if (setrlimit(RLIMIT_NOFILE, &rlim) < 0)
       return Log.Emsg("Config", errno,"set FD limit");
@@ -893,9 +1243,9 @@ int XrdConfig::setFDL()
 
 // The scheduler will have already set the thread limit. We just report it
 //
-#if defined(__linux__) && defined(RLIMIT_NPROC)
+#if ( defined(__linux__) || defined(__GNU__) || (defined(__FreeBSD_kernel__) && defined(__GLIBC__)) ) && defined(RLIMIT_NPROC)
 
-// Obtain the actual limit now (Scheduler construction sets this to rlim_max)
+// Obtain the actual limit now (Scheduler::setNproc may change this)
 //
    if (getrlimit(RLIMIT_NPROC, &rlim) < 0)
       return Log.Emsg("Config", errno, "get thread limit");
@@ -916,11 +1266,10 @@ int XrdConfig::setFDL()
 /*                                 S e t u p                                  */
 /******************************************************************************/
   
-int XrdConfig::Setup(char *dfltp)
+int XrdConfig::Setup(char *dfltp, char *libProt)
 {
-   XrdInet *NetWAN;
    XrdConfigProt *cp;
-   int i, wsz, arbNet;
+   int xport, protNum = 0;
 
 // Establish the FD limit
 //
@@ -928,7 +1277,7 @@ int XrdConfig::Setup(char *dfltp)
 
 // Special handling for Linux sendfile()
 //
-#if defined(__linux__) && defined(TCP_CORK)
+#if ( defined(__linux__) || defined(__GNU__) ) && defined(TCP_CORK)
 {  int sokFD, setON = 1;
    if ((sokFD = socket(PF_INET, SOCK_STREAM, 0)) >= 0)
       {setsockopt(sokFD, XrdNetUtils::ProtoID("tcp"), TCP_NODELAY,
@@ -954,23 +1303,8 @@ int XrdConfig::Setup(char *dfltp)
 
 // Setup the link and socket polling infrastructure
 //
-   XrdLink::Init(&Log, &Trace, &Sched);
-   XrdPoll::Init(&Log, &Trace, &Sched);
-   if (!XrdLink::Setup(ProtInfo.ConnMax, ProtInfo.idleWait)
+   if (!XrdLinkCtl::Setup(ProtInfo.ConnMax, ProtInfo.idleWait)
    ||  !XrdPoll::Setup(ProtInfo.ConnMax)) return 1;
-
-// Modify the AdminPath to account for any instance name. Note that there is
-// a negligible memory leak under ceratin path combinations. Not enough to
-// warrant a lot of logic to get around.
-//
-   if (myInsName) ProtInfo.AdmPath = XrdOucUtils::genPath(AdminPath,myInsName);
-      else ProtInfo.AdmPath = AdminPath;
-   XrdOucEnv::Export("XRDADMINPATH", ProtInfo.AdmPath);
-   AdminPath = XrdOucUtils::genPath(AdminPath, myInsName, ".xrd");
-
-// Setup admin connection now
-//
-   if (ASocket(AdminPath, "admin", (mode_t)AdminMode)) return 1;
 
 // Determine the default port number (only for xrootd) if not specified.
 //
@@ -981,12 +1315,24 @@ int XrdConfig::Setup(char *dfltp)
 
 // We now go through all of the protocols and get each respective port number.
 //
-   XrdProtLoad::Init(&Log, &Trace); cp = Firstcp;
+   cp = Firstcp;
    while(cp)
-        {ProtInfo.Port = (cp->port < 0 ? PortTCP : cp->port);
+        {if (!tlsCtx)
+            for (int i = 0; i < cp->numP; i++)
+                {if (cp->tlsVec[i])
+                    {Log.Emsg("Config", "protocol", cp->proname,
+                              "configured with a TLS-only port "
+                              "but TLS is not configured!");
+                     return 1;
+                    }
+                }
+         xport = (cp->dotls ? PortTLS : PortTCP);
+         ProtInfo.Port = (cp->port < 0 ? xport : cp->port);
          XrdOucEnv::Export("XRDPORT", ProtInfo.Port);
-         if ((cp->port = XrdProtLoad::Port(cp->libpath, cp->proname,
-                                           cp->parms, &ProtInfo)) < 0) return 1;
+         cp->port = XrdProtLoad::Port(cp->libpath,cp->proname,cp->parms,&ProtInfo);
+         if (cp->port < 0) return 1;
+         for (int i = 1; i < cp->numP; i++)
+             if (cp->port == cp->portVec[i]) cp->portVec[i] = -1;
          cp = cp->Next;
         }
 
@@ -997,70 +1343,159 @@ int XrdConfig::Setup(char *dfltp)
                                  ProtInfo.myName, Firstcp->port,
                                  ProtInfo.myInst, ProtInfo.myProg, mySitName);
 
-// Allocate a WAN port number of we need to
+// If the base protocol is xroot, then save the base port number so we can
+// extend the port to the http protocol should it have been loaded. That way
+// redirects via xroot will also work for http.
 //
-   if (PortWAN &&  (NetWAN = new XrdInet(&Log, &Trace, Police)))
-      {if (Wan_Opts || Wan_Blen) NetWAN->setDefaults(Wan_Opts, Wan_Blen);
-       if (myDomain) NetWAN->setDomain(myDomain);
-       if (NetWAN->BindSD((PortWAN > 0 ? PortWAN : 0), "tcp")) return 1;
-       PortWAN  = NetWAN->Port();
-       wsz      = NetWAN->WSize();
-       Wan_Blen = (wsz < Wan_Blen || !Wan_Blen ? wsz : Wan_Blen);
-       TRACE(NET,"WAN port " <<PortWAN <<" wsz=" <<Wan_Blen <<" (" <<wsz <<')');
-       NetTCP[XrdProtLoad::ProtoMax] = NetWAN;
-      } else {PortWAN = 0; Wan_Blen = 0;}
+   xport = (strcmp("xroot", Firstcp->proname) ? 0 : Firstcp->port);
 
 // Load the protocols. For each new protocol port number, create a new
 // network object to handle the port dependent communications part. All
-// port issues will have been resolved at this point.
+// port issues will have been resolved at this point. Note that we need
+// to set default network object from the first protocol before loading
+// any protocol in case one of them starts using the default network.
 //
-   arbNet = XrdProtLoad::ProtoMax;
+   XrdInet *arbNet = 0, *theNet;
    while((cp = Firstcp))
-        {if (!(cp->port)) i = arbNet;
-            else for (i = 0; i < XrdProtLoad::ProtoMax && NetTCP[i]; i++)
-                     {if (cp->port == NetTCP[i]->Port()) break;}
-         if (i >= XrdProtLoad::ProtoMax || !NetTCP[i])
-            {NetTCP[++NetTCPlep] = new XrdInet(&Log, &Trace, Police);
-             if (Net_Opts || Net_Blen)
-                NetTCP[NetTCPlep]->setDefaults(Net_Opts, Net_Blen);
-             if (myDomain) NetTCP[NetTCPlep]->setDomain(myDomain);
-             if (NetTCP[NetTCPlep]->BindSD(cp->port, "tcp")) return 1;
-             ProtInfo.Port   = NetTCP[NetTCPlep]->Port();
-             ProtInfo.NetTCP = NetTCP[NetTCPlep];
-             wsz             = NetTCP[NetTCPlep]->WSize();
-             ProtInfo.WSize  = (wsz < Net_Blen || !Net_Blen ? wsz : Net_Blen);
-             TRACE(NET,"LCL port " <<ProtInfo.Port <<" wsz=" <<ProtInfo.WSize
-                       <<" (" <<wsz <<')');
-             if (cp->wanopt)
-                {ProtInfo.WANPort = PortWAN;
-                 ProtInfo.WANWSize= Wan_Blen;
-                } else ProtInfo.WANPort = ProtInfo.WANWSize = 0;
-             if (!(cp->port)) arbNet = NetTCPlep;
-             if (!NetTCPlep) XrdLink::Init(NetTCP[0]);
-             XrdOucEnv::Export("XRDPORT", ProtInfo.Port);
-            }
-         if (!XrdProtLoad::Load(cp->libpath,cp->proname,cp->parms,&ProtInfo))
-            return 1;
-         Firstcp = cp->Next; delete cp;
-        }
+         {for (int i = 0; i < cp->numP; i++)
+             {if (cp->portVec[i] < 0) continue;
+              if (!(cp->portVec[i]) && arbNet) theNet = arbNet;
+                 else {theNet = getNet(cp->portVec[i], cp->tlsVec[i]);
+                       if (!theNet) return 1;
+                       if (!(cp->portVec[i])) arbNet = theNet;
+                      }
+              if (i == 0) XrdNetTCP = theNet; // Avoid race condition!!!
+              ProtInfo.Port   = theNet->Port();
+              ProtInfo.NetTCP = theNet;
+              ProtInfo.WSize  = theNet->WSize();
+              TRACE(NET, cp->proname <<':' <<ProtInfo.Port <<" wsz="
+                         <<ProtInfo.WSize);
+
+              if (i) XrdProtLoad::Port(protNum, ProtInfo.Port, cp->tlsVec[i]);
+                 else {XrdOucEnv::Export("XRDPORT", ProtInfo.Port);
+                       protNum = XrdProtLoad::Load(cp->libpath, cp->proname,
+                                                   cp->parms, &ProtInfo,
+                                                   cp->dotls);
+                       if (!protNum) return 1;
+                      }
+             }
+          if (!strcmp("http", cp->proname) && xport)
+             {for (int i = 0; i < cp->numP; i++)
+                  {if (cp->portVec[i] == xport) {xport = 0; break;}}
+              if (xport) XrdProtLoad::Port(protNum, xport, false);
+             }
+          Firstcp = cp->Next; delete cp;
+         }
 
 // Leave the env port number to be the first used port number. This may
-// or may not be the same as the default port number.
+// or may not be the same as the default port number. This corresponds to
+// the default network object.
 //
-   ProtInfo.Port = NetTCP[0]->Port();
-   PortTCP = ProtInfo.Port;
+   PortTCP = ProtInfo.Port = XrdNetTCP->Port();
    XrdOucEnv::Export("XRDPORT", PortTCP);
 
 // Now check if we have to setup automatic reporting
 //
    if (repDest[0] != 0 && repOpts) 
-      ProtInfo.Stats->Report(repDest, repInt, repOpts);
+      {ProtInfo.Stats->Report(repDest, repInt, repOpts);
+       theMon = new XrdMonitor;
+       XrdMonRoll* monRoll = new XrdMonRoll(*theMon);
+       theEnv.PutPtr("XrdMonRoll*", monRoll);
+      }
 
 // All done
 //
    return 0;
 }
 
+/******************************************************************************/
+/*                            S e t u p A P a t h                             */
+/******************************************************************************/
+
+int XrdConfig::SetupAPath()
+{
+   int rc;
+
+// Modify the AdminPath to account for any instance name. Note that there is
+// a negligible memory leak under certain path combinations. Not enough to
+// warrant a lot of logic to get around.
+//
+   if (myInsName) ProtInfo.AdmPath = XrdOucUtils::genPath(AdminPath,myInsName);
+      else ProtInfo.AdmPath = AdminPath;
+   XrdOucEnv::Export("XRDADMINPATH", ProtInfo.AdmPath);
+   AdminPath = XrdOucUtils::genPath(AdminPath, myInsName, ".xrd");
+
+// Create the path. Only sockets are group writable but allow read access to
+// the path for group members.
+//
+//
+   if ((rc = XrdOucUtils::makePath(AdminPath, AdminMode & ~S_IWGRP)))
+       {Log.Emsg("Config", rc, "create admin path", AdminPath);
+        return 1;
+       }
+
+// Make sure the last component has the permission that we want
+//
+#ifndef WIN32
+   if (chmod(AdminPath, AdminMode & ~S_IWGRP))
+      {Log.Emsg("Config", errno, "set permission for admin path", AdminPath);
+       return 1;
+      }
+#endif
+
+
+// Setup admin connection now
+//
+   return ASocket(AdminPath, "admin", (mode_t)AdminMode);
+}
+  
+/******************************************************************************/
+/*                              S e t u p T L S                               */
+/******************************************************************************/
+
+bool XrdConfig::SetupTLS()
+{
+
+// Check if we should issue a verification error
+//
+   if (!caDir && !caFile && !tlsNoVer)
+      {if (tlsNoCAD)
+          Log.Say("Config failure: the tlsca directive was not specified!");
+          else Log.Say("Config failure: the tlsca directive did not specify "
+                       "a certdir or certfile!");
+       return false;
+      }
+
+// Set the message callback before doing anything else
+//
+   XrdTls::SetMsgCB(TlsError);
+
+// Set tracing options as needed
+//
+   if (TRACING((TRACE_DEBUG|TRACE_TLS)))
+      {int tlsdbg = 0;
+       if (TRACING(TRACE_DEBUG)) tlsdbg = XrdTls::dbgALL;
+          else {if (TRACING(TRACE_TLSCTX)) tlsdbg |= XrdTls::dbgCTX;
+                if (TRACING(TRACE_TLSSIO)) tlsdbg |= XrdTls::dbgSIO;
+                if (TRACING(TRACE_TLSSOK)) tlsdbg |= XrdTls::dbgSOK;
+               }
+       XrdTls::SetDebug(tlsdbg, &Logger);
+      }
+
+// Create a context
+//
+   static XrdTlsContext xrdTLS(tlsCert, tlsKey, caDir, caFile, tlsOpts);
+
+// Check if all went well
+//
+   if (!xrdTLS.isOK()) return false;
+
+// Set address of out TLS object in the global area
+//
+   XrdGlobal::tlsCtx = &xrdTLS;
+   return true;
+}
+  
 /******************************************************************************/
 /*                                 U s a g e                                  */
 /******************************************************************************/
@@ -1069,11 +1504,12 @@ void XrdConfig::Usage(int rc)
 {
   extern const char *XrdLicense;
 
-  if (rc < 0) cerr <<XrdLicense;
+  if (rc < 0) std::cerr <<XrdLicense;
      else
-     cerr <<"\nUsage: " <<myProg <<" [-b] [-c <cfn>] [-d] [-h] [-H] [-I {v4|v6}]\n"
-            "[-k {n|sz|sig}] [-l [=]<fn>] [-n name] [-p <port>] [-P <prot>] [-L <libprot>]\n"
-            "[-R] [-s pidfile] [-S site] [-v] [-z] [<prot_options>]" <<endl;
+     std::cerr <<"\nUsage: " <<myProg <<" [-b] [-c <cfn>] [-d] [-h] [-H] [-I {v4|v6}]\n"
+            "[-k {n|sz|sig}] [-l [=]<fn>] [-n <name>] [-N <hname>] [-p <port>]\n"
+            "[-P <prot>] [-L <libprot>] [-R] [-s pidfile] [-S site] [-v] [-z]\n"
+            "[<protocol_options>]" <<std::endl;
      _exit(rc > 0 ? rc : 0);
 }
 
@@ -1160,7 +1596,7 @@ int XrdConfig::xallow(XrdSysError *eDest, XrdOucStream &Config)
        {eDest->Emsg("Config", "allow target name not specified"); return 1;}
 
     if (!Police) {Police = new XrdNetSecurity();
-                  if (Trace.What == TRACE_ALL) Police->Trace(&Trace);
+                  if (XrdTrace.What == TRACE_ALL) Police->Trace(&XrdTrace);
                  }
     if (ishost)  Police->AddHost(val);
        else      Police->AddNetGroup(val);
@@ -1185,6 +1621,13 @@ int XrdConfig::xallow(XrdSysError *eDest, XrdOucStream &Config)
 
 int XrdConfig::xhpath(XrdSysError *eDest, XrdOucStream &Config)
 {
+// If the command line specified he home, it cannot be undone
+//
+   if (Specs & hpSpec)
+      {eDest->Say("Config warning: command line homepath cannot be overridden.");
+       Config.GetWord();
+       return 0;
+      }
 
 // Free existing home path, if any
 //
@@ -1243,27 +1686,68 @@ int XrdConfig::xbuf(XrdSysError *eDest, XrdOucStream &Config)
     return 0;
 }
 
+
+/******************************************************************************/
+/*                                x m a x f d                                 */
+/******************************************************************************/
+
+/* Function: xmaxfd
+
+   Purpose:  To parse the directive: maxfd [strict] <numfd>
+
+             strict     when specified, the limits is always applied. Otherwise,
+                        it is only applied when rlimit is infinite.
+             <numfd>    maximum number of fs that can be established.
+                        Specify a value optionally suffixed with 'k'.
+
+   Output: 0 upon success or !0 upon failure.
+*/
+int XrdConfig::xmaxfd(XrdSysError *eDest, XrdOucStream &Config)
+{
+    long long minV = 1024, maxV = 1024LL*1024LL; // between 1k and 1m
+    long long fdVal;
+    char *val;
+
+    if ((val = Config.GetWord()))
+       {if (!strcmp(val, "strict")) 
+           {isStrict = true;
+            val = Config.GetWord();
+           } else isStrict = false;
+       }
+
+    if (!val)
+       {eDest->Emsg("Config", "file descriptor limit not specified"); return 1;}
+
+
+    if (XrdOuca2x::a2sz(*eDest,"maxfd value",val,&fdVal,minV,maxV)) return 1;
+
+    maxFD = static_cast<unsigned int>(fdVal);
+
+    return 0;
+}
+
 /******************************************************************************/
 /*                                  x n e t                                   */
 /******************************************************************************/
 
 /* Function: xnet
 
-   Purpose:  To parse directive: network [wan] [[no]keepalive] [buffsz <blen>]
+   Purpose:  To parse directive: network [tls] [[no]keepalive] [buffsz <blen>]
                                          [kaparms parms] [cache <ct>] [[no]dnr]
                                          [routes <rtype> [use <ifn1>,<ifn2>]]
-                                         [[no]rpipa]
+                                         [[no]rpipa] [[no]dyndns]
 
              <rtype>: split | common | local
 
-             wan       parameters apply only to the wan port
+             tls       parameters apply only to the tls port
              keepalive do [not] set the socket keepalive option.
-             kaparms   keepalive paramters as specfied by parms.
+             kaparms   keepalive paramters as specified by parms.
              <blen>    is the socket's send/rcv buffer size.
              <ct>      Seconds to cache address to name resolutions.
              [no]dnr   do [not] perform a reverse DNS lookup if not needed.
              routes    specifies the network configuration (see reference)
              [no]rpipa do [not] resolve private IP addresses.
+             [no]dyndns This network does [not] use a dynamic DNS.
 
    Output: 0 upon success or !0 upon failure.
 */
@@ -1271,8 +1755,8 @@ int XrdConfig::xbuf(XrdSysError *eDest, XrdOucStream &Config)
 int XrdConfig::xnet(XrdSysError *eDest, XrdOucStream &Config)
 {
     char *val;
-    int  i, n, V_keep = -1, V_nodnr = 0, V_iswan = 0, V_blen = -1, V_ct = -1, V_assumev4;
-    int  v_rpip = -1;
+    int  i, n, V_keep = -1, V_nodnr = 0, V_istls = 0, V_blen = -1, V_ct = -1;
+    int   V_assumev4 = -1, v_rpip = -1, V_dyndns = -1;
     long long llp;
     struct netopts {const char *opname; int hasarg; int opval;
                            int *oploc;  const char *etxt;}
@@ -1286,10 +1770,12 @@ int XrdConfig::xnet(XrdSysError *eDest, XrdOucStream &Config)
         {"cache",      2, 0, &V_ct,     "cache time"},
         {"dnr",        0, 0, &V_nodnr,  "option"},
         {"nodnr",      0, 1, &V_nodnr,  "option"},
+        {"dyndns",     0, 1, &V_dyndns, "option"},
+        {"nodyndns",   0, 0, &V_dyndns, "option"},
         {"routes",     3, 1, 0,         "routes"},
         {"rpipa",      0, 1, &v_rpip,   "rpipa"},
         {"norpipa",    0, 0, &v_rpip,   "norpipa"},
-        {"wan",        0, 1, &V_iswan,  "option"}
+        {"tls",        0, 1, &V_istls,  "option"}
        };
     int numopts = sizeof(ntopts)/sizeof(struct netopts);
 
@@ -1348,18 +1834,23 @@ int XrdConfig::xnet(XrdSysError *eDest, XrdOucStream &Config)
       val = Config.GetWord();
      }
 
-     if (V_iswan)
-        {if (V_blen >= 0) Wan_Blen = V_blen;
-         if (V_keep >= 0) Wan_Opts = (V_keep  ? XRDNET_KEEPALIVE : 0);
-         Wan_Opts |= (V_nodnr ? XRDNET_NORLKUP   : 0);
-         if (!PortWAN) PortWAN = -1;
+     if (V_istls)
+        {if (V_blen >= 0) TLS_Blen = V_blen;
+         if (V_keep >= 0) TLS_Opts = (V_keep  ? XRDNET_KEEPALIVE : 0);
+         TLS_Opts |= (V_nodnr ? XRDNET_NORLKUP   : 0) | XRDNET_USETLS;
         } else {
          if (V_blen >= 0) Net_Blen = V_blen;
          if (V_keep >= 0) Net_Opts = (V_keep  ? XRDNET_KEEPALIVE : 0);
          Net_Opts |= (V_nodnr ? XRDNET_NORLKUP   : 0);
         }
-
+  // Turn off name chaing if not specified and dynamic dns was specified
+  //
+     if (V_dyndns >= 0)
+        {if (V_dyndns && V_ct < 0) V_ct = 0;
+         XrdNetAddr::SetDynDNS(V_dyndns != 0);
+        }
      if (V_ct >= 0) XrdNetAddr::SetCache(V_ct);
+
      if (v_rpip >= 0) XrdInet::netIF.SetRPIPA(v_rpip != 0);
      if (V_assumev4 >= 0) XrdInet::SetAssumeV4(true);
      return 0;
@@ -1413,29 +1904,59 @@ int XrdConfig::xnkap(XrdSysError *eDest, char *val)
 }
   
 /******************************************************************************/
+/*                                 x p i d f                                  */
+/******************************************************************************/
+
+/* Function: xpidf
+
+   Purpose:  To parse the directive: pidpath <path>
+
+             <path>    the path where the pid file is to be created.
+
+  Output: 0 upon success or !0 upon failure.
+*/
+
+int XrdConfig::xpidf(XrdSysError *eDest, XrdOucStream &Config)
+{
+    char *val;
+
+// Get the path
+//
+   val = Config.GetWord();
+   if (!val || !val[0])
+      {eDest->Emsg("Config", "pidpath not specified"); return 1;}
+
+// Record the path
+//
+   if (PidPath) free(PidPath);
+   PidPath = strdup(val);
+   return 0;
+}
+  
+/******************************************************************************/
 /*                                 x p o r t                                  */
 /******************************************************************************/
 
 /* Function: xport
 
-   Purpose:  To parse the directive: port [wan] <tcpnum>
+   Purpose:  To parse the directive: port [tls] <tcpnum>
                                                [if [<hlst>] [named <nlst>]]
 
-             wan        apply this to the wan port
-             <tcpnum>   number of the tcp port for incomming requests
+             tls        apply this to the tls port
+             <tcpnum>   number of the tcp port for incoming requests
              <hlst>     list of applicable host patterns
              <nlst>     list of applicable instance names.
 
    Output: 0 upon success or !0 upon failure.
 */
 int XrdConfig::xport(XrdSysError *eDest, XrdOucStream &Config)
-{   int rc, iswan = 0, pnum = 0;
+{   int rc, istls = 0, pnum = 0;
     char *val, cport[32];
 
     do {if (!(val = Config.GetWord()))
            {eDest->Emsg("Config", "tcp port not specified"); return 1;}
-        if (strcmp("wan", val) || iswan) break;
-        iswan = 1;
+        if (strcmp("tls", val) || istls) break;
+        istls = 1;
        } while(1);
 
     strncpy(cport, val, sizeof(cport)-1); cport[sizeof(cport)-1] = '\0';
@@ -1445,32 +1966,13 @@ int XrdConfig::xport(XrdSysError *eDest, XrdOucStream &Config)
                               ProtInfo.myInst, myProg)) <= 0)
           {if (!rc) Config.noEcho(); return (rc < 0);}
 
-    if ((pnum = yport(eDest, "tcp", cport)) < 0) return 1;
-    if (iswan) PortWAN = pnum;
+    if ((pnum = XrdOuca2x::a2p(*eDest, "tcp", cport)) < 0) return 1;
+    if (istls) PortTLS = pnum;
        else PortTCP = PortUDP = pnum;
 
     return 0;
 }
 
-/******************************************************************************/
-
-int XrdConfig::yport(XrdSysError *eDest, const char *ptype, const char *val)
-{
-    int pnum;
-    if (!strcmp("any", val)) return 0;
-
-    const char *invp = (*ptype == 't' ? "tcp port" : "udp port" );
-    const char *invs = (*ptype == 't' ? "Unable to find tcp service" :
-                                        "Unable to find udp service" );
-
-    if (isdigit(*val))
-       {if (XrdOuca2x::a2i(*eDest,invp,val,&pnum,1,65535)) return 0;}
-       else if (!(pnum = XrdNetUtils::ServPort(val, (*ptype != 't'))))
-               {eDest->Emsg("Config", invs, val);
-                return -1;
-               }
-    return pnum;
-}
   
 /******************************************************************************/
 /*                                 x p r o t                                  */
@@ -1478,9 +1980,10 @@ int XrdConfig::yport(XrdSysError *eDest, const char *ptype, const char *val)
 
 /* Function: xprot
 
-   Purpose:  To parse the directive: protocol [wan] <name>[:<port>] <loc> [<parm>]
+   Purpose:  To parse the directive: protocol [tls] <name>[:<port>] <args>
 
-             wan    The protocol is WAN optimized
+             <args> {+port | <loc> [<parm>]}
+             tls    The protocol requires tls.
              <name> The name of the protocol (e.g., rootd)
              <port> Port binding for the protocol, if not the default.
              <loc>  The shared library in which it is located.
@@ -1492,61 +1995,81 @@ int XrdConfig::yport(XrdSysError *eDest, const char *ptype, const char *val)
 int XrdConfig::xprot(XrdSysError *eDest, XrdOucStream &Config)
 {
     XrdConfigProt *cpp;
-    char *val, *parms, *lib, proname[64], buff[1024];
-    int vlen, bleft = sizeof(buff), portnum = -1, wanopt = 0;
+    char *val, *parms, *lib, proname[64], buff[2048];
+    int portnum = -1;
+    bool dotls = false;
 
     do {if (!(val = Config.GetWord()))
            {eDest->Emsg("Config", "protocol name not specified"); return 1;}
-        if (wanopt || strcmp("wan", val)) break;
-        wanopt = 1;
+        if (dotls || strcmp("tls", val)) break;
+        dotls = true;
        } while(1);
 
     if (strlen(val) > sizeof(proname)-1)
        {eDest->Emsg("Config", "protocol name is too long"); return 1;}
     strcpy(proname, val);
 
-    if (!(val = Config.GetWord()))
-       {eDest->Emsg("Config", "protocol library not specified"); return 1;}
-    if (strcmp("*", val)) lib = strdup(val);
-       else lib = 0;
-
-    parms = buff;
-    while((val = Config.GetWord()))
-         {vlen = strlen(val); bleft -= (vlen+1);
-          if (bleft <= 0)
-             {eDest->Emsg("Config", "Too many parms for protocol", proname);
-              return 1;
-             }
-          *parms = ' '; parms++; strcpy(parms, val); parms += vlen;
-         }
-    if (parms != buff) parms = strdup(buff+1);
-       else parms = 0;
-
     if ((val = index(proname, ':')))
-       {if ((portnum = yport(&Log, "tcp", val+1)) < 0) return 1;
+       {if ((portnum = XrdOuca2x::a2p(*eDest, "tcp", val+1)) < 0) return 1;
            else *val = '\0';
        }
 
-    if (wanopt && !PortWAN) PortWAN = 1;
+    if (!(val = Config.GetWord()))
+       {eDest->Emsg("Config", "protocol library not specified"); return 1;}
+    if (!strcmp("*", val)) lib = 0;
+       else if (*val == '+')
+               {if (strcmp(val, "+port"))
+                   {eDest->Emsg("Config","invalid library specification -",val);
+                    return 1;
+                   }
+                if ((cpp = Firstcp))
+                   do {if (!strcmp(proname, cpp->proname))
+                          {if (cpp->AddPort(portnum, dotls)) return 0;
+                           eDest->Emsg("Config", "port add limit exceeded!");
+                           return 1;
+                          }
+                      } while((cpp = cpp->Next));
+                eDest->Emsg("Config","protocol",proname,"not previously defined!");
+                return 1;
+               }
+               else lib = strdup(val);
+
+// If no library was specified then this is a default protocol. We must make sure
+// sure it is consistent with whatever default we have.
+//
+   if (!lib && Firstcp && strcmp(proname, Firstcp->proname))
+      {char eBuff[512];
+       snprintf(eBuff, sizeof(eBuff), "the %s protocol is '%s' not '%s'; "
+                "assuming you meant '%s'",
+                (Firstcp->libpath ? "assigned" : "builtin"),
+                 Firstcp->proname, proname, Firstcp->proname);
+       eDest->Say("Config warning: ", eBuff, " but please correct "
+                                      "the following directive!");
+       snprintf(proname, sizeof(proname), "%s", Firstcp->proname);
+      }
+
+    *buff = 0;
+    if (!Config.GetRest(buff, sizeof(buff)))
+       {eDest->Emsg("Config", "Too many parms for protocol", proname);
+        return 1;
+       }
+    parms = (*buff ? strdup(buff) : 0);
 
     if ((cpp = Firstcp))
        do {if (!strcmp(proname, cpp->proname))
-              {if (cpp->libpath) free(cpp->libpath);
-               if (cpp->parms)   free(cpp->parms);
-               cpp->libpath = lib;
-               cpp->parms   = parms;
-               cpp->wanopt  = wanopt;
+              {cpp->Reset(lib, parms, portnum, dotls);
                return 0;
               }
           } while((cpp = cpp->Next));
 
-    if (lib)
-       {cpp = new XrdConfigProt(strdup(proname), lib, parms, portnum, wanopt);
-        if (Lastcp) Lastcp->Next = cpp;
-           else    Firstcp = cpp;
-        Lastcp = cpp;
-       }
-
+    cpp = new XrdConfigProt(strdup(proname), lib, parms, portnum, dotls);
+    if (!lib) {cpp->Next = Firstcp; Firstcp = cpp;
+               if (!Lastcp) Lastcp = cpp;
+              }
+       else   {if (Lastcp) Lastcp->Next = cpp;
+                  else     Firstcp = cpp;
+               Lastcp = cpp;
+              }
     return 0;
 }
 
@@ -1627,7 +2150,11 @@ int XrdConfig::xrep(XrdSysError *eDest, XrdOucStream &Config)
 
 // Get optional "every"
 //
-   if (!(val = Config.GetWord())) {repOpts = XRD_STATS_ALL; return 0;}
+   if (!(val = Config.GetWord()))
+      {repOpts = static_cast<char>(XRD_STATS_ALL);
+       return 0;
+      }
+
    if (!strcmp("every", val))
       {if (!(val = Config.GetWord()))
           {eDest->Emsg("Config", "report every value not specified"); return 1;}
@@ -1655,7 +2182,8 @@ int XrdConfig::xrep(XrdSysError *eDest, XrdOucStream &Config)
 
 // All done
 //
-   if (!(repOpts & XRD_STATS_ALL)) repOpts = XRD_STATS_ALL & ~XRD_STATS_INFO;
+   if (!(repOpts & XRD_STATS_ALL))
+      repOpts = char(XRD_STATS_ALL & ~XRD_STATS_INFO);
    return 0;
 }
 
@@ -1792,6 +2320,269 @@ int XrdConfig::xsit(XrdSysError *eDest, XrdOucStream &Config)
 }
 
 /******************************************************************************/
+/*                               x t c p m o n                                */
+/******************************************************************************/
+
+/* Function: xtcpmon
+
+   Purpose:  To parse the directive: tcpmonlib [++] <path> [<parms>]
+
+             <path>  absolute path to the tcp monitor plugin.
+             <parms> optional parameters passed to the plugin.
+
+   Output: 0 upon success or !0 upon failure.
+*/
+
+int XrdConfig::xtcpmon(XrdSysError *eDest, XrdOucStream &Config)
+{
+   std::string path;
+   char *val, parms[2048];
+   bool push = false;
+
+// Get the path or the push token
+//
+   if ((val = Config.GetWord()))
+      {if (!strcmp(val, "++"))
+          {push = true;
+           val =  Config.GetWord();
+          }
+      }
+
+// Make sure a path was specified
+//
+   if (!val || !*val)
+      {eDest->Emsg("Config", "tcpmonlib not specified"); return 1;}
+
+// Make sure the path is absolute
+//
+   if (*val != '/')
+      {eDest->Emsg("Config", "tcpmonlib path is not absolute"); return 1;}
+
+// Sequester the path as we will get additional tokens
+//
+   path = val;
+
+// Record any parms
+//
+   if (!Config.GetRest(parms, sizeof(parms)))
+      {eDest->Emsg("Config", "tcpmonlib parameters too long"); return 1;}
+
+// Check if we have a plugin info object (we will need one for this)
+//
+   if (!tmoInfo) tmoInfo = new XrdTcpMonInfo("xrd.tcpmonlib",ConfigFN,*eDest);
+
+// Add the plugin
+//
+   tmoInfo->KingPin.Add(path.c_str(), (*parms ? parms : 0), push);
+
+// All done
+//
+   return 0;
+}
+  
+/******************************************************************************/
+/*                                  x t l s                                   */
+/******************************************************************************/
+
+/* Function: xtls
+
+   Purpose:  To parse directive: tls <cpath> [<kpath>] [<opts>]
+
+             <cpath>  is the the certificate file to be used.
+             <kpath>  is the the private key file to be used.
+             <opts>   options:
+                      [no]detail       do [not] print TLS library msgs
+                      hsto <sec>       handshake timeout (default 10).
+
+   Output: 0 upon success or 1 upon failure.
+*/
+
+int XrdConfig::xtls(XrdSysError *eDest, XrdOucStream &Config)
+{
+    char *val;
+    int num;
+
+    if (!(val = Config.GetWord()))
+       {eDest->Emsg("Config", "tls cert path not specified"); return 1;}
+
+    if (*val != '/')
+       {eDest->Emsg("Config", "tls cert path not absolute"); return 1;}
+
+    if (tlsCert) free(tlsCert);
+    tlsCert = strdup(val);
+    if (tlsKey)  free(tlsKey);
+    tlsKey  = 0;
+
+    if (!(val = Config.GetWord())) return 0;
+
+    if (*val == '/')
+       {tlsKey = strdup(val);
+        if (!(val = Config.GetWord())) return 0;
+       }
+
+do {     if (!strcmp(val,   "detail")) SSLmsgs = true;
+    else if (!strcmp(val, "nodetail")) SSLmsgs = false;
+    else if (!strcmp(val, "hsto" ))
+            {if (!(val = Config.GetWord()))
+                {eDest->Emsg("Config", "tls hsto value not specified");
+                 return 1;
+                }
+             if (XrdOuca2x::a2tm(*eDest,"tls hsto",val,&num,1,255))
+                return 1;
+             tlsOpts = TLS_SET_HSTO(tlsOpts,num);
+            }
+    else {eDest->Emsg("Config", "invalid tls option -",val); return 1;}
+   } while ((val = Config.GetWord()));
+
+    return 0;
+}
+  
+/******************************************************************************/
+/*                                x t l s c a                                 */
+/******************************************************************************/
+
+/* Function: xtlsca
+
+   Purpose:  To parse directive: tlsca noverify | <parms> [<opts>]
+
+             parms: {certdir | certfile} <path>
+
+             opts:  [crlcheck {all | external | last}] [log {failure | off}]
+
+                    [[no]proxies] [refresh t[m|h|s]] [verdepth <n>]
+
+             noverify client's cert need not be verified.
+             <path>   is the the certificate path or file to be used.
+                      Both a file and a directory path can be specified.
+             crlcheck Controls internal crl checks:
+                      all       applies crls to the full chain
+                      external leaves crl checking to an external plug-in
+                      last     applies crl check to the last cert only
+             log      logs verification attempts: "failure" (the default) logs
+                      verification failures, while "off" logs nothing.
+             proxies  allows proxy certs while noproxies does not.
+             <t>      the crl/ca refresh interval.
+             <n>      the maximum certificate depth to be check.
+
+   Output: 0 upon success or 1 upon failure.
+*/
+
+int XrdConfig::xtlsca(XrdSysError *eDest, XrdOucStream &Config)
+{
+   char *val, **cadest, kword[16];
+   int  vd, rt;
+   bool isdir;
+
+   if (!(val = Config.GetWord()))
+      {eDest->Emsg("Config", "tlsca parameter not specified"); return 1;}
+   tlsNoCAD = false;
+
+   if (!strcmp(val, "noverify"))
+      {tlsNoVer = true;
+       if (caDir)  {free(caDir);  caDir  = 0;}
+       if (caFile) {free(caFile); caFile = 0;}
+       return 0;
+      }
+   tlsNoVer = false;
+
+
+   do {if (!strcmp(val, "proxies") || !strcmp("noproxies", val))
+          {if (*val == 'n') tlsOpts |=  XrdTlsContext::nopxy;
+              else          tlsOpts &= ~XrdTlsContext::nopxy;
+           continue;
+          }
+
+       if (strlen(val) >= (int)sizeof(kword))
+          {eDest->Emsg("Config", "Invalid tlsca parameter -", val);
+           return 1;
+          }
+       strcpy(kword, val);
+
+       if (!(val = Config.GetWord()))
+          {eDest->Emsg("Config", "tlsca", kword, "value not specified");
+           return 1;
+          }
+            if ((isdir = !strcmp(kword, "certdir"))
+            ||  !strcmp(kword, "certfile"))
+               {if (*val != '/')
+                   {eDest->Emsg("Config","tlsca",kword,"path is not absolute.");
+                    return 1;
+                   }
+                cadest = (isdir ? &caDir : &caFile);
+               if (*cadest) free(*cadest);
+               *cadest = strdup(val);
+              }
+       else if (!strcmp(kword, "crlcheck"))
+               {tlsOpts &= ~(XrdTlsContext::crlON | XrdTlsContext::crlFC);
+                     if (!strcmp(val, "all"))  tlsOpts |= XrdTlsContext::crlFC;
+                else if (!strcmp(val, "last")) tlsOpts |= XrdTlsContext::crlON;
+                else if ( strcmp(val, "external"))
+                        {eDest->Emsg("Config","Invalid tlsca crlcheck "
+                                     " argument -",val);
+                         return 1;
+                        }
+               }
+       else if (!strcmp(kword, "log"))
+               {     if (!strcmp(val, "off"))
+                        tlsOpts &= ~XrdTlsContext::logVF;
+                else if (!strcmp(val, "failure"))
+                        tlsOpts |=  XrdTlsContext::logVF;
+                else {eDest->Emsg("Config","Invalid tlsca log argument -",val);
+                      return 1;
+                     }
+               }
+       else if (!strcmp(kword, "refresh"))
+               {if (XrdOuca2x::a2tm(*eDest, "tlsca refresh interval",
+                                    val, &rt,1,std::min(int((XrdTlsContext::crlRF >> XrdTlsContext::crlRS) * 60),std::numeric_limits<int>::max()))) return 1;
+                if (rt < 60) rt = 60;
+                   else if (rt % 60) rt += 60;
+                rt = rt/60;
+                tlsOpts = TLS_SET_REFINT(tlsOpts,rt);
+               }
+       else if (!strcmp(kword, "verdepth"))
+               {if (XrdOuca2x::a2i(*eDest,"tlsca verdepth",val,&vd,1,255))
+                   return 1;
+                tlsOpts = TLS_SET_VDEPTH(tlsOpts,vd);
+               }
+       else {eDest->Emsg("Config", "invalid tlsca option -",kword); return 1;}
+
+       } while((val = Config.GetWord()));
+
+   return 0;
+}
+  
+/******************************************************************************/
+/*                                x t l s c i                                 */
+/******************************************************************************/
+
+/* Function: xtlsci
+
+   Purpose:  To parse directive: tlsciphers <ciphers>
+
+             <ciphers> list of colon sperated ciphers to use.
+
+   Output: 0 upon success or 1 upon failure.
+*/
+
+int XrdConfig::xtlsci(XrdSysError *eDest, XrdOucStream &Config)
+{
+   char *val, *ciphers;
+
+   if (!(val = Config.GetWord()))
+      {eDest->Emsg("Config", "tlsciphers parameter not specified"); return 1;}
+
+   ciphers = strdup(val);
+
+   if ((val = Config.GetWord()))
+      {eDest->Emsg("Config","Invalid tlsciphers argument -",val);
+       return 1;
+      }
+
+   XrdTlsContext::SetDefaultCiphers(ciphers);
+   return 0;
+}
+  
+/******************************************************************************/
 /*                                  x t m o                                   */
 /******************************************************************************/
 
@@ -1859,7 +2650,7 @@ int XrdConfig::xtmo(XrdSysError *eDest, XrdOucStream &Config)
    if (V_read >  0) ProtInfo.readWait = V_read*1000;
    if (V_hail >= 0) ProtInfo.hailWait = V_hail*1000;
    if (V_idle >= 0) ProtInfo.idleWait = V_idle;
-   XrdLink::setKWT(V_read, V_kill);
+   XrdLinkCtl::setKWT(V_read, V_kill);
    return 0;
 }
   
@@ -1891,7 +2682,11 @@ int XrdConfig::xtrace(XrdSysError *eDest, XrdOucStream &Config)
         {"net",      TRACE_NET},
         {"poll",     TRACE_POLL},
         {"protocol", TRACE_PROT},
-        {"sched",    TRACE_SCHED}
+        {"sched",    TRACE_SCHED},
+        {"tls",      TRACE_TLS},
+        {"tlsctx",   TRACE_TLSCTX},
+        {"tlssio",   TRACE_TLSSIO},
+        {"tlssok",   TRACE_TLSSOK}
        };
     int i, neg, trval = 0, numopts = sizeof(tropts)/sizeof(struct traceopts);
 
@@ -1915,6 +2710,6 @@ int XrdConfig::xtrace(XrdSysError *eDest, XrdOucStream &Config)
                   }
           val = Config.GetWord();
          }
-    Trace.What = trval;
+    XrdTrace.What = trval;
     return 0;
 }

@@ -27,46 +27,85 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
+#include <vector>
+
 #include "XrdOuc/XrdOucPinLoader.hh"
 #include "XrdSys/XrdSysError.hh"
 
 #include "Xrd/XrdLink.hh"
-#include "Xrd/XrdPoll.hh"
 #include "Xrd/XrdProtLoad.hh"
+#include "Xrd/XrdTrace.hh"
 
 #include "XrdVersion.hh"
 
-#define XRD_TRACE XrdTrace->
-#include "Xrd/XrdTrace.hh"
-  
 /******************************************************************************/
 /*                        G l o b a l   O b j e c t s                         */
 /******************************************************************************/
 
-XrdSysError *XrdProtLoad::XrdLog   = 0;
-XrdOucTrace *XrdProtLoad::XrdTrace = 0;
-
-XrdProtocol *XrdProtLoad::ProtoWAN[ProtoMax] = {0};
 XrdProtocol *XrdProtLoad::Protocol[ProtoMax] = {0};
 char        *XrdProtLoad::ProtName[ProtoMax] = {0};
-int          XrdProtLoad::ProtPort[ProtoMax] = {0};
 
 int          XrdProtLoad::ProtoCnt = 0;
-int          XrdProtLoad::ProtWCnt = 0;
 
 namespace
 {
+struct portMap
+      {int   port;
+       short protIdx;
+       bool  protTLS;
+
+             portMap(int pnum, int pidx, bool istls)
+                     : port(pnum), protIdx(pidx), protTLS(istls) {}
+            ~portMap() {}
+      };
+
+std::vector<portMap> portVec;
+
 char            *liblist[XrdProtLoad::ProtoMax];
 XrdOucPinLoader *libhndl[XrdProtLoad::ProtoMax];
+const char      *TraceID = "ProtLoad";
 int              libcnt = 0;
 }
+
+namespace XrdGlobal
+{
+extern XrdSysError Log;
+}
+using namespace XrdGlobal;
 
 /******************************************************************************/
 /*            C o n s t r u c t o r   a n d   D e s t r u c t o r             */
 /******************************************************************************/
   
  XrdProtLoad::XrdProtLoad(int port) :
-              XrdProtocol("protocol loader"), myPort(port) {}
+              XrdProtocol("protocol loader"), myPort(port)
+{
+   int j = 0;
+   bool hastls = false;
+
+// Extract out the protocols associated with this port
+//
+   for (int i = 0; i < (int)portVec.size(); i++)
+       {if (myPort == portVec[i].port)
+           {if (portVec[i].protTLS) hastls = true;
+               else myProt[j++] = portVec[i].protIdx;
+           }
+       }
+
+// Setup to handle tls protocols
+//
+   if (hastls)
+      {myProt[j++] = -1;
+       for (int i = 0; i < (int)portVec.size(); i++)
+           {if (myPort == portVec[i].port && portVec[i].protTLS)
+                myProt[j++] =  portVec[i].protIdx;
+           }
+      }
+
+// Put in an end marker
+//
+   myProt[j] = -2;
+}
 
  XrdProtLoad::~XrdProtLoad() {}
  
@@ -75,54 +114,39 @@ int              libcnt = 0;
 /******************************************************************************/
 
 int XrdProtLoad::Load(const char *lname, const char *pname,
-                      char *parms, XrdProtocol_Config *pi)
+                      char *parms, XrdProtocol_Config *pi, bool istls)
 {
    XrdProtocol *xp;
-   int i, j, port = pi->Port;
-   int wanopt = pi->WANPort;
+   int port = pi->Port;
 
 // Trace this load if so wanted
 //
-   if (TRACING(TRACE_DEBUG))
-      {XrdTrace->Beg("Protocol");
-       cerr <<"getting protocol object " <<pname;
-       XrdTrace->End();
-      }
+   TRACE(DEBUG, "getting protocol object " <<pname);
 
 // First check to see that we haven't exceeded our protocol count
 //
    if (ProtoCnt >= ProtoMax)
-      {XrdLog->Emsg("Protocol", "Too many protocols have been defined.");
+      {Log.Emsg("Protocol", "Too many protocols have been defined.");
        return 0;
       }
 
 // Obtain an instance of this protocol
 //
    xp = getProtocol(lname, pname, parms, pi);
-   if (!xp) {XrdLog->Emsg("Protocol","Protocol", pname, "could not be loaded");
+   if (!xp) {Log.Emsg("Protocol","Protocol", pname, "could not be loaded");
              return 0;
             }
 
-// If this is a WAN enabled protocol then add it to the WAN table
+// Add protocol to our table of protocols.
 //
-   if (wanopt) ProtoWAN[ProtWCnt++] = xp;
-
-// Find a port associated slot in the table
-//
-   for (i = ProtoCnt-1; i >= 0; i--) if (port == ProtPort[i]) break;
-   for (j = ProtoCnt-1; j > i; j--)
-       {ProtName[j+1] = ProtName[j];
-        ProtPort[j+1] = ProtPort[j];
-        Protocol[j+1] = Protocol[j];
-       }
-
-// Add protocol to our table of protocols
-//
-   ProtName[j+1] = strdup(pname);
-   ProtPort[j+1] = port;
-   Protocol[j+1] = xp;
+   ProtName[ProtoCnt] = strdup(pname);
+   Protocol[ProtoCnt] = xp;
    ProtoCnt++;
-   return 1;
+
+// Map the port to this protocol
+//
+   Port(ProtoCnt, port, istls);
+   return ProtoCnt;
 }
   
 /******************************************************************************/
@@ -134,22 +158,37 @@ int XrdProtLoad::Port(const char *lname, const char *pname,
 {
    int port;
 
-// Trace this load if so wanted
-//
-   if (TRACING(TRACE_DEBUG))
-      {XrdTrace->Beg("Protocol");
-       cerr <<"getting port from protocol " <<pname;
-       XrdTrace->End();
-      }
-
 // Obtain the port number to be used by this protocol
 //
    port = getProtocolPort(lname, pname, parms, pi);
-   if (port < 0) XrdLog->Emsg("Protocol","Protocol", pname,
+
+// Trace this call if so wanted
+//
+   TRACE(DEBUG, "protocol " <<pname <<" wants to use port " <<port);
+
+// Make sure we can use the port
+//
+   if (port < 0) Log.Emsg("Protocol","Protocol", pname,
                              "port number could not be determined");
    return port;
 }
   
+/******************************************************************************/
+
+void XrdProtLoad::Port(int protIdx, int port, bool isTLS)
+{
+    if (protIdx > 0 && protIdx <= ProtoCnt && port > 0)
+       {portMap pMap(port, protIdx-1, isTLS);
+        portVec.push_back(pMap);
+        TRACE(DEBUG, "enabling " <<(isTLS ? "tls port " :  "port ") <<port
+                     <<" for protocol " <<ProtName[protIdx-1]);
+       } else {
+        char buff[256];
+        snprintf(buff, sizeof(buff), "prot=%d port=%d;", protIdx, port);
+        Log.Emsg("Protocol", "Invalid Port() parms:", buff, "port not mapped!");
+       }
+}
+
 /******************************************************************************/
 /*                               P r o c e s s                                */
 /******************************************************************************/
@@ -157,36 +196,40 @@ int XrdProtLoad::Port(const char *lname, const char *pname,
 int XrdProtLoad::Process(XrdLink *lp)
 {
      XrdProtocol *pp = 0;
-     int i;
+     signed char *pVec = myProt;
+     int i = 0;
 
-// Check if this is a WAN lookup or standard lookup
+// Try to find a protocol match for this connection
 //
-   if (myPort < 0)
-      {for (i = 0; i < ProtWCnt; i++)
-           if ((pp = ProtoWAN[i]->Match(lp))) break;
-              else if (lp->isFlawed()) return -1;
-      } else {
-       for (i = 0; i < ProtoCnt; i++)
-           if (myPort == ProtPort[i] && (pp = Protocol[i]->Match(lp))) break;
-               else if (lp->isFlawed()) return -1;
-      }
+   while(*pVec != -2)
+        {if (*pVec == -1)
+            {if (!(lp->setTLS(true)))
+                {lp->setEtext("TLS negotiation failed.");
+                 return -1;
+                }
+            } else {i = *pVec;
+                    if ((pp = Protocol[i]->Match(lp))) break;
+                       else if (lp->isFlawed()) return -1;
+                   }
+         pVec++;
+        }
+
+// Verify that we have an actual protocol
+//
    if (!pp) {lp->setEtext("matching protocol not found"); return -1;}
 
 // Now attach the new protocol object to the link
 //
    lp->setProtocol(pp);
+   lp->setProtName(ProtName[i]);
 
 // Trace this load if so wanted
-//                                                x
-   if (TRACING(TRACE_DEBUG))
-      {XrdTrace->Beg("Protocol");
-       cerr <<"matched protocol " <<ProtName[i];
-       XrdTrace->End();
-      }
-
-// Attach this link to the appropriate poller
 //
-   if (!XrdPoll::Attach(lp)) {lp->setEtext("attach failed"); return -1;}
+   TRACE(DEBUG, "matched port " <<myPort <<" protocol " <<ProtName[i]);
+
+// Activate this link
+//
+   if (!lp->Activate()) {lp->setEtext("activation failed"); return -1;}
 
 // Take a short-cut and process the initial request as a sticky request
 //
@@ -203,7 +246,7 @@ void XrdProtLoad::Recycle(XrdLink *lp, int ctime, const char *reason)
 // Document non-protocol errors
 //
    if (lp && reason)
-      XrdLog->Emsg("Protocol", lp->ID, "terminated", reason);
+      Log.Emsg("Protocol", lp->ID, "terminated", reason);
 }
 
 /******************************************************************************/
@@ -250,7 +293,7 @@ XrdProtocol *XrdProtLoad::getProtocol(const char *lname,
 //
    for (i = 0; i < libcnt; i++) if (!strcmp(xname, liblist[i])) break;
    if (i >= libcnt)
-      {XrdLog->Emsg("Protocol", pname, "was lost during loading", lname);
+      {Log.Emsg("Protocol", pname, "was lost during loading", lname);
        return 0;
       }
 
@@ -288,10 +331,10 @@ int XrdProtLoad::getProtocolPort(const char *lname,
    for (i = 0; i < libcnt; i++) if (!strcmp(xname, liblist[i])) break;
    if (i >= libcnt)
       {if (libcnt >= ProtoMax)
-          {XrdLog->Emsg("Protocol", "Too many protocols have been defined.");
+          {Log.Emsg("Protocol", "Too many protocols have been defined.");
            return -1;
           }
-       if (!(libhndl[i] = new XrdOucPinLoader(XrdLog,&myVer,"protocol",lname)))
+       if (!(libhndl[i] = new XrdOucPinLoader(&Log,&myVer,"protocol",lname)))
           return -1;
        liblist[i] = strdup(xname);
        libcnt++;

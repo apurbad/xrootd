@@ -34,12 +34,13 @@
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <dirent.h>
-#include <errno.h>
+#include <cerrno>
 #include <fcntl.h>
-#include <stdio.h>
+#include <cstdio>
 #include <unistd.h>
 
 #include "XrdPosix/XrdPosixOsDep.hh"
+#include "XrdPosix/XrdPosixXrootd.hh"
 #include "XrdSys/XrdSysPlatform.hh"
 
 /******************************************************************************/
@@ -80,9 +81,15 @@
 #define Retv_Fcntl   int
 #define Args_Fcntl   int, int, ...
 
+#ifdef __APPLE__
+#define Symb_Fcntl64 UNIX_PFX "fcntl"
+#define Retv_Fcntl64 int
+#define Args_Fcntl64 int, int, ...
+#else
 #define Symb_Fcntl64 UNIX_PFX "fcntl64"
 #define Retv_Fcntl64 int
 #define Args_Fcntl64 int, int, ...
+#endif
 
 #define Symb_Fdatasync UNIX_PFX "fdatasync"
 #define Retv_Fdatasync int
@@ -96,9 +103,15 @@
 #define Retv_Fopen FILE *
 #define Args_Fopen const char *, const char *
 
+#ifdef __APPLE__
+#define Symb_Fopen64 UNIX_PFX "fopen"
+#define Retv_Fopen64 FILE *
+#define Args_Fopen64 const char *, const char *
+#else
 #define Symb_Fopen64 UNIX_PFX "fopen64"
 #define Retv_Fopen64 FILE *
 #define Args_Fopen64 const char *, const char *
+#endif
 
 #define Symb_Fread UNIX_PFX "fread"
 #define Retv_Fread size_t
@@ -112,11 +125,17 @@
 #define Retv_Fseeko int
 #define Args_Fseeko FILE *, off_t, int
 
+#ifdef __APPLE__
+#define Symb_Fseeko64 UNIX_PFX "fseeko"
+#define Retv_Fseeko64 int
+#define Args_Fseeko64 FILE *, off64_t, int
+#else
 #define Symb_Fseeko64 UNIX_PFX "fseeko64"
 #define Retv_Fseeko64 int
 #define Args_Fseeko64 FILE *, off64_t, int
+#endif
 
-#ifdef __linux__
+#if defined(__linux__) and defined(_STAT_VER)
 #define Symb_Fstat UNIX_PFX "__fxstat"
 #define Retv_Fstat int
 #define Args_Fstat int, int, struct stat *
@@ -126,14 +145,20 @@
 #define Args_Fstat int, struct stat *
 #endif
 
-#ifdef __linux__
+#if defined(__linux__) and defined(_STAT_VER)
 #define Symb_Fstat64 UNIX_PFX "__fxstat64"
 #define Retv_Fstat64 int
 #define Args_Fstat64 int, int, struct stat64 *
 #else
+#ifdef __APPLE__
+#define Symb_Fstat64 UNIX_PFX "fstat"
+#define Retv_Fstat64 int
+#define Args_Fstat64 int, struct stat64 *
+#else
 #define Symb_Fstat64 UNIX_PFX "fstat64"
 #define Retv_Fstat64 int
 #define Args_Fstat64 int, struct stat64 *
+#endif
 #endif
 
 #define Symb_Fsync UNIX_PFX "fsync"
@@ -148,17 +173,29 @@
 #define Retv_Ftello off_t
 #define Args_Ftello FILE *
 
+#ifdef __APPLE__
+#define Symb_Ftello64 UNIX_PFX "ftello"
+#define Retv_Ftello64 off64_t
+#define Args_Ftello64 FILE *
+#else
 #define Symb_Ftello64 UNIX_PFX "ftello64"
 #define Retv_Ftello64 off64_t
 #define Args_Ftello64 FILE *
+#endif
 
 #define Symb_Ftruncate UNIX_PFX "ftruncate"
 #define Retv_Ftruncate int
 #define Args_Ftruncate int, off_t
 
+#ifdef __APPLE__
+#define Symb_Ftruncate64 UNIX_PFX "ftruncate"
+#define Retv_Ftruncate64 int
+#define Args_Ftruncate64 int, off64_t
+#else
 #define Symb_Ftruncate64 UNIX_PFX "ftruncate64"
 #define Retv_Ftruncate64 int
 #define Args_Ftruncate64 int, off64_t
+#endif
 
 #define Symb_Fwrite UNIX_PFX "fwrite"
 #define Retv_Fwrite int
@@ -180,11 +217,17 @@
 #define Retv_Lseek off_t
 #define Args_Lseek int, off_t, int
 
+#ifdef __APPLE__
+#define Symb_Lseek64 UNIX_PFX "lseek"
+#define Retv_Lseek64 off64_t
+#define Args_Lseek64 int, off64_t, int
+#else
 #define Symb_Lseek64 UNIX_PFX "lseek64"
 #define Retv_Lseek64 off64_t
 #define Args_Lseek64 int, off64_t, int
+#endif
 
-#ifdef __linux__
+#if defined(__linux__) and defined(_STAT_VER)
 #define Symb_Lstat UNIX_PFX "__lxstat"
 #define Retv_Lstat int
 #define Args_Lstat int, const char *, struct stat *
@@ -194,14 +237,20 @@
 #define Args_Lstat const char *, struct stat *
 #endif
 
-#ifdef __linux__
+#if defined(__linux__) and defined(_STAT_VER)
 #define Symb_Lstat64 UNIX_PFX "__lxstat64"
 #define Retv_Lstat64 int
 #define Args_Lstat64 int, const char *, struct stat64 *
 #else
+#ifdef __APPLE__
+#define Symb_Lstat64 UNIX_PFX "lstat"
+#define Retv_Lstat64 int
+#define Args_Lstat64 const char *, struct stat64 *
+#else
 #define Symb_Lstat64 UNIX_PFX "lstat64"
 #define Retv_Lstat64 int
 #define Args_Lstat64 const char *, struct stat64 *
+#endif
 #endif
 
 #define Symb_Mkdir UNIX_PFX "mkdir"
@@ -212,9 +261,15 @@
 #define Retv_Open int
 #define Args_Open const char *, int, ...
 
+#ifdef __APPLE__
+#define Symb_Open64 UNIX_PFX "open"
+#define Retv_Open64 int
+#define Args_Open64 const char *, int, ...
+#else
 #define Symb_Open64 UNIX_PFX "open64"
 #define Retv_Open64 int
 #define Args_Open64 const char *, int, ...
+#endif
 
 #define Symb_Opendir UNIX_PFX "opendir"
 #define Retv_Opendir DIR *
@@ -228,17 +283,29 @@
 #define Retv_Pread ssize_t
 #define Args_Pread int, void *, size_t, off_t
   
+#ifdef __APPLE__
+#define Symb_Pread64 UNIX_PFX "pread"
+#define Retv_Pread64 ssize_t
+#define Args_Pread64 int, void *, size_t, off64_t
+#else
 #define Symb_Pread64 UNIX_PFX "pread64"
 #define Retv_Pread64 ssize_t
 #define Args_Pread64 int, void *, size_t, off64_t
+#endif
 
 #define Symb_Pwrite UNIX_PFX "pwrite"
 #define Retv_Pwrite ssize_t
 #define Args_Pwrite int, const void *, size_t, off_t
 
+#ifdef __APPLE__
+#define Symb_Pwrite64 UNIX_PFX "pwrite"
+#define Retv_Pwrite64 ssize_t
+#define Args_Pwrite64 int, const void *, size_t, off64_t
+#else
 #define Symb_Pwrite64 UNIX_PFX "pwrite64"
 #define Retv_Pwrite64 ssize_t
 #define Args_Pwrite64 int, const void *, size_t, off64_t
+#endif
 
 #define Symb_Read UNIX_PFX "read"
 #define Retv_Read ssize_t
@@ -252,17 +319,29 @@
 #define Retv_Readdir struct dirent *
 #define Args_Readdir DIR *
 
+#ifdef __APPLE__
+#define Symb_Readdir64 UNIX_PFX "readdir"
+#define Retv_Readdir64 struct dirent *
+#define Args_Readdir64 DIR *
+#else
 #define Symb_Readdir64 UNIX_PFX "readdir64"
 #define Retv_Readdir64 struct dirent64 *
 #define Args_Readdir64 DIR *
+#endif
 
 #define Symb_Readdir_r UNIX_PFX "readdir_r"
 #define Retv_Readdir_r int
 #define Args_Readdir_r DIR *, struct dirent *, struct dirent **
 
+#ifdef __APPLE__
+#define Symb_Readdir64_r UNIX_PFX "readdir_r"
+#define Retv_Readdir64_r int
+#define Args_Readdir64_r DIR *, struct dirent64 *, struct dirent64 **
+#else
 #define Symb_Readdir64_r UNIX_PFX "readdir64_r"
 #define Retv_Readdir64_r int
 #define Args_Readdir64_r DIR *, struct dirent64 *, struct dirent64 **
+#endif
 
 #define Symb_Rename UNIX_PFX "rename"
 #define Retv_Rename int
@@ -290,31 +369,49 @@
 #define Args_Stat const char *, struct stat *
 #endif
 
-#ifdef __linux__
+#if defined(__linux__) and defined(_STAT_VER)
 #define Symb_Stat64 UNIX_PFX "__xstat64"
 #define Retv_Stat64 int
 #define Args_Stat64 int, const char *, struct stat64 *
 #else
+#ifdef __APPLE__
+#define Symb_Stat64 UNIX_PFX "stat"
+#define Retv_Stat64 int
+#define Args_Stat64 const char *, struct stat64 *
+#else
 #define Symb_Stat64 UNIX_PFX "stat64"
 #define Retv_Stat64 int
 #define Args_Stat64 const char *, struct stat64 *
+#endif
 #endif
 
 #define Symb_Statfs    UNIX_PFX "statfs"
 #define Retv_Statfs    int
 #define Args_Statfs    const char *, struct statfs *
 
+#ifdef __APPLE__
+#define Symb_Statfs64  UNIX_PFX "statfs"
+#define Retv_Statfs64  int
+#define Args_Statfs64  const char *, struct statfs64 *
+#else
 #define Symb_Statfs64  UNIX_PFX "statfs64"
 #define Retv_Statfs64  int
 #define Args_Statfs64  const char *, struct statfs64 *
+#endif
 
 #define Symb_Statvfs UNIX_PFX "statvfs"
 #define Retv_Statvfs int
 #define Args_Statvfs const char *, struct statvfs *
 
+#ifdef __APPLE__
+#define Symb_Statvfs64 UNIX_PFX "statvfs"
+#define Retv_Statvfs64 int
+#define Args_Statvfs64 const char *, struct statvfs64 *
+#else
 #define Symb_Statvfs64 UNIX_PFX "statvfs64"
 #define Retv_Statvfs64 int
 #define Args_Statvfs64 const char *, struct statvfs64 *
+#endif
 
 #define Symb_Telldir UNIX_PFX "telldir"
 #define Retv_Telldir long
@@ -324,9 +421,15 @@
 #define Retv_Truncate int
 #define Args_Truncate const char *, off_t
 
+#ifdef __APPLE__
+#define Symb_Truncate64 UNIX_PFX "truncate"
+#define Retv_Truncate64 int
+#define Args_Truncate64 const char *, off64_t
+#else
 #define Symb_Truncate64 UNIX_PFX "truncate64"
 #define Retv_Truncate64 int
 #define Args_Truncate64 const char *, off64_t
+#endif
 
 #define Symb_Unlink UNIX_PFX "unlink"
 #define Retv_Unlink int

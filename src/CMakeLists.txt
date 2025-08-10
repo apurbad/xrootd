@@ -1,103 +1,114 @@
+#-------------------------------------------------------------------------------
+# If this is a build for pip set up the rpath
+# (this is especially important for plugins)
+#-------------------------------------------------------------------------------
+if( PYPI_BUILD )
+  set( CMAKE_INSTALL_RPATH "$ORIGIN" )
+  set( CMAKE_INSTALL_RPATH_USE_LINK_PATH true )
+endif()
 
 #-------------------------------------------------------------------------------
-# Include the subcomponents
+# XRDCL_LIB_ONLY implies XRDCL_ONLY
 #-------------------------------------------------------------------------------
-include( XrdUtils )
-include( XrdApps )
-include( XrdCrypto )
-include( XrdSec )
-include( XrdXml )
+if( XRDCL_LIB_ONLY )
+  set ( XRDCL_ONLY TRUE )
+endif()
+
 include( XrdHeaders )
 
-if( BUILD_CRYPTO )
-  include( XrdSecgsi )
+add_library(XrdUtils SHARED)
+
+set_target_properties(XrdUtils
+  PROPERTIES BUILD_RPATH $ORIGIN VERSION 3.0.0 SOVERSION 3
+)
+
+target_link_libraries(XrdUtils
+  PRIVATE
+    OpenSSL::SSL
+    ${CMAKE_THREAD_LIBS_INIT}
+    ${CMAKE_DL_LIBS}
+    ${SOCKET_LIBRARY}
+    ${SENDFILE_LIBRARY}
+    ${EXTRA_LIBS}
+)
+
+if(SYSTEMD_FOUND)
+  target_link_libraries(XrdUtils PRIVATE ${SYSTEMD_LIBRARIES})
 endif()
 
-if( BUILD_KRB5 )
-  include( XrdSeckrb5 )
-endif()
+install(TARGETS XrdUtils LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
 
-if( ENABLE_XRDCL )
-  add_subdirectory( XrdCl )
-endif()
+add_subdirectory( XProtocol )
+add_subdirectory( Xrd )
+add_subdirectory( XrdCks )
+add_subdirectory( XrdNet )
+add_subdirectory( XrdSut )
+add_subdirectory( XrdSys )
+add_subdirectory( XrdOuc )
+add_subdirectory( XrdTls )
+add_subdirectory( XrdRmc )
 
-if( XRDCLHTTP_SUBMODULE )
-  add_subdirectory( XrdClHttp )
-endif()
+add_subdirectory( XrdApps )
+add_subdirectory( XrdCrypto )
+add_subdirectory( XrdPosix )
 
+add_subdirectory( XrdSec )
+add_subdirectory( XrdSecgsi )
+add_subdirectory( XrdSeckrb5 )
+add_subdirectory( XrdSecpwd )
+add_subdirectory( XrdSecsss )
+add_subdirectory( XrdSecunix )
+add_subdirectory( XrdSecztn )
+
+add_subdirectory( XrdXml )
+
+add_subdirectory( XrdCl )
+add_subdirectory( XrdClHttp )
+add_subdirectory( XrdEc )
 
 if( NOT XRDCL_ONLY )
-  include( XrdClient )
+  add_library(XrdServer SHARED)
 
-  include( XrdServer )
-  include( XrdDaemons )
-  include( XrdFrm )
-  include( XrdPosix )
-  include( XrdFfs )
-  include( XrdPlugins )
-  include( XrdSsi )
-  include( XrdCns )
+  set_target_properties(XrdServer
+    PROPERTIES VERSION 3.0.0 SOVERSION 3
+  )
 
-  include( XrdFileCache )
+  target_link_libraries(XrdServer
+    PRIVATE
+    XrdUtils
+    ${CMAKE_DL_LIBS}
+    ${CMAKE_THREAD_LIBS_INIT}
+    ${ATOMIC_LIBRARY}
+    ${EXTRA_LIBS}
+    ${SOCKET_LIBRARY}
+  )
 
-  if( BUILD_HTTP )
-    include( XrdHttp )
-    include( XrdTpc )
-  endif()
+  install(TARGETS XrdServer LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
 
-  if( BUILD_MACAROONS )
-    include( XrdMacaroons )
-  endif()
+  add_subdirectory( XrdAcc )
+  add_subdirectory( XrdCms )
+  add_subdirectory( XrdDig )
+  add_subdirectory( XrdFrc )
+  add_subdirectory( XrdOfs )
+  add_subdirectory( XrdOss )
+  add_subdirectory( XrdSfs )
+  add_subdirectory( XrdXrootd )
 
-if( XRDCEPH_SUBMODULE )
+  add_subdirectory( XrdFrm )
+  add_subdirectory( XrdFfs )
+  add_subdirectory( XrdBwm )
+  add_subdirectory( XrdPss )
+  add_subdirectory( XrdSsi )
+  add_subdirectory( XrdPfc )
+  add_subdirectory( XrdOssCsi )
+  add_subdirectory( XrdOssStats )
+  add_subdirectory( XrdThrottle )
+
+  add_subdirectory( XrdHttp )
+  add_subdirectory( XrdHttpTpc )
+
+  add_subdirectory( XrdMacaroons )
+  add_subdirectory( XrdVoms )
   add_subdirectory( XrdCeph )
+  add_subdirectory( XrdSciTokens )
 endif()
-endif()
-
-#-------------------------------------------------------------------------------
-# Install the utility scripts
-#-------------------------------------------------------------------------------
-install(
-  FILES
-  ${CMAKE_SOURCE_DIR}/utils/XrdCmsNotify.pm
-  ${CMAKE_SOURCE_DIR}/utils/netchk
-  ${CMAKE_SOURCE_DIR}/utils/XrdOlbMonPerf
-  DESTINATION ${CMAKE_INSTALL_DATADIR}/xrootd/utils
-  PERMISSIONS
-  OWNER_EXECUTE OWNER_WRITE OWNER_READ
-  GROUP_EXECUTE GROUP_READ
-  WORLD_EXECUTE WORLD_READ )
-
-#-------------------------------------------------------------------------------
-# Install xrootd-config
-#-------------------------------------------------------------------------------
-install(
-  CODE "
-    EXECUTE_PROCESS(
-      COMMAND cat ${CMAKE_SOURCE_DIR}/utils/xrootd-config
-      COMMAND sed -e \"s/__VERSION__/${XROOTD_VERSION}/\"
-      COMMAND sed -e \"s|__INCLUDEDIR__|${CMAKE_INSTALL_INCLUDEDIR}|\"
-      COMMAND sed -e \"s/__PLUGIN_VERSION__/${PLUGIN_VERSION}/\"
-      COMMAND sed -e \"s|__PREFIX__|${CMAKE_INSTALL_PREFIX}|\"
-      OUTPUT_FILE \$ENV{DESTDIR}/${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_BINDIR}/xrootd-config )
-    EXECUTE_PROCESS(
-      COMMAND chmod 755 \$ENV{DESTDIR}/${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_BINDIR}/xrootd-config )"
-)
-
-#-------------------------------------------------------------------------------
-# Post process man pages
-#-------------------------------------------------------------------------------
-install(
-  CODE "
-    FILE(GLOB MANPAGES
-      \"\$ENV{DESTDIR}/${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_MANDIR}/man[1,8]/*.[1,8]\" )
-    FOREACH(MANPAGE \${MANPAGES})
-      MESSAGE( \"-- Processing: \" \${MANPAGE} )
-      EXECUTE_PROCESS(
-        COMMAND cat \${MANPAGE}
-        COMMAND sed  -e \"s/__VERSION__/${XROOTD_VERSION}/\"
-        OUTPUT_FILE \${MANPAGE}.new )
-      EXECUTE_PROCESS(
-        COMMAND mv -f \${MANPAGE}.new \${MANPAGE} )
-    ENDFOREACH()"
-)

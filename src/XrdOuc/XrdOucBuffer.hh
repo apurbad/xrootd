@@ -30,7 +30,7 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#include <stdlib.h>
+#include <cstdlib>
 
 #include "XrdOuc/XrdOucChain.hh"
 #include "XrdSys/XrdSysPthread.hh"
@@ -201,7 +201,7 @@ inline int           DataLen() {return dlen;}
 //-----------------------------------------------------------------------------
 //! Highjack the buffer contents and reinitialize the original buffer.
 //!
-//! @param  xsz   - the desired size to be given to the highjacked buffer. If
+//! @param  bPsz  - the desired size to be given to the highjacked buffer. If
 //!                 zero, the current size is used. Same size resictions apply
 //!                 as for buffer pool Alloc(), above.
 //!
@@ -248,8 +248,8 @@ inline void         SetLen(int dataL, int dataO=0) {dlen = dataL; doff = dataO;}
 //! the Clone(), Highjack() and Resize() methods will always fail. However,
 //! all the other methods will work in the expected way.
 //!
-//! @param  buff  - pointer to a storage area obtained via malloc and its
-//!                 relatives (e.g. memalign). It will be released via free().
+//! @param  buff  - pointer to a storage area obtained via posix_memalign()
+//!                 and it will be released via free().
 //! @param  blen  - the size of the buffer as well as the data length.
 //!                 Use SetLen() to set a new data length if it differs.
 //-----------------------------------------------------------------------------

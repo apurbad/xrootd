@@ -76,7 +76,7 @@
 //! Warning! All methods (except Init()) in this class must be thread-safe.
 //-----------------------------------------------------------------------------
 
-#include <errno.h>
+#include <cerrno>
 
 #include "XrdSsi/XrdSsiErrInfo.hh"
 #include "XrdSsi/XrdSsiResource.hh"
@@ -90,6 +90,26 @@ class XrdSsiProvider
 public:
 
 //-----------------------------------------------------------------------------
+//! Issue a control operation (future).
+//!
+//! @param  cmd      The control command.
+//! @param  argP     The operational argument cast to a void pointer.
+//! @param  resP     A reference to the pointer to hold the operational
+//!                  result object if any.
+//!
+//! @return Upon success 0 is returned and if a resutt is returned is must
+//!         cast to te correct pointer type and deleted,when no longer needed.
+//!         Upon failure, -errno is returned.
+//-----------------------------------------------------------------------------
+
+enum CTL_Cmd {CTL_None = 0};
+
+virtual int    Control(CTL_Cmd cmd, const void *argP, void *&resP)
+                      {(void)cmd; (void)argP; (void)resP;
+                       return (cmd == CTL_None ? 0 : -ENOTSUP);
+                      }
+
+//-----------------------------------------------------------------------------
 //! Obtain a service object (client-side or server-side).
 //!
 //! @param  eInfo    the object where error status is to be placed.
@@ -98,6 +118,9 @@ public:
 //!                  an IPV4 address (i.e. d.d.d.d), or an IPV6 address
 //!                  (i.e. [x:x:x:x:x:x]), and "port" is either a numeric port
 //!                  number or the service name assigned to the port number.
+//!                  You may specify more than one contact by separating each
+//!                  with a comma (e.g. host1:port,host2:port,...). Each host
+//!                  must be equivalent with respect to request processing.
 //!                  This is a null string if the call is being made server-side.
 //!                  Note that only one service object is obtained by a server.
 //! @param  oHold    the maximum number of request objects that should be held
@@ -206,21 +229,76 @@ virtual void   ResourceAdded(const char *rName) {}
 virtual void   ResourceRemoved(const char *rName) {}
 
 //-----------------------------------------------------------------------------
-//! Set the maximum number of threads for handling callbacks (client-side only).
-//! When the maximum is reached, callbacks wait until an in-progress callback
-//! completes. This method must be called prior to calling GetService().
+//! Set thread values. This call is deprecated. You should use SetConfig().
 //! This method has no meaning server-side and is ignored.
 //!
-//! @param  cbNum    The maximum number of threads to be used for callbacks and
-//!                  sets the maximum number of active callbacks (default 300).
-//!                  The maximum value is 32767. Note that the nproc ulimit is
-//!                  final arbiter of the actual number of threads to use.
-//! @param  ntNum    The maximum number of threads to be used to handle network
-//!                  traffic. The minimum is 3, the default is 10% of cbNum but
-//!                  no more than 100.
+//! @param  cbNum    Equivalent to SetConfig("cbThreads",  cbNum).
+//! @param  ntNum    Equivalent to SetConfig("netThreads", ntNum).
 //-----------------------------------------------------------------------------
 
 virtual void   SetCBThreads(int cbNum, int ntNum=0) {(void)cbNum; (void)ntNum;}
+
+//-----------------------------------------------------------------------------
+//! Set a configuration option for execution behaviour.
+//!
+//! @param  eInfo    The object where error status is to be placed.
+//! @param  optname  The name of the option (see table below).
+//! @param  optvalue The value to be set for the option.
+//!
+//! @return true     Option set.
+//! @return false    Option not set, eInfo holds the reason.
+//!
+//! @note All calls to SetConfig() must occur before GetService() is called.
+//-----------------------------------------------------------------------------
+
+/*! The following table list the currently supported keynames and what the
+    value actually does. These options only apply to the client. The options
+    must be set before calling GetService().
+
+    cbThreads        The maximum number of threads to be used for callbacks and
+                     sets the maximum number of active callbacks (default 300).
+                     set a value between 1 and 32767. Note: the nproc ulimit
+                     is final arbiter of the actual number of threads to use.
+    hiResTime        enables the use of a high resolution timer in log message
+                     timestamps. The optvalue is immaterial as this simply sets
+                     feature on and once set on cannot be set off.
+    netThreads       The maximum number of threads to be used to handle network
+                     traffic. The minimum is 3, the default is 10% of cbThreads
+                     but no more than 100.
+    pollers          The number network interrupt pollers to run. Larger values
+                     allow the initial fielding of more interrupts. Care must
+                     be taken to not overrun netThreads. The default is 3. The
+                     suggested maximum is the number of cores.
+    reqDispatch      Request dispatch algorithm to use when contact has multiple
+                     endpoints. Choose one of:
+                     < 0: Random choice each time.
+                     = 0: Use DNS order.
+                     > 0: Round robbin (the default).
+*/
+
+virtual bool SetConfig(XrdSsiErrInfo &eInfo,
+                       std::string   &optname,
+                       int            optvalue)
+                      {(void)optname; (void)optvalue; return 0;}
+
+//-----------------------------------------------------------------------------
+//! Set the client-size request spread size.
+//! @param  ssz      The spread value which may be <0, -0, or >0:
+//!                  >0 The maximum number of connections to use to to handle
+//!                     requests. No more or less are used until reset.
+//!                  =0 Turns on auto-tuning using curent setting. The initial
+//!                     default is 4. The size is automatically increased to
+//!                     accomodate the number of simultaeous requests.
+//!                  <0 Turns on auto-tuning using curent setting using the
+//!                     abs(sval) as the new spread value. The size is
+//!                     The size is automatically increased to accomodate the
+//!                     number of simultaeous requests.
+//!
+//! @note   This method may be called at any time. An abs(ssz) value > 1024
+//!         is set to 1024. Auto-tuning must be requested; it's not the default.
+//-----------------------------------------------------------------------------
+
+virtual void   SetSpread(short ssz) {(void)ssz;}
 
 //-----------------------------------------------------------------------------
 //! Set default global timeouts. By default, all timeouts are set to infinity.

@@ -32,8 +32,12 @@
 
 #include <sys/types.h>
 #include <sys/stat.h>
-  
+#include <string>
+#include <unordered_set>
+#include <vector>
+
 class XrdSysError;
+class XrdOucString;
 class XrdOucStream;
 
 class XrdOucUtils
@@ -42,13 +46,19 @@ public:
 
 static const mode_t pathMode = S_IRWXU|S_IRGRP|S_IXGRP|S_IROTH|S_IXOTH;
 
+static int   argList(char *args, char **argV, int argC);
+
+static char *bin2hex(char *inbuff, int dlen, char *buff, int blen, bool sep=true);
+
 static bool  endsWith(const char *text, const char *ending, int endlen);
 
-static char *eText(int rc, char *eBuff, int eBlen, int AsIs=0);
+static char *eText(int rc, char *eBuff, int eBlen);
 
 static int   doIf(XrdSysError *eDest, XrdOucStream &Config,
                   const char *what, const char *hname, 
                                     const char *nname, const char *pname);
+
+static bool  findPgm(const char *pgm, XrdOucString& path);
  
 static int   fmtBytes(long long val, char *buff, int bsz);
 
@@ -56,7 +66,20 @@ static char *genPath(const char *path, const char *inst, const char *psfx=0);
 
 static int   genPath(char *buff, int blen, const char *path, const char *psfx=0);
 
+static char *getFile(const char *path, int &rc, int maxsz=10240,
+                     bool notempty=true);
+
+static bool  getGID(const char *gName, gid_t &gID);
+
+static bool  getUID(const char *uName, uid_t &uID, gid_t *gID=0);
+
+static int   GidName(gid_t gID, char *gName, int gNsz, time_t keepT=0);
+
 static int   GroupName(gid_t gID, char *gName, int gNsz);
+
+static const char *i2bstr(char *buff, int blen, int val, bool pad=false);
+
+static const char *HSize(size_t bytes, char* buff, int bsz);
 
 static char *Ident(long long  &mySID, char *iBuff, int iBlen,
                    const char *iHost, const char *iProg, const char *iName,
@@ -80,11 +103,18 @@ static void  makeHome(XrdSysError &eDest, const char *inst);
 static bool  makeHome(XrdSysError &eDest, const char *inst,
                                           const char *path, mode_t mode);
 
-static int   makePath(char *path, mode_t mode);
+static int   makePath(char *path, mode_t mode, bool reset=false);
+
+static bool  mode2mask(const char *mode, mode_t &mask);
+
+static bool  parseLib(XrdSysError &eDest, XrdOucStream &Config,
+                      const char *libName, char *&path, char **libparm);
 
 static char *parseHome(XrdSysError &eDest, XrdOucStream &Config, int &mode);
 
 static int   ReLink(const char *path, const char *target, mode_t mode=0);
+
+static void  Sanitize(char *instr, char subc='_');
  
 static char *subLogfn(XrdSysError &eDest, const char *inst, char *logfn);
 
@@ -94,11 +124,21 @@ static int   Token(const char **str, char delim, char *buff, int bsz);
 
 static void  Undercover(XrdSysError &eDest, int noLog, int *pipeFD = 0);
 
+static int   UidName(uid_t uID, char *uName, int uNsz, time_t keepT=0);
+
 static int   UserName(uid_t uID, char *uName, int uNsz);
+
+static
+const char  *ValPath(const char *path, mode_t allow, bool isdir);
 
 static bool PidFile(XrdSysError &eDest, const char *path);
 
-       XrdOucUtils() {}
-      ~XrdOucUtils() {}
+static int getModificationTime(const char * path, time_t & modificationTime);
+
+static void trim(std::string & str);
+
+    XrdOucUtils() {}
+    ~XrdOucUtils() {}
+
 };
 #endif

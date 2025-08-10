@@ -32,6 +32,10 @@
 #include "XrdCl/XrdClUtils.hh"
 #include "XrdCl/XrdClCopyProcess.hh"
 #include "XrdCl/XrdClFile.hh"
+#include "XrdCl/XrdClFileSystemOperations.hh"
+#include "XrdCl/XrdClParallelOperation.hh"
+#include "XrdOuc/XrdOucPrivateUtils.hh"
+#include "XrdSys/XrdSysE2T.hh"
 
 #include <cstdlib>
 #include <cstdio>
@@ -156,6 +160,68 @@ XRootDStatus ConvertMode( Access::Mode &mode, const std::string &modeStr )
 }
 
 //------------------------------------------------------------------------------
+// Perform a cache operation
+//------------------------------------------------------------------------------
+XRootDStatus DoCache( FileSystem                      *fs,
+                      Env                             *env,
+                      const FSExecutor::CommandParams &args )
+{
+  //----------------------------------------------------------------------------
+  // Check up the args
+  //----------------------------------------------------------------------------
+  Log         *log     = DefaultEnv::GetLog();
+  uint32_t     argc    = args.size();
+
+  if( argc != 3 )
+  {
+    log->Error( AppMsg, "Wrong number of arguments." );
+    return XRootDStatus( stError, errInvalidArgs, 0,
+                                  "Wrong number of arguments." );
+  }
+
+  if( args[1] != "evict" && args[1] != "fevict")
+  {
+    log->Error( AppMsg, "Invalid cache operation." );
+    return XRootDStatus( stError, errInvalidArgs, 0, "Invalid cache operation." );
+  }
+
+  std::string fullPath;
+  if( !BuildPath( fullPath, env, args[2] ).IsOK() )
+  {
+    log->Error( AppMsg, "Invalid cache path." );
+    return XRootDStatus( stError, errInvalidArgs, 0, "Invalid cache path." );
+  }
+
+  //----------------------------------------------------------------------------
+  // Create the command 
+  //----------------------------------------------------------------------------
+  std::string cmd = args[1];
+  cmd.append(" ");
+  cmd.append(fullPath);
+
+  //----------------------------------------------------------------------------
+  // Run the operation
+  //----------------------------------------------------------------------------
+  Buffer *response = 0;
+  XRootDStatus st = fs->SendCache( cmd, response );
+  if( !st.IsOK() )
+  {
+    log->Error( AppMsg, "Unable set cache %s: %s",
+                        fullPath.c_str(),
+                        st.ToStr().c_str() );
+    return st;
+  }
+
+  if( response )
+  {
+    std::cout << response->ToString() << '\n';
+  }
+
+  delete response;
+
+  return XRootDStatus();
+}
+//------------------------------------------------------------------------------
 // Change current working directory
 //------------------------------------------------------------------------------
 XRootDStatus DoCD( FileSystem                      *fs,
@@ -209,9 +275,59 @@ XRootDStatus DoCD( FileSystem                      *fs,
 //------------------------------------------------------------------------------
 // Helper function to calculate number of digits in a number
 //------------------------------------------------------------------------------
-int nbDigits( uint64_t nb )
+uint32_t nbDigits( uint64_t nb )
 {
-  return int( log10( double(nb) ) + 1);
+  if( nb == 0 ) return 1;
+  return uint32_t( log10( double(nb) ) + 1);
+}
+
+
+void PrintDirListStatInfo( StatInfo *info, bool hascks = false, uint32_t ownerwidth = 0, uint32_t groupwidth = 0, uint32_t sizewidth = 0 )
+{
+  if( info->ExtendedFormat() )
+  {
+    if( info->TestFlags( StatInfo::IsDir ) )
+      std::cout << "d";
+    else
+      std::cout << "-";
+    std::cout << info->GetModeAsOctString();
+
+    std::cout << " " << std::setw( ownerwidth ) << info->GetOwner();
+    std::cout << " " << std::setw( groupwidth ) << info->GetGroup();
+    std::cout << " " << std::setw( sizewidth ) << info->GetSize();
+    if( hascks && info->HasChecksum() )
+      std::cout << " " << std::setw( sizewidth ) << info->GetChecksum();
+    std::cout << " " << info->GetModTimeAsString() << " ";
+  }
+  else
+  {
+    if( info->TestFlags( StatInfo::IsDir ) )
+      std::cout << "d";
+    else
+      std::cout << "-";
+
+    if( info->TestFlags( StatInfo::IsReadable ) )
+      std::cout << "r";
+    else
+      std::cout << "-";
+
+    if( info->TestFlags( StatInfo::IsWritable ) )
+      std::cout << "w";
+    else
+      std::cout << "-";
+
+    if( info->TestFlags( StatInfo::XBitSet ) )
+      std::cout << "x";
+    else
+      std::cout << "-";
+
+    std::cout << " " << info->GetModTimeAsString();
+
+    uint64_t size = info->GetSize();
+    int width = nbDigits( size ) + 2;
+    if( width < 12 ) width = 12;
+    std::cout << std::setw( width ) << info->GetSize() << " ";
+  }
 }
 
 //------------------------------------------------------------------------------
@@ -228,6 +344,7 @@ XRootDStatus DoLS( FileSystem                      *fs,
   uint32_t    argc     = args.size();
   bool        stats    = false;
   bool        showUrls = false;
+  bool        hascks   = false;
   std::string path;
   DirListFlags::Flags flags = DirListFlags::Locate | DirListFlags::Merge;
 
@@ -260,6 +377,13 @@ XRootDStatus DoLS( FileSystem                      *fs,
       // check if file is a ZIP archive if yes list content
       flags |= DirListFlags::Zip;
     }
+    else if( args[i] == "-C" )
+    {
+      // query checksum for each entry in the directory
+      hascks = true;
+      stats  = true;
+      flags |= DirListFlags::Cksm;
+    }
     else
       path = args[i];
   }
@@ -281,13 +405,44 @@ XRootDStatus DoLS( FileSystem                      *fs,
     }
   }
 
-  log->Debug( AppMsg, "Attempting to list: %s", newPath.c_str() );
+  //----------------------------------------------------------------------------
+  // Stat the entry so we know if it is a file or a directory
+  //----------------------------------------------------------------------------
+  log->Debug( AppMsg, "Attempting to stat: %s", newPath.c_str() );
+
+  StatInfo *info = 0;
+  XRootDStatus st = fs->Stat( newPath, info );
+  std::unique_ptr<StatInfo> ptr( info );
+  if( !st.IsOK() )
+  {
+    log->Error( AppMsg, "Unable to stat the path: %s", st.ToStr().c_str() );
+    return st;
+  }
+
+  if( !info->TestFlags( StatInfo::IsDir ) &&
+      !( flags & DirListFlags::Zip ) )
+  {
+    if( stats )
+      PrintDirListStatInfo( info );
+
+    if( showUrls )
+    {
+      std::string url;
+      fs->GetProperty( "LastURL", url );
+      std::cout << url;
+    }
+    std::cout << newPath << std::endl;
+    return XRootDStatus();
+  }
+
 
   //----------------------------------------------------------------------------
   // Ask for the list
   //----------------------------------------------------------------------------
+  log->Debug( AppMsg, "Attempting to list: %s", newPath.c_str() );
+
   DirectoryList *list;
-  XRootDStatus st = fs->DirList( newPath, flags, list );
+  st = fs->DirList( newPath, flags, list );
   if( !st.IsOK() )
   {
     log->Error( AppMsg, "Unable to list the path: %s", st.ToStr().c_str() );
@@ -300,48 +455,33 @@ XRootDStatus DoLS( FileSystem                      *fs,
     std::cerr << "incomplete." << std::endl;
   }
 
+  uint32_t ownerwidth = 0, groupwidth = 0, sizewidth = 0, ckswidth = 0;
+  DirectoryList::Iterator it;
+  for( it = list->Begin(); it != list->End() && stats; ++it )
+  {
+    StatInfo *info = (*it)->GetStatInfo();
+    if( ownerwidth < info->GetOwner().size() )
+      ownerwidth = info->GetOwner().size();
+    if( groupwidth < info->GetGroup().size() )
+      groupwidth = info->GetGroup().size();
+    if( sizewidth < nbDigits( info->GetSize() ) )
+      sizewidth = nbDigits( info->GetSize() );
+    if( ckswidth < info->GetChecksum().size() )
+      ckswidth = info->GetChecksum().size();
+  }
+
   //----------------------------------------------------------------------------
   // Print the results
   //----------------------------------------------------------------------------
-  DirectoryList::Iterator it;
   for( it = list->Begin(); it != list->End(); ++it )
   {
     if( stats )
     {
       StatInfo *info = (*it)->GetStatInfo();
       if( !info )
-      {
         std::cout << "---- 0000-00-00 00:00:00            ? ";
-      }
       else
-      {
-        if( info->TestFlags( StatInfo::IsDir ) )
-          std::cout << "d";
-        else
-          std::cout << "-";
-
-        if( info->TestFlags( StatInfo::IsReadable ) )
-          std::cout << "r";
-        else
-          std::cout << "-";
-
-        if( info->TestFlags( StatInfo::IsWritable ) )
-          std::cout << "w";
-        else
-          std::cout << "-";
-
-        if( info->TestFlags( StatInfo::XBitSet ) )
-          std::cout << "x";
-        else
-          std::cout << "-";
-
-        std::cout << " " << info->GetModTimeAsString();
-
-        uint64_t size = info->GetSize();
-        int width = nbDigits( size ) + 2;
-        if( width < 12 ) width = 12;
-        std::cout << std::setw( width ) << info->GetSize() << " ";
-      }
+        PrintDirListStatInfo( info, hascks, ownerwidth, groupwidth, sizewidth );
     }
     if( showUrls )
       std::cout << "root://" << (*it)->GetHostAddress() << "/";
@@ -488,6 +628,10 @@ XRootDStatus DoMv( FileSystem                      *fs,
     return XRootDStatus( stError, errInvalidArgs );
   }
 
+  if( is_subdirectory(fullPath1, fullPath2) )
+    return XRootDStatus( stError, errInvalidArgs, 0,
+      "cannot move directory to a subdirectory of itself." );
+
   //----------------------------------------------------------------------------
   // Run the query
   //----------------------------------------------------------------------------
@@ -516,30 +660,60 @@ XRootDStatus DoRm( FileSystem                      *fs,
   Log         *log     = DefaultEnv::GetLog();
   uint32_t     argc    = args.size();
 
-  if( argc != 2 )
+  if( argc < 2 )
   {
     log->Error( AppMsg, "Wrong number of arguments." );
     return XRootDStatus( stError, errInvalidArgs );
   }
 
-  std::string fullPath;
-  if( !BuildPath( fullPath, env, args[1] ).IsOK() )
+  struct print_t
   {
-    log->Error( AppMsg, "Invalid path." );
-    return XRootDStatus( stError, errInvalidArgs );
+    void print( const std::string &msg )
+    {
+      std::unique_lock<std::mutex> lck( mtx );
+      std::cout << msg << '\n';
+    }
+    std::mutex mtx;
+  };
+  std::shared_ptr<print_t> print;
+  if( argc - 1 > 0 )
+    print = std::make_shared<print_t>();
+
+  std::vector<Pipeline> rms;
+  rms.reserve( argc - 1 );
+  for( size_t i = 1; i < argc; ++i )
+  {
+    std::string fullPath;
+    if( !BuildPath( fullPath, env, args[i] ).IsOK() )
+    {
+      log->Error( AppMsg, "Invalid path: %s", fullPath.c_str() );
+      return XRootDStatus( stError, errInvalidArgs );
+    }
+    rms.emplace_back( Rm( fs, fullPath ) >>
+                      [log, fullPath, print]( XRootDStatus &st )
+                      {
+                        if( !st.IsOK() )
+                        {
+                          log->Error( AppMsg, "Unable remove %s: %s",
+                                              fullPath.c_str(),
+                                              st.ToStr().c_str() );
+                        }
+                        if( print )
+                        {
+                          print->print( "rm " + fullPath + " : " + st.ToString() );
+                        }
+                      } );
   }
 
   //----------------------------------------------------------------------------
-  // Run the query
+  // Run the query:
+  // Parallel() will take the vector of Pipeline by reference and empty the
+  // vector, so rms.size() will change after the call.
   //----------------------------------------------------------------------------
-  XRootDStatus st = fs->Rm( fullPath );
+  const size_t rs = rms.size();
+  XRootDStatus st = WaitFor( Parallel( rms ).AtLeast( rs ) );
   if( !st.IsOK() )
-  {
-    log->Error( AppMsg, "Unable remove %s: %s",
-                        fullPath.c_str(),
-                        st.ToStr().c_str() );
     return st;
-  }
 
   return XRootDStatus();
 }
@@ -776,7 +950,7 @@ XRootDStatus DoLocate( FileSystem                      *fs,
 //------------------------------------------------------------------------------
 // Process stat query
 //------------------------------------------------------------------------------
-XRootDStatus ProcessStatQuery( StatInfo *info, const std::string &query )
+XRootDStatus ProcessStatQuery( StatInfo &info, const std::string &query )
 {
   Log *log = DefaultEnv::GetLog();
 
@@ -823,13 +997,13 @@ XRootDStatus ProcessStatQuery( StatInfo *info, const std::string &query )
   if( isOrQuery )
   {
     for( it = queryFlags.begin(); it != queryFlags.end(); ++it )
-      if( info->TestFlags( flagMap[*it] ) )
+      if( info.TestFlags( flagMap[*it] ) )
         return XRootDStatus();
   }
   else
   {
     for( it = queryFlags.begin(); it != queryFlags.end(); ++it )
-      if( !info->TestFlags( flagMap[*it] ) )
+      if( !info.TestFlags( flagMap[*it] ) )
         return XRootDStatus( stError, errResponseNegative );
   }
 
@@ -851,13 +1025,13 @@ XRootDStatus DoStat( FileSystem                      *fs,
   Log         *log     = DefaultEnv::GetLog();
   uint32_t     argc    = args.size();
 
-  if( argc != 2 && argc != 4 )
+  if( argc < 2 )
   {
     log->Error( AppMsg, "Wrong number of arguments." );
     return XRootDStatus( stError, errInvalidArgs );
   }
 
-  std::string path;
+  std::vector<std::string> paths;
   std::string query;
 
   for( uint32_t i = 1; i < args.size(); ++i )
@@ -876,68 +1050,101 @@ XRootDStatus DoStat( FileSystem                      *fs,
       }
     }
     else
-      path = args[i];
+      paths.emplace_back( args[i] );
   }
 
-  std::string fullPath;
-  if( !BuildPath( fullPath, env, path ).IsOK() )
+  std::vector<XrdCl::Pipeline> stats;
+  std::vector<std::tuple<std::future<StatInfo>, std::string>> results;
+  for( auto &path : paths )
   {
-    log->Error( AppMsg, "Invalid path." );
-    return XRootDStatus( stError, errInvalidArgs );
+    std::string fullPath;
+    if( !BuildPath( fullPath, env, path ).IsOK() )
+    {
+      log->Error( AppMsg, "Invalid path." );
+      return XRootDStatus( stError, errInvalidArgs );
+    }
+    std::future<XrdCl::StatInfo> ftr;
+    stats.emplace_back( XrdCl::Stat( fs, fullPath ) >> ftr );
+    results.emplace_back( std::move( ftr ), std::move( fullPath ) );
   }
 
   //----------------------------------------------------------------------------
   // Run the query
   //----------------------------------------------------------------------------
-  StatInfo *info = 0;
-  XRootDStatus st = fs->Stat( fullPath, info );
-
-  if( !st.IsOK() )
-  {
-    log->Error( AppMsg, "Unable stat %s: %s",
-                        fullPath.c_str(),
-                        st.ToStr().c_str() );
-    return st;
-  }
+  XrdCl::Async( XrdCl::Parallel( stats ) );
 
   //----------------------------------------------------------------------------
   // Print the result
   //----------------------------------------------------------------------------
-  std::string flags;
-
-  if( info->TestFlags( StatInfo::XBitSet ) )
-    flags += "XBitSet|";
-  if( info->TestFlags( StatInfo::IsDir ) )
-    flags += "IsDir|";
-  if( info->TestFlags( StatInfo::Other ) )
-    flags += "Other|";
-  if( info->TestFlags( StatInfo::Offline ) )
-    flags += "Offline|";
-  if( info->TestFlags( StatInfo::POSCPending ) )
-    flags += "POSCPending|";
-  if( info->TestFlags( StatInfo::IsReadable ) )
-    flags += "IsReadable|";
-  if( info->TestFlags( StatInfo::IsWritable ) )
-    flags += "IsWritable|";
-  if( info->TestFlags( StatInfo::BackUpExists ) )
-    flags += "BackUpExists|";
-
-  if( !flags.empty() )
-    flags.erase( flags.length()-1, 1 );
-
-  std::cout << "Path:   " << fullPath << std::endl;
-  std::cout << "Id:     " << info->GetId() << std::endl;
-  std::cout << "Size:   " << info->GetSize() << std::endl;
-  std::cout << "MTime:  " << info->GetModTimeAsString() << std::endl;
-  std::cout << "Flags:  " << info->GetFlags() << " (" << flags << ")";
-  std::cout << std::endl;
-  if( query.length() != 0 )
+  XrdCl::XRootDStatus st;
+  for( auto &tpl : results )
   {
-    st = ProcessStatQuery( info, query );
-    std::cout << "Query:  " << query << " " << std::endl;
+    auto &ftr      = std::get<0>( tpl );
+    auto &fullPath = std::get<1>( tpl );
+    std::cout << std::endl;
+    try
+    {
+      XrdCl::StatInfo info( ftr.get() );
+      std::string flags;
+
+      if( info.TestFlags( StatInfo::XBitSet ) )
+        flags += "XBitSet|";
+      if( info.TestFlags( StatInfo::IsDir ) )
+        flags += "IsDir|";
+      if( info.TestFlags( StatInfo::Other ) )
+        flags += "Other|";
+      if( info.TestFlags( StatInfo::Offline ) )
+        flags += "Offline|";
+      if( info.TestFlags( StatInfo::POSCPending ) )
+        flags += "POSCPending|";
+      if( info.TestFlags( StatInfo::IsReadable ) )
+        flags += "IsReadable|";
+      if( info.TestFlags( StatInfo::IsWritable ) )
+        flags += "IsWritable|";
+      if( info.TestFlags( StatInfo::BackUpExists ) )
+        flags += "BackUpExists|";
+
+      if( !flags.empty() )
+        flags.erase( flags.length()-1, 1 );
+
+      std::cout <<   "Path:   " << fullPath << std::endl;
+      std::cout <<   "Id:     " << info.GetId() << std::endl;
+      std::cout <<   "Size:   " << info.GetSize() << std::endl;
+      std::cout <<   "MTime:  " << info.GetModTimeAsString() << std::endl;
+      // if extended stat information is available we can print also
+      // change time and access time
+      if( info.ExtendedFormat() )
+      {
+        std::cout << "CTime:  " << info.GetChangeTimeAsString() << std::endl;
+        std::cout << "ATime:  " << info.GetAccessTimeAsString() << std::endl;
+      }
+      std::cout << "Flags:  " << info.GetFlags() << " (" << flags << ")";
+
+      // check if extended stat information is available
+      if( info.ExtendedFormat() )
+      {
+        std::cout << "\nMode:   " << info.GetModeAsString() << std::endl;
+        std::cout << "Owner:  " << info.GetOwner() << std::endl;
+        std::cout << "Group:  " << info.GetGroup();
+      }
+
+      std::cout << std::endl;
+
+      if( query.length() != 0 )
+      {
+        XRootDStatus s = ProcessStatQuery( info, query );
+        if( !s.IsOK() )
+          st = s;
+        std::cout << "Query:  " << query << " " << std::endl;
+      }
+    }
+    catch( XrdCl::PipelineException &ex )
+    {
+      st = ex.GetError();
+      log->Error( AppMsg, "Unable stat %s: %s", fullPath.c_str(), st.ToStr().c_str() );
+    }
   }
 
-  delete info;
   return st;
 }
 
@@ -1165,6 +1372,8 @@ XRootDStatus DoPrepare( FileSystem                      *fs,
       flags |= PrepareFlags::Stage;
     else if( args[i] == "-w" )
       flags |= PrepareFlags::WriteMode;
+    else if( args[i] == "-e" )
+      flags |= PrepareFlags::Evict;
     else if( args[i] == "-a" )
     {
       flags |= PrepareFlags::Cancel;
@@ -1276,7 +1485,7 @@ XRootDStatus DoCat( FileSystem                      *fs,
   Log         *log     = DefaultEnv::GetLog();
   uint32_t     argc    = args.size();
 
-  if( argc != 2 && argc != 4 )
+  if( argc < 2 )
   {
     log->Error( AppMsg, "Wrong number of arguments." );
     return XRootDStatus( stError, errInvalidArgs );
@@ -1290,7 +1499,7 @@ XRootDStatus DoCat( FileSystem                      *fs,
     return XRootDStatus( stError, errInvalidAddr );
   }
 
-  std::string remote;
+  std::vector<std::string> remotes;
   std::string local;
 
   for( uint32_t i = 1; i < args.size(); ++i )
@@ -1309,44 +1518,59 @@ XRootDStatus DoCat( FileSystem                      *fs,
       }
     }
     else
-      remote = args[i];
+      remotes.emplace_back( args[i] );
   }
 
-  std::string remoteFile;
-  if( !BuildPath( remoteFile, env, remote ).IsOK() )
+  if( !local.empty() && remotes.size() > 1 )
   {
-    log->Error( AppMsg, "Invalid path." );
+    log->Error( AppMsg, "If '-o' is used only can be used with only one remote file." );
     return XRootDStatus( stError, errInvalidArgs );
   }
 
-  URL remoteUrl( server );
-  remoteUrl.SetPath( remoteFile );
+  std::vector<URL> remoteUrls;
+  remoteUrls.reserve( remotes.size() );
+  for( auto &remote : remotes )
+  {
+    std::string remoteFile;
+    if( !BuildPath( remoteFile, env, remote ).IsOK() )
+    {
+      log->Error( AppMsg, "Invalid path." );
+      return XRootDStatus( stError, errInvalidArgs );
+    }
+
+    remoteUrls.emplace_back( server );
+    remoteUrls.back().SetPath( remoteFile );
+  }
 
   //----------------------------------------------------------------------------
   // Fetch the data
   //----------------------------------------------------------------------------
   CopyProgressHandler *handler = 0; ProgressDisplay d;
-  CopyProcess process; PropertyList props; PropertyList results;
+  CopyProcess process;
+  std::vector<PropertyList> props( remoteUrls.size() ), results( remoteUrls.size() );
 
-  props.Set( "source", remoteUrl.GetURL() );
-  if( !local.empty() )
+  for( size_t i = 0; i < remoteUrls.size(); ++i )
   {
-    props.Set( "target", std::string( "file://" ) + local );
-    handler = &d;
+    props[i].Set( "source", remoteUrls[i].GetURL() );
+    if( !local.empty() )
+    {
+      props[i].Set( "target", std::string( "file://" ) + local );
+      handler = &d;
+    }
+    else
+      props[i].Set( "target", "stdio://-" );
+
+    props[i].Set( "dynamicSource", true );
+
+    XRootDStatus st = process.AddJob( props[i], &results[i] );
+    if( !st.IsOK() )
+    {
+      log->Error( AppMsg, "Job adding failed: %s.", st.ToStr().c_str() );
+      return st;
+    }
   }
-  else
-    props.Set( "target", "stdio://-" );
 
-  props.Set( "dynamicSource", true );
-
-  XRootDStatus st = process.AddJob( props, &results );
-  if( !st.IsOK() )
-  {
-    log->Error( AppMsg, "Job adding failed: %s.", st.ToStr().c_str() );
-    return st;
-  }
-
-  st = process.Prepare();
+  XRootDStatus st = process.Prepare();
   if( !st.IsOK() )
   {
     log->Error( AppMsg, "Copy preparation failed: %s.", st.ToStr().c_str() );
@@ -1440,7 +1664,7 @@ XRootDStatus DoTail( FileSystem                      *fs,
   if( !st.IsOK() )
   {
     log->Error( AppMsg, "Unable to open file %s: %s",
-                remoteUrl.GetURL().c_str(), st.ToStr().c_str() );
+                remoteUrl.GetObfuscatedURL().c_str(), st.ToStr().c_str() );
     return st;
   }
 
@@ -1463,7 +1687,7 @@ XRootDStatus DoTail( FileSystem                      *fs,
     if( !st.IsOK() )
     {
       log->Error( AppMsg, "Unable to read from %s: %s",
-                  remoteUrl.GetURL().c_str(), st.ToStr().c_str() );
+                  remoteUrl.GetObfuscatedURL().c_str(), st.ToStr().c_str() );
       delete [] buffer;
       return st;
     }
@@ -1473,7 +1697,7 @@ XRootDStatus DoTail( FileSystem                      *fs,
     if( ret == -1 )
     {
       log->Error( AppMsg, "Unable to write to stdout: %s",
-                  strerror(errno) );
+                  XrdSysE2T(errno) );
       delete [] buffer;
       return st;
     }
@@ -1536,6 +1760,170 @@ XRootDStatus DoSpaceInfo( FileSystem                      *fs,
 }
 
 //------------------------------------------------------------------------------
+// Carry out xattr operation
+//------------------------------------------------------------------------------
+XRootDStatus DoXAttr( FileSystem                      *fs,
+                      Env                             *env,
+                      const FSExecutor::CommandParams &args )
+{
+  //----------------------------------------------------------------------------
+  // Check up the args
+  //----------------------------------------------------------------------------
+  Log         *log     = DefaultEnv::GetLog();
+  uint32_t     argc    = args.size();
+
+  if( argc < 3 )
+  {
+    log->Error( AppMsg, "Wrong number of arguments." );
+    return XRootDStatus( stError, errInvalidArgs );
+  }
+
+  kXR_char code = 0;
+  if( args[2] == "set")
+    code = kXR_fattrSet;
+  else if( args[2] == "get" )
+    code = kXR_fattrGet;
+  else if( args[2] == "del" )
+    code = kXR_fattrDel;
+  else if( args[2] == "list" )
+    code = kXR_fattrList;
+  else
+  {
+    log->Error( AppMsg, "Invalid xattr code." );
+    return XRootDStatus( stError, errInvalidArgs );
+  }
+
+  std::string path;
+  if( !BuildPath( path, env, args[1] ).IsOK() )
+  {
+    log->Error( AppMsg, "Invalid path." );
+    return XRootDStatus( stError, errInvalidArgs );
+  }
+
+  //----------------------------------------------------------------------------
+  // Issue the xattr operation
+  //----------------------------------------------------------------------------
+  XRootDStatus status;
+  switch( code )
+  {
+    case kXR_fattrSet:
+    {
+      if( argc != 4 )
+      {
+        log->Error( AppMsg, "Wrong number of arguments." );
+        return XRootDStatus( stError, errInvalidArgs );
+      }
+
+      std::string key_value = args[3];
+      size_t pos = key_value.find( '=' );
+      std::string key   = key_value.substr( 0, pos );
+      std::string value = key_value.substr( pos + 1 );
+      std::vector<xattr_t> attrs;
+      attrs.push_back( std::make_tuple( key, value ) );
+
+      std::vector<XAttrStatus> result;
+      XRootDStatus status = fs->SetXAttr( path, attrs, result );
+      XAttrStatus xst = status.IsOK() ? result.front() : XAttrStatus( key, status );
+
+      if( !xst.status.IsOK() )
+        status = xst.status;
+
+      if( !status.IsOK() )
+        log->Error( AppMsg, "Unable to xattr set %s %s: %s",
+                            key.c_str(), value.c_str(),
+                            status.ToStr().c_str() );
+      return status;
+    }
+
+    case kXR_fattrGet:
+    {
+      if( argc != 4 )
+      {
+        log->Error( AppMsg, "Wrong number of arguments." );
+        return XRootDStatus( stError, errInvalidArgs );
+      }
+
+      std::string key = args[3];
+      std::vector<std::string> attrs;
+      attrs.push_back( key );
+
+      std::vector<XAttr> result;
+      XRootDStatus status = fs->GetXAttr( path, attrs, result );
+      XAttr xattr = status.IsOK() ? result.front() : XAttr( key, status );
+
+      if( !xattr.status.IsOK() )
+        status = xattr.status;
+
+      if( !status.IsOK() )
+        log->Error( AppMsg, "Unable to xattr get %s : %s",
+                            key.c_str(),
+                            status.ToStr().c_str() );
+      else
+      {
+        std::cout << "# file: " << path << '\n';
+        std::cout << xattr.name << "=\"" << xattr.value << "\"\n";
+      }
+
+      return status;
+    }
+
+    case kXR_fattrDel:
+    {
+      if( argc != 4 )
+      {
+        log->Error( AppMsg, "Wrong number of arguments." );
+        return XRootDStatus( stError, errInvalidArgs );
+      }
+
+      std::string key = args[3];
+      std::vector<std::string> attrs;
+      attrs.push_back( key );
+
+      std::vector<XAttrStatus> result ;
+      XRootDStatus status = fs->DelXAttr( path, attrs, result );
+      XAttrStatus xst = status.IsOK() ? result.front() : XAttrStatus( key, status );
+
+      if( !xst.status.IsOK() )
+        status = xst.status;
+
+      if( !status.IsOK() )
+        log->Error( AppMsg, "Unable to xattr del %s : %s",
+                            key.c_str(),
+                            status.ToStr().c_str() );
+      return status;
+    }
+
+    case kXR_fattrList:
+    {
+      if( argc != 3 )
+      {
+        log->Error( AppMsg, "Wrong number of arguments." );
+        return XRootDStatus( stError, errInvalidArgs );
+      }
+
+      std::vector<XAttr> result;
+      XRootDStatus status = fs->ListXAttr( path, result );
+
+      if( !status.IsOK() )
+        log->Error( AppMsg, "Unable to xattr list : %s",
+                            status.ToStr().c_str() );
+      else
+      {
+        std::cout << "# file: " << path << '\n';
+        auto itr = result.begin();
+        for( ; itr != result.end(); ++itr )
+          std::cout << itr->name << "=\"" << itr->value << "\"\n";
+      }
+
+      return status;
+    }
+
+    default:
+      return XRootDStatus( stError, errInvalidAddr );
+  }
+}
+
+//------------------------------------------------------------------------------
 // Print help
 //------------------------------------------------------------------------------
 XRootDStatus PrintHelp( FileSystem *, Env *,
@@ -1557,6 +1945,11 @@ XRootDStatus PrintHelp( FileSystem *, Env *,
   printf( "   help\n"                                                         );
   printf( "     This help screen.\n\n"                                        );
 
+  printf( "   cache {evict | fevict} <path>\n"                                );
+  printf( "     Evict a file from a cache if not in use; while fevict\n"      );
+  printf( "     forcibly evicts the file causing any current uses of the\n"   );
+  printf( "     file to get read failures on a subsequent read\n\n"           );
+
   printf( "   cd <path>\n"                                                    );
   printf( "     Change the current working directory\n\n"                     );
 
@@ -1564,13 +1957,14 @@ XRootDStatus PrintHelp( FileSystem *, Env *,
   printf( "     Modify permissions. Permission string example:\n"             );
   printf( "     rwxr-x--x\n\n"                                                );
 
-  printf( "   ls [-l] [-u] [-R] [-D] [-Z] [dirname]\n"                        );
+  printf( "   ls [-l] [-u] [-R] [-D] [-Z] [-C] [dirname]\n"                   );
   printf( "     Get directory listing.\n"                                     );
-  printf( "     -l stat every entry and pring long listing\n"                 );
+  printf( "     -l stat every entry and print long listing\n"                 );
   printf( "     -u print paths as URLs\n"                                     );
   printf( "     -R list subdirectories recursively\n"                         );
   printf( "     -D show duplicate entries"                                    );
-  printf( "     -Z if a ZIP archive list its content\n\n"                     );
+  printf( "     -Z if a ZIP archive list its content\n"                       );
+  printf( "     -C checksum every entry\n\n"                                  );
 
   printf( "   locate [-n] [-r] [-d] [-m] [-i] [-p] <path>\n"                  );
   printf( "     Get the locations of the path.\n"                             );
@@ -1596,29 +1990,29 @@ XRootDStatus PrintHelp( FileSystem *, Env *,
   printf( "              flags may be combined together using '|' or '&'\n"   );
   printf( "              Available flags:\n"                                  );
   printf( "              XBitSet, IsDir, Other, Offline, POSCPending,\n"      );
-  printf( "              IsReadable, IsWriteable\n\n"                         );
+  printf( "              IsReadable, IsWritable\n\n"                          );
 
   printf( "   statvfs <path>\n"                                               );
   printf( "     Get info about a virtual file system.\n\n"                    );
 
-  printf( "   query <code> <parms>\n"                                         );
+  printf( "   query <code> <parameters>\n"                                    );
   printf( "     Obtain server information. Query codes:\n\n"                  );
 
   printf( "     config         <what>   Server configuration; <what> is\n"    );
   printf( "                             one of the following:\n"              );
   printf( "                               bind_max      - the maximum number of parallel streams\n"  );
   printf( "                               chksum        - the supported checksum\n"                  );
+  printf( "                               cms           - the status of the cmsd\n"                  );
   printf( "                               pio_max       - maximum number of parallel I/O requests\n" );
   printf( "                               readv_ior_max - maximum size of a readv element\n"         );
   printf( "                               readv_iov_max - maximum number of readv entries\n"         );
+  printf( "                               role          - the role in a cluster\n"                   );
+  printf( "                               sitename      - the site name\n"                           );
   printf( "                               tpc           - support for third party copies\n"          );
+  printf( "                               version       - the version of the server\n"               );
   printf( "                               wan_port      - the port to use for wan copies\n"          );
   printf( "                               wan_window    - the wan_port window size\n"                );
   printf( "                               window        - the tcp window size\n"                     );
-  printf( "                               cms           - the status of the cmsd\n"                  );
-  printf( "                               role          - the role in a cluster\n"                   );
-  printf( "                               sitename      - the site name\n"                           );
-  printf( "                               version       - the version of the server\n"               );
   printf( "     checksumcancel <path>   File checksum cancellation\n"       );
   printf( "     checksum       <path>   File checksum\n"                    );
   printf( "     opaque         <arg>    Implementation dependent\n"         );
@@ -1648,17 +2042,18 @@ XRootDStatus PrintHelp( FileSystem *, Env *,
   printf( "   truncate <filename> <length>\n"                               );
   printf( "     Truncate a file.\n\n"                                       );
 
-  printf( "   prepare [-c] [-f] [-s] [-w] [-p priority] [-a requestid] filenames\n"   );
+  printf( "   prepare [-c] [-f] [-s] [-w] [-e] [-p priority] [-a requestid] filenames\n"   );
   printf( "     Prepare one or more files for access.\n"                    );
   printf( "     -c co-locate staged files if possible\n"                    );
   printf( "     -f refresh file access time even if the location is known\n" );
   printf( "     -s stage the files to disk if they are not online\n"        );
   printf( "     -w the files will be accessed for modification\n"           );
   printf( "     -p priority of the request, 0 (lowest) - 3 (highest)\n"     );
-  printf( "     -a abort stage request\n\n"                                 );
+  printf( "     -a abort stage request\n"                                   );
+  printf( "     -e evict the file from disk cache\n\n"                      );
 
-  printf( "   cat [-o local file] file\n"                                   );
-  printf( "     Print contents of a file to stdout.\n"                      );
+  printf( "   cat [-o local file] files\n"                                  );
+  printf( "     Print contents of one or more files to stdout.\n"           );
   printf( "     -o print to the specified local file\n\n"                   );
 
   printf( "   tail [-c bytes] [-f] file\n"                                  );
@@ -1668,6 +2063,14 @@ XRootDStatus PrintHelp( FileSystem *, Env *,
 
   printf( "   spaceinfo path\n"                                             );
   printf( "     Get space statistics for given path.\n\n"                   );
+
+  printf( "   xattr <path> <code> <params> \n"                              );
+  printf( "     Operation on extended attributes. Codes:\n\n"               );
+  printf( "     set   <attr>          Set extended attribute; <attr> is\n"  );
+  printf( "                             string of form name=value\n"        );
+  printf( "     get   <name>          Get extended attribute\n"             );
+  printf( "     del   <name>          Delete extended attribute\n"          );
+  printf( "     list                  List extended attributes\n\n"         );
 
   return XRootDStatus();
 }
@@ -1680,6 +2083,7 @@ FSExecutor *CreateExecutor( const URL &url )
   Env *env = new Env();
   env->PutString( "CWD", "/" );
   FSExecutor *executor = new FSExecutor( url, env );
+  executor->AddCommand( "cache",       DoCache      );
   executor->AddCommand( "cd",          DoCD         );
   executor->AddCommand( "chmod",       DoChMod      );
   executor->AddCommand( "ls",          DoLS         );
@@ -1697,6 +2101,7 @@ FSExecutor *CreateExecutor( const URL &url )
   executor->AddCommand( "cat",         DoCat        );
   executor->AddCommand( "tail",        DoTail       );
   executor->AddCommand( "spaceinfo",   DoSpaceInfo  );
+  executor->AddCommand( "xattr",       DoXAttr      );
   return executor;
 }
 

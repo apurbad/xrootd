@@ -28,15 +28,13 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
-#ifndef __APPLE__
-#include <malloc.h>
-#endif
-#include <stdlib.h>
+#include <cstdlib>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <port.h>
 
-using namespace std;
+@include "XrdSys/XrdSysE2T.hh"
+
   
 /******************************************************************************/
 /*                        C l a s s   P o l l P o r t                         */
@@ -162,7 +160,7 @@ int XrdSys::IOEvents::PollPort::AllocMem(void **memP, int slots)
 //
    bytes     = slots * sizeof(port_event_t);
    alignment = (bytes < pagsz ? 1024 : pagsz);
-   if (!(*memP = memalign(alignment, bytes))) return ENOMEM;
+   if (posix_memalign(memP, alignment, bytes)) return ENOMEM;
    memset(*memP, 0, bytes);
    return 0;
 }
@@ -197,7 +195,13 @@ void XrdSys::IOEvents::PollPort::Begin(XrdSysSemaphore *syncsem,
             if (rc)
                {if (errno == ETIME || !errno) CbkTMO();
                    else {int rc = errno;
-                         cerr <<"PollP: " <<strerror(rc) <<" polling for events" <<endl;
+                         //--------------------------------------------------------------
+                         // If we are in a child process and the poll file descriptor
+                         // has been closed, there is an immense chance the fork will be
+                         // followed by an exec, in which case we don't want to abort
+                         //--------------------------------------------------------------
+                         if( rc == EBADF && parentPID != getpid() ) return;
+                         std::cerr <<"PollP: " <<XrdSysE2T(rc) <<" polling for events" <<std::endl;
                          abort();
                         }
                }

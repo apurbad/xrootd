@@ -31,7 +31,7 @@
 /******************************************************************************/
 
 #include <sys/types.h>
-#include <errno.h>
+#include <cerrno>
 #include "XrdSys/XrdSysHeaders.hh"
 
 #include "XrdOss/XrdOss.hh"
@@ -55,21 +55,25 @@ int     Close(long long *retsz=0);
 int     Opendir(const char *, XrdOucEnv &);
 int     Readdir(char *buff, int blen);
 int     StatRet(struct stat *buff);
+int     getFD() {return fd;}
 
         // Constructor and destructor
-        XrdOssDir(const char *tid) : lclfd(0), mssfd(0), Stat(0), tident(tid),
-                                     pflags(0), ateof(0), isopen(0), dirFD(0)
-                                   {}
-       ~XrdOssDir() {if (isopen > 0) Close(); isopen = 0;}
+        XrdOssDir(const char *tid, DIR *dP=0)
+                 : XrdOssDF(tid, DF_isDir),
+                   lclfd(dP), mssfd(0), Stat(0), ateof(false),
+                   isopen(dP != 0), dOpts(0) {if (dP) fd = dirfd(dP);}
+
+       ~XrdOssDir() {if (isopen) Close();}
 private:
          DIR       *lclfd;
          void      *mssfd;
 struct   stat      *Stat;
-const    char      *tident;
-unsigned long long  pflags;
-         int        ateof;
-         int        isopen;
-         int        dirFD;
+         bool       ateof;
+         bool       isopen;
+unsigned char       dOpts;
+static const int    isStage  = 0x01;
+static const int    noCheck  = 0x02;
+static const int    noDread  = 0x04;
 };
   
 /******************************************************************************/
@@ -92,6 +96,8 @@ virtual int     Close(long long *retsz=0);
 virtual int     Open(const char *, int, mode_t, XrdOucEnv &);
 
 int     Fchmod(mode_t mode);
+int     Fctl(int cmd, int alen, const char *args, char **resp=0);
+void    Flush();
 int     Fstat(struct stat *);
 int     Fsync();
 int     Fsync(XrdSfsAio *aiop);
@@ -108,10 +114,10 @@ ssize_t Write(const void *, off_t, size_t);
 int     Write(XrdSfsAio *aiop);
  
         // Constructor and destructor
-        XrdOssFile(const char *tid)
-                  {cxobj = 0; rawio = 0; cxpgsz = 0; cxid[0] = '\0';
-                   mmFile = 0; tident = tid;
-                  }
+        XrdOssFile(const char *tid, int fdnum=-1)
+                  : XrdOssDF(tid, DF_isFile, fdnum),
+                    cxobj(0), cacheP(0), mmFile(0),
+                    rawio(0), cxpgsz(0) {cxid[0] = '\0';}
 
 virtual ~XrdOssFile() {if (fd >= 0) Close();}
 
@@ -122,7 +128,6 @@ static int      AioFailure;
 oocx_CXFile    *cxobj;
 XrdOssCache_FS *cacheP;
 XrdOssMioFile  *mmFile;
-const char     *tident;
 long long       FSize;
 int             rawio;
 int             cxpgsz;
@@ -158,6 +163,7 @@ int       Configure(const char *, XrdSysError &, XrdOucEnv *envP);
 void      Config_Display(XrdSysError &);
 virtual
 int       Create(const char *, const char *, mode_t, XrdOucEnv &, int opts=0);
+uint64_t  Features() {return XRDOSS_HASNAIO;} // Turn async I/O off for disk
 int       GenLocalPath(const char *, char *);
 int       GenRemotePath(const char *, char *);
 int       Init(XrdSysLogger *, const char *, XrdOucEnv *envP);
@@ -182,7 +188,7 @@ int       StatFS(const char *path, char *buff, int &blen, XrdOucEnv *Env=0);
 int       StatFS(const char *path, unsigned long long &Opt,
                  long long &fSize, long long &fSpace);
 int       StatLS(XrdOucEnv &env, const char *path, char *buff, int &blen);
-int       StatPF(const char *, struct stat *);
+int       StatPF(const char *, struct stat *, int);
 int       StatVS(XrdOssVSInfo *sP, const char *sname=0, int updt=0);
 int       StatXA(const char *path, char *buff, int &blen, XrdOucEnv *Env=0);
 int       StatXP(const char *path, unsigned long long &attr, XrdOucEnv *Env=0);
@@ -193,8 +199,6 @@ int       Stats(char *bp, int bl);
 
 static int   AioInit();
 static int   AioAllOk;
-
-static int   runOld;            // Run in backward compatability mode
 
 static char  tryMmap;           // Memory mapped files enabled
 static char  chkMmap;           // Memory mapped files are selective
@@ -306,6 +310,8 @@ char           *UDir;         // -> Usage logdir
 char           *QFile;        // -> Quota file
 char           *xfrFdir;      // -> Fail file base dir
 int             xfrFdln;      //    strlen(xfrFDir)
+short           USync;        // Usage sync interval
+bool            pfcMode;      // Setup for Proxy File Cache
 
 int                Alloc_Cache(XrdOssCreateInfo &, XrdOucEnv &);
 int                Alloc_Local(XrdOssCreateInfo &, XrdOucEnv &);
@@ -325,6 +331,7 @@ int                Stage_RT(const char *, const char *, XrdOucEnv &, unsigned lo
 
 // Configuration related methods
 //
+void   ConfigCache(XrdSysError &Eroute, bool pass2=false);
 void   ConfigMio(XrdSysError &Eroute);
 int    ConfigN2N(XrdSysError &Eroute, XrdOucEnv *envP);
 int    ConfigProc(XrdSysError &Eroute);
@@ -352,7 +359,7 @@ int    xprerd(XrdOucStream &Config, XrdSysError &Eroute);
 int    xspace(XrdOucStream &Config, XrdSysError &Eroute, int *isCD=0);
 int    xspace(XrdOucStream &Config, XrdSysError &Eroute,
               const char *grp, bool isAsgn);
-int    xspaceBuild(char *grp, char *fn, int isxa, XrdSysError &Eroute);
+int    xspaceBuild(OssSpaceConfig &sInfo, XrdSysError &Eroute);
 int    xstg(XrdOucStream &Config, XrdSysError &Eroute);
 int    xstl(XrdOucStream &Config, XrdSysError &Eroute);
 int    xusage(XrdOucStream &Config, XrdSysError &Eroute);
@@ -368,8 +375,6 @@ int    MSS_Xeq(XrdOucStream **xfd, int okerr,
 // Other methods
 //
 int    RenameLink(char *old_path, char *new_path);
-int    RenameLink2(int Llen, char *oLnk, char *old_path,
-                             char *nLnk, char *new_path);
 int    RenameLink3(char *cPath, char *old_path, char *new_path);
 };
 

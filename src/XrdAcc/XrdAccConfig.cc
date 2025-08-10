@@ -29,18 +29,19 @@
 /******************************************************************************/
   
 #include <unistd.h>
-#include <ctype.h>
+#include <cctype>
 #include <fcntl.h>
 #include <map>
 #include <strings.h>
-#include <stdio.h>
-#include <time.h>
+#include <cstdio>
+#include <ctime>
 #include <sys/param.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 
 #include "XrdOuc/XrdOucLock.hh"
 #include "XrdOuc/XrdOucEnv.hh"
+#include "XrdOuc/XrdOucUri.hh"
 #include "XrdSys/XrdSysError.hh"
 #include "XrdSys/XrdSysHeaders.hh"
 #include "XrdOuc/XrdOucStream.hh"
@@ -108,6 +109,7 @@ XrdAccConfig::XrdAccConfig()
    Database      = 0;
    Authorization = 0;
    spChar        = 0;
+   uriPath       = false;
 
 // Establish other defaults
 //
@@ -275,6 +277,9 @@ int XrdAccConfig::ConfigFile(XrdSysError &Eroute, const char *ConfigFN) {
 // Now start reading records until eof.
 //
    ConfigDefaults(); Config.Attach(cfgFD); Config.Tabs(0);
+   static const char *cvec[] = { "*** acc plugin config:", 0 };
+   Config.Capture(cvec);
+
    while((var = Config.GetMyFirstWord()))
         {if (!strncmp(var, "acc.", 2))
             {recs++;
@@ -282,7 +287,7 @@ int XrdAccConfig::ConfigFile(XrdSysError &Eroute, const char *ConfigFN) {
             }
         }
 
-// Now check if any errors occured during file i/o
+// Now check if any errors occurred during file i/o
 //
    if ((retc = Config.LastError()))
       NoGo = Eroute.Emsg("Config",-retc,"read config file",ConfigFN);
@@ -324,6 +329,7 @@ int XrdAccConfig::ConfigXeq(char *var, XrdOucStream &Config, XrdSysError &Eroute
    TS_Xeq("audit",         xaud);
    TS_Xeq("authdb",        xdbp);
    TS_Xeq("authrefresh",   xart);
+   TS_Xeq("encoding",      xenc);
    TS_Xeq("gidlifetime",   xglt);
    TS_Xeq("gidretran",     xgrt);
    TS_Xeq("nisdomain",     xnis);
@@ -422,6 +428,55 @@ int XrdAccConfig::xart(XrdOucStream &Config, XrdSysError &Eroute)
          return 1;
       AuthRT = reft;
       return 0;
+}
+
+/******************************************************************************/
+/*                                  x e n c                                   */
+/******************************************************************************/
+
+/* Function: xenc
+
+   Purpose:  To parse the directive: encoding [space <char>] [pct path]
+
+             <char>    the character that is to be considred as a space.
+                       This only applies to identifiers.
+
+   Output: 0 upon success or !0 upon failure.
+*/
+
+int XrdAccConfig::xenc(XrdOucStream &Config, XrdSysError &Eroute)
+{
+   char *val;
+
+   if (!(val = Config.GetWord()) || *val == 0)
+      {Eroute.Emsg("Config","encoding argument not specified"); return 1;}
+
+do{     if (!strcmp(val, "pct"))
+           {if (!(val = Config.GetWord()))
+               {Eroute.Emsg("Config","pct argument not specified");
+                return 1;
+               }
+            if (strcmp(val, "path"))
+               {Eroute.Emsg("Config",val, "pct encoding not supported");
+                return 1;
+               }
+            uriPath = true;
+           }
+   else if (!strcmp(val, "space"))
+           {if (!(val = Config.GetWord()))
+               {Eroute.Emsg("Config","space argument not specified");
+                return 1;
+               }
+            if (strlen(val) != 1)
+               {Eroute.Emsg("Config","invalid space argument -", val);
+                return 1;
+               }
+            spChar = *val;
+           }
+  } while((val = Config.GetWord()) && *val);
+
+
+   return 0;
 }
 
 /******************************************************************************/
@@ -535,7 +590,7 @@ int XrdAccConfig::xnis(XrdOucStream &Config, XrdSysError &Eroute)
 /*                                  x s p c                                   */
 /******************************************************************************/
 
-/* Function: xspc
+/* Function: xspc (deprecated and undocumented, replaced by acc.encoding).
 
    Purpose:  To parse the directive: spacechar <char>
 
@@ -682,7 +737,12 @@ int XrdAccConfig::ConfigDBrec(XrdSysError &Eroute,
                      {Eroute.Emsg("ConfigXeq", "Invalid privs -", privs);
                       break;
                      }
-                  currcap = new XrdAccCapability(path, xprivs);
+                  if (uriPath)
+                     {int plen = strlen(path);
+                      char *decp = (char *)alloca(plen+1);
+                      XrdOucUri::Decode(path, plen, decp);
+                      currcap = new XrdAccCapability(decp, xprivs);
+                     } else currcap = new XrdAccCapability(path, xprivs);
                 }
              lastcap->Add(currcap);
              lastcap = currcap;

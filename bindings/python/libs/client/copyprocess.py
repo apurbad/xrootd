@@ -26,6 +26,7 @@ from __future__ import absolute_import, division, print_function
 from pyxrootd import client
 from XRootD.client.url import URL
 from XRootD.client.responses import XRootDStatus
+from .env import EnvGetInt, EnvGetString
 
 class ProgressHandlerWrapper(object):
   """Internal progress handler wrapper to convert parameters to friendly 
@@ -73,20 +74,27 @@ class CopyProcess(object):
   def add_job(self,
               source,
               target,
-              sourcelimit    = 1,
-              force          = False,
-              posc           = False,
-              coerce         = False,
-              mkdir          = False,
-              thirdparty     = 'none',
-              checksummode   = 'none',
-              checksumtype   = '',
-              checksumpreset = '',
-              dynamicsource  = False,
-              chunksize      = 4194304,
-              parallelchunks = 8,
-              inittimeout    = 600,
-              tpctimeout     = 1800):
+              sourcelimit     = 1,
+              force           = False,
+              posc            = False,
+              coerce          = False,
+              mkdir           = False,
+              thirdparty      = 'none',
+              checksummode    = 'none',
+              checksumtype    = '',
+              checksumpreset  = '',
+              dynamicsource   = False,
+              chunksize       = EnvGetInt('CPChunkSize'),
+              parallelchunks  = EnvGetInt('CPParallelChunks'),
+              inittimeout     = EnvGetInt('CPInitTimeout'),
+              tpctimeout      = EnvGetInt('CPTPCTimeout'),
+              rmBadCksum      = False,
+              cptimeout       = EnvGetInt('CPTimeout'),
+              xrateThreshold  = EnvGetInt('XRateThreshold'),
+              xrate           = 0,
+              retry           = EnvGetInt('CpRetry'),
+              cont            = False,
+              rtrplc          = EnvGetString('CpRetryPolicy') ):
     """Add a job to the copy process.
 
     :param         source: original source URL
@@ -123,11 +131,26 @@ class CopyProcess(object):
     :type     inittimeout: integer
     :param     tpctimeout: timeout for a third-party copy to finish
     :type      tpctimeout: integer
+    :param     rmBadCksum: remove target file on bad checksum
+    :type      rmBadCksum: boolean
+    :param      cptimeout: timeout for classic cp operation
+    :type       cptimeout: integer
+    :param xrateThreshold: data transfer rate threshold
+    :type  xrateThreshold: integer
+    :param           xrate: data transfer rate limit
+    :type            xrate: integer
+    :param     retry: number of retries
+    :type      retry: integer
+    :param     cont: continue copying a file from the point where the previous copy was interrupted
+    :type      cont: boolean
+    :param     rtrplc: the retry polic (force or continue)
+    :type      rtrplc: string
     """
-    self.__process.add_job(source, target, sourcelimit, force, posc, coerce, mkdir,
-                           thirdparty, checksummode, checksumtype, checksumpreset,
-                           dynamicsource, chunksize, parallelchunks, inittimeout,
-                           tpctimeout)
+    self.__process.add_job(source, target, sourcelimit, force, posc,
+                           coerce, mkdir, thirdparty, checksummode, checksumtype,
+                           checksumpreset, dynamicsource, chunksize, parallelchunks, inittimeout,
+                           tpctimeout, rmBadCksum, cptimeout, retry, xrateThreshold,
+                           xrate, cont, rtrplc )
 
   def prepare(self):
     """Prepare the copy jobs. **Must be called before** ``run()``."""

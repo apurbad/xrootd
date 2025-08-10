@@ -76,12 +76,12 @@ Where:
 /******************************************************************************/
   
 #include <unistd.h>
-#include <ctype.h>
-#include <errno.h>
-#include <stdlib.h>
-#include <string.h>
+#include <cctype>
+#include <cerrno>
+#include <cstdlib>
+#include <cstring>
 #include <strings.h>
-#include <stdio.h>
+#include <cstdio>
 #include <sys/param.h>
 
 #include "XrdFrc/XrdFrcTrace.hh"
@@ -152,7 +152,7 @@ int main(int argc, char *argv[])
 //
    XrdXrootdTrace = new XrdOucTrace(&Say);
 
-// Display configuration (defered because mum might have been in effect)
+// Display configuration (deferred because mum might have been in effect)
 //
    if (!Config.isOTO || Config.Verbose) XrdFrmPurge::Display();
 

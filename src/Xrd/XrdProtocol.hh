@@ -4,7 +4,7 @@
 /*                                                                            */
 /*                        X r d P r o t o c o l . h h                         */
 /*                                                                            */
-/* (c) 2004 by the Board of Trustees of the Leland Stanford, Jr., University  */
+/*(c) 2004-18 By the Board of Trustees of the Leland Stanford, Jr., University*/
 /*   Produced by Andrew Hanushevsky for Stanford University under contract    */
 /*              DE-AC02-76-SFO0515 with the Department of Energy              */
 /*                                                                            */
@@ -43,11 +43,12 @@
 class XrdSysError;
 union XrdNetSockAddr;
 class XrdOucEnv;
-class XrdOucTrace;
+class XrdOucString;
 class XrdBuffManager;
 class XrdInet;
 class XrdScheduler;
 class XrdStats;
+class XrdTlsContext;
 
 struct sockaddr;
 
@@ -63,7 +64,7 @@ XrdBuffManager *BPool;       // Stable -> Buffer Pool Manager
 XrdScheduler   *Sched;       // Stable -> System Scheduler
 XrdStats       *Stats;       // Stable -> System Statistics (@ XrdgetProtocol)
 XrdOucEnv      *theEnv;      // Stable -> Additional environmental information
-XrdOucTrace    *Trace;       // Stable -> Trace Information
+void           *rsvd0;
 
 // The following information must be duplicated; it is unstable.
 //
@@ -71,8 +72,12 @@ char            *ConfigFN;     // -> Configuration file
 int              Format;       // Binary format of this server
 int              Port;         // Port number
 int              WSize;        // Window size for Port
+int              rsvd1;
 const char      *AdmPath;      // Admin path
 int              AdmMode;      // Admin path mode
+int              xrdFlags;
+static const int admPSet    = 0x00000001;  // The adminppath was set via cli
+
 const char      *myInst;       // Instance name
 const char      *myName;       // Host name
 const char      *myProg;       // Program name
@@ -88,12 +93,15 @@ int              idleWait;     // Max milliseconds connection may be idle
 int              argc;         // Number of arguments
 char           **argv;         // Argument array (prescreened)
 char             DebugON;      // True if started with -d option
-int              WANPort;      // Port prefered for WAN connections (0 if none)
-int              WANWSize;     // Window size for the WANPort
+char             rsvd3[7];
 int              hailWait;     // Max milliseconds to wait for data after accept
+int              tlsPort;      // Default TLS port (0 if not specified)
+XrdTlsContext   *tlsCtx;       // Stable -> TLS Context (0 if not initialized)
+XrdOucString    *totalCF;      // Stable -> total config after full init
 
-                 XrdProtocol_Config(XrdProtocol_Config &rhs);
-                 XrdProtocol_Config() {}
+                 XrdProtocol_Config(XrdProtocol_Config &rhs) =delete;
+                 XrdProtocol_Config() : rsvd0(0), rsvd1(0)
+                                        {memset(rsvd3, 0, sizeof(rsvd3));}
                 ~XrdProtocol_Config() {}
 };
 

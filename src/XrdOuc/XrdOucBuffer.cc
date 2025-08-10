@@ -32,10 +32,7 @@
 #include <unistd.h>
 #endif
 #include <sys/types.h>
-#include <stdlib.h>
-#if !defined(__APPLE__) && !defined(__FreeBSD__)
-#include <malloc.h>
-#endif
+#include <cstdlib>
 
 #include "XrdOuc/XrdOucBuffer.hh"
 #include "XrdSys/XrdSysPlatform.hh"
@@ -79,7 +76,7 @@ XrdOucBuffPool::XrdOucBuffPool(int minsz, int maxsz,
 
 // Allocate a slot vector for this
 //
-   bSlot = new BuffSlot[slots];
+   bSlot = new BuffSlot[(unsigned int)slots];
 
 // Complete initializing the slot vector
 //
@@ -124,9 +121,12 @@ XrdOucBuffer *XrdOucBuffPool::Alloc(int bsz)
        sP->numbuff--;
       } else {
        if ((bP = new XrdOucBuffer(this, snum)))
-          {if (posix_memalign((void **)&(bP->data),
-                              (sP->size <= alignit ? sP->size : alignit),
-                               sP->size))
+          {int mema;
+           if (sP->size >= alignit) mema = alignit;
+              else if (sP->size > 2048) mema = 4096;
+                      else if (sP->size > 1024) mema = 2048;
+                              else mema = 1024;
+           if (posix_memalign((void **)&(bP->data), mema, sP->size))
               {delete bP; bP = 0;}
           }
       }

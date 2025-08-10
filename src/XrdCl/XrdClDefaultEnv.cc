@@ -72,7 +72,6 @@ extern "C"
     env->GetInt( "RunForkHandler", runForkHandler );
     if( runForkHandler )
       forkHandler->Prepare();
-    env->WriteLock();
   }
 
   //----------------------------------------------------------------------------
@@ -84,7 +83,6 @@ extern "C"
     Log         *log         = DefaultEnv::GetLog();
     Env         *env         = DefaultEnv::GetEnv();
     ForkHandler *forkHandler = DefaultEnv::GetForkHandler();
-    env->UnLock();
 
     pid_t pid = getpid();
     log->Debug( UtilityMsg, "In the parent fork handler for process %d", pid );
@@ -111,7 +109,7 @@ extern "C"
     Log         *log         = DefaultEnv::GetLog();
     Env         *env         = DefaultEnv::GetEnv();
     ForkHandler *forkHandler = DefaultEnv::GetForkHandler();
-    env->ReInitializeLock();
+    env->RecreateLock();
 
     pid_t pid = getpid();
     log->Debug( UtilityMsg, "In the child fork handler for process %d", pid );
@@ -154,6 +152,7 @@ namespace
       masks["JobMgrMsg"]          = XrdCl::JobMgrMsg;
       masks["PlugInMgrMsg"]       = XrdCl::PlugInMgrMsg;
       masks["ExDbgMsg"]           = XrdCl::ExDbgMsg;
+      masks["TlsMsg"]             = XrdCl::TlsMsg;
     }
 
     //--------------------------------------------------------------------------
@@ -257,6 +256,7 @@ namespace XrdCl
   DefaultEnv::DefaultEnv()
   {
     Log *log = GetLog();
+    log->Debug( UtilityMsg, "Initializing xrootd client version: %s", XrdVERSION );
 
     //--------------------------------------------------------------------------
     // Declate the variables to be processed
@@ -279,6 +279,7 @@ namespace XrdCl
     REGISTER_VAR_INT( varsInt, "LoadBalancerTTL",         DefaultLoadBalancerTTL         );
     REGISTER_VAR_INT( varsInt, "CPInitTimeout",           DefaultCPInitTimeout           );
     REGISTER_VAR_INT( varsInt, "CPTPCTimeout",            DefaultCPTPCTimeout            );
+    REGISTER_VAR_INT( varsInt, "CPTimeout",               DefaultCPTimeout               );
     REGISTER_VAR_INT( varsInt, "TCPKeepAlive",            DefaultTCPKeepAlive            );
     REGISTER_VAR_INT( varsInt, "TCPKeepAliveTime",        DefaultTCPKeepAliveTime        );
     REGISTER_VAR_INT( varsInt, "TCPKeepAliveInterval",    DefaultTCPKeepAliveInterval    );
@@ -294,8 +295,18 @@ namespace XrdCl
     REGISTER_VAR_INT( varsInt, "MaxMetalinkWait",         DefaultMaxMetalinkWait         );
     REGISTER_VAR_INT( varsInt, "PreserveLocateTried",     DefaultPreserveLocateTried     );
     REGISTER_VAR_INT( varsInt, "NotAuthorizedRetryLimit", DefaultNotAuthorizedRetryLimit );
+    REGISTER_VAR_INT( varsInt, "PreserveXAttrs",          DefaultPreserveXAttrs          );
+    REGISTER_VAR_INT( varsInt, "NoTlsOK",                 DefaultNoTlsOK                 );
+    REGISTER_VAR_INT( varsInt, "TlsNoData",               DefaultTlsNoData               );
+    REGISTER_VAR_INT( varsInt, "TlsMetalink",             DefaultTlsMetalink             );
+    REGISTER_VAR_INT( varsInt, "ZipMtlnCksum",            DefaultZipMtlnCksum            );
+    REGISTER_VAR_INT( varsInt, "IPNoShuffle",             DefaultIPNoShuffle             );
+    REGISTER_VAR_INT( varsInt, "WantTlsOnNoPgrw",         DefaultWantTlsOnNoPgrw         );
+    REGISTER_VAR_INT( varsInt, "RetryWrtAtLBLimit",       DefaultRetryWrtAtLBLimit       );
+    REGISTER_VAR_INT( varsInt, "XRateThreshold",          DefaultXRateThreshold          );
+    REGISTER_VAR_INT( varsInt, "CpRetry",                 DefaultCpRetry                 );
+    REGISTER_VAR_INT( varsInt, "CpUsePgWrtRd",            DefaultCpUsePgWrtRd            );
 
-    REGISTER_VAR_STR( varsStr, "PollerPreference",        DefaultPollerPreference        );
     REGISTER_VAR_STR( varsStr, "ClientMonitor",           DefaultClientMonitor           );
     REGISTER_VAR_STR( varsStr, "ClientMonitorParam",      DefaultClientMonitorParam      );
     REGISTER_VAR_STR( varsStr, "NetworkStack",            DefaultNetworkStack            );
@@ -305,6 +316,9 @@ namespace XrdCl
     REGISTER_VAR_STR( varsStr, "WriteRecovery",           DefaultWriteRecovery           );
     REGISTER_VAR_STR( varsStr, "OpenRecovery",            DefaultOpenRecovery            );
     REGISTER_VAR_STR( varsStr, "GlfnRedirector",          DefaultGlfnRedirector          );
+    REGISTER_VAR_STR( varsStr, "TlsDbgLvl",               DefaultTlsDbgLvl               );
+    REGISTER_VAR_STR( varsStr, "CpTarget",                DefaultCpTarget                );
+    REGISTER_VAR_STR( varsStr, "CpRetryPolicy",           DefaultCpRetryPolicy           );
 
     //--------------------------------------------------------------------------
     // Process the configuration files
@@ -331,6 +345,24 @@ namespace XrdCl
     }
     else
       log->Debug( UtilityMsg, "Unable to find user home directory." );
+
+    char *conffile = getenv( "XRD_CLCONFFILE" );
+    if( conffile )
+    {
+      st = Utils::ProcessConfig( userConfig, conffile );
+      if( !st.IsOK() )
+        log->Debug( UtilityMsg, "Unable to process %s file: %s",
+                    conffile, st.ToString().c_str() );
+    }
+
+    char *confdir = getenv( "XRD_CLCONFDIR" );
+    if( confdir )
+    {
+      st = Utils::ProcessConfigDir( userConfig, confdir );
+      if( !st.IsOK() )
+        log->Debug( UtilityMsg, "Unable to process %s file: %s",
+                    confdir, st.ToString().c_str() );
+    }
 
     std::map<std::string, std::string>::iterator it;
 
@@ -827,9 +859,11 @@ namespace XrdCl
     log->SetTopicName( JobMgrMsg,          "JobMgr" );
     log->SetTopicName( PlugInMgrMsg,       "PlugInMgr" );
     log->SetTopicName( ExDbgMsg,           "ExDbgMsg" );
+    log->SetTopicName( TlsMsg,             "TlsMsg" );
+    log->SetTopicName( ZipMsg,             "ZipMsg" );
   }
-}
 
+}
 
 //------------------------------------------------------------------------------
 // Static initialization and finalization

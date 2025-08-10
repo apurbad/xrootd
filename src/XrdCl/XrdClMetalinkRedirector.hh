@@ -37,7 +37,6 @@ class MetalinkRedirector : public VirtualRedirector
     //----------------------------------------------------------------------------
     //! Constructor
     //! @param url         : URL to the metalink file
-    //! @param userHandler : the response handler provided by end user
     //----------------------------------------------------------------------------
     MetalinkRedirector( const std::string &url );
 
@@ -48,6 +47,7 @@ class MetalinkRedirector : public VirtualRedirector
 
     //----------------------------------------------------------------------------
     //! Initializes the object with the content of the metalink file
+    //! @param userHandler : the response handler provided by end user
     //----------------------------------------------------------------------------
     XRootDStatus Load( ResponseHandler *userHandler );
 
@@ -56,7 +56,7 @@ class MetalinkRedirector : public VirtualRedirector
     //! redirect response, otherwise queues the request until initialization
     //! is done.
     //----------------------------------------------------------------------------
-    XRootDStatus HandleRequest( const Message *msg, IncomingMsgHandler *handler );
+    XRootDStatus HandleRequest( const Message *msg, MsgHandler *handler );
 
     //----------------------------------------------------------------------------
     //! Gets the file name as specified in the metalink
@@ -72,9 +72,26 @@ class MetalinkRedirector : public VirtualRedirector
     //----------------------------------------------------------------------------
     std::string GetCheckSum( const std::string &type ) const
     {
-      CksumMap::const_iterator it = pChecksums.find( type );
+      std::string t = type != "adler32" ? type : "a32";
+      CksumMap::const_iterator it = pChecksums.find( t );
       if( it == pChecksums.end() ) return std::string();
       return type + ":" + it->second;
+    }
+
+    //----------------------------------------------------------------------------
+    //! Returns the first (in alphabetical order) checksum type available in the
+    //! metalink file, if no checksum is available returns an empty string
+    //----------------------------------------------------------------------------
+    std::vector<std::string> GetSupportedCheckSums() const
+    {
+      std::vector<std::string> ret;
+      CksumMap::const_iterator itr = pChecksums.begin();
+      for( ; itr != pChecksums.end(); ++itr )
+      {
+        if( itr->first == "a32" ) ret.push_back( "adler32" );
+        else ret.push_back( itr->first );
+      }
+      return ret;
     }
 
     //----------------------------------------------------------------------------
@@ -97,7 +114,7 @@ class MetalinkRedirector : public VirtualRedirector
     //----------------------------------------------------------------------------
     //! Count how many replicas do we have left to try for given request
     //----------------------------------------------------------------------------
-    virtual int Count( Message *req ) const;
+    virtual int Count( Message &req ) const;
 
   private:
 
@@ -107,7 +124,7 @@ class MetalinkRedirector : public VirtualRedirector
     //! The virtual response is being handled by the given handler
     //! in the thread-pool.
     //----------------------------------------------------------------------------
-    XRootDStatus HandleRequestImpl( const Message *msg, IncomingMsgHandler *handler );
+    XRootDStatus HandleRequestImpl( const Message *msg, MsgHandler *handler );
 
     //----------------------------------------------------------------------------
     //! Parses the metalink file
@@ -126,12 +143,12 @@ class MetalinkRedirector : public VirtualRedirector
     //----------------------------------------------------------------------------
     //! Generates redirect response for the given request
     //----------------------------------------------------------------------------
-    Message* GetResponse( const Message *msg ) const;
+    std::shared_ptr<Message> GetResponse( const Message *msg ) const;
 
     //----------------------------------------------------------------------------
     //! Generates error response for the given request
     //----------------------------------------------------------------------------
-    Message* GetErrorMsg( const Message *msg, const std::string &errMsg, XErrorCode code ) const;
+    std::shared_ptr<Message> GetErrorMsg( const Message *msg, const std::string &errMsg, XErrorCode code ) const;
 
     //----------------------------------------------------------------------------
     //! Initializes checksum map
@@ -146,21 +163,21 @@ class MetalinkRedirector : public VirtualRedirector
     //----------------------------------------------------------------------------
     //! Get the next replica for the given message
     //----------------------------------------------------------------------------
-    XRootDStatus GetReplica( const Message *msg, std::string &replica ) const;
+    XRootDStatus GetReplica( const Message &msg, std::string &replica ) const;
 
     //----------------------------------------------------------------------------
     //! Extracts an element from URL cgi
     //----------------------------------------------------------------------------
-    XRootDStatus GetCgiInfo( const Message *msg, const std::string &key, std::string &out ) const;
+    XRootDStatus GetCgiInfo( const Message &msg, const std::string &key, std::string &out ) const;
 
-    typedef std::list< std::pair<const Message*, IncomingMsgHandler*> > RedirectList;
-    typedef std::map<std::string, std::string>                          CksumMap;
-    typedef std::vector<std::string>                                    ReplicaList;
+    typedef std::list< std::pair<const Message*, MsgHandler*> > RedirectList;
+    typedef std::map<std::string, std::string>                  CksumMap;
+    typedef std::vector<std::string>                            ReplicaList;
 
     //----------------------------------------------------------------------------
     //! Get the next replica for the given message
     //----------------------------------------------------------------------------
-    ReplicaList::const_iterator GetReplica( const Message *msg ) const;
+    ReplicaList::const_iterator GetReplica( const Message &msg ) const;
 
     RedirectList     pPendingRedirects;
     std::string      pUrl;
